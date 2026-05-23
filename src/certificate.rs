@@ -145,7 +145,11 @@ impl Certificate {
 /// Format raw digest bytes as `AB:CD:EF:...` upper-case colon-separated hex.
 /// Matches the C++ `make_fingerprint` formatter at
 /// `native/libdatachannel/src/impl/certificate.cpp:482`.
-fn format_fingerprint(bytes: &[u8]) -> String {
+///
+/// Visible to the crate so `dtls_transport`'s verify callback can render
+/// peer-cert digests in the same shape as the SDP fingerprint we compare
+/// against.
+pub(crate) fn format_fingerprint(bytes: &[u8]) -> String {
     // 2 hex chars per byte + `:` between each pair = 3*N - 1.
     let mut s = String::with_capacity(bytes.len() * 3);
     for (i, b) in bytes.iter().enumerate() {

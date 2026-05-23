@@ -38,6 +38,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use openssl::hash::MessageDigest;
 use openssl::ssl::{Ssl, SslContext, SslContextBuilder, SslMethod, SslOptions, SslVerifyMode};
 use openssl_sys as ossl_sys;
 use parking_lot::Mutex;
@@ -64,11 +65,18 @@ fn ssl_ptr(ssl: &Ssl) -> *mut ossl_sys::SSL {
     unsafe { std::mem::transmute_copy::<Ssl, *mut ossl_sys::SSL>(ssl) }
 }
 
-use crate::certificate::{Certificate, CertificateError};
-use crate::description::{Role, FingerprintAlgorithm};
+use crate::certificate::{Certificate, CertificateError, format_fingerprint};
+use crate::description::{Fingerprint, FingerprintAlgorithm, Role};
 use crate::ice_transport::{
     IceTransport, IceTransportCallbacks, IceTransportError, State as IceState,
 };
+
+/// Shared state between the SSL_CTX verify callback and the Bridge.
+///
+/// The verify callback is installed at `SSL_CTX` construction time —
+/// before [`Bridge`] exists — so we wire both ends through this small
+/// Arc. The bridge calls `set` / `get`; the callback reads.
+type SharedFingerprint = Arc<Mutex<Option<Fingerprint>>>;
 
 /// MTU default mirroring `DEFAULT_MTU` in libdatachannel
 /// (`src/impl/transport.hpp`). `1280` is the IPv6 minimum.
@@ -207,6 +215,14 @@ struct Bridge {
     /// `dtlstransport.cpp:736` derives this from the lower transport's
     /// resolved role; we mirror that.
     is_client: bool,
+    /// Expected remote certificate fingerprint, set by
+    /// [`DtlsTransport::set_remote_fingerprint`]. Shared with the
+    /// SSL_CTX verify callback installed at construction time.
+    expected_remote_fingerprint: SharedFingerprint,
+    /// Guards [`DtlsTransport::start`] against double-driving the
+    /// handshake when both the auto-start callback on ICE-Connected and
+    /// an explicit user call race.
+    started: AtomicBool,
 }
 
 /// The DTLS transport. Cheap to clone — it's an `Arc<Bridge>` under
@@ -257,8 +273,14 @@ impl DtlsTransport {
         let role = ice.role();
         let is_client = matches!(role, Role::Active);
 
+        // The expected remote fingerprint is wired through both the
+        // SSL_CTX verify callback (read-only) and the Bridge (read/write
+        // via `set_remote_fingerprint`). We construct the shared cell
+        // first so both ends can hold a clone.
+        let expected_remote_fingerprint: SharedFingerprint = Arc::new(Mutex::new(None));
+
         // Build the SSL_CTX with the libdatachannel options.
-        let ctx = build_ssl_context(&certificate)?;
+        let ctx = build_ssl_context(&certificate, Arc::clone(&expected_remote_fingerprint))?;
 
         // Build the Ssl wrapper and switch sides.
         let mut ssl = Ssl::new(&ctx)?;
@@ -309,10 +331,56 @@ impl DtlsTransport {
             }),
             _ctx: ctx,
             state: Mutex::new(DtlsState::New),
-            ice,
+            ice: Arc::clone(&ice),
             callbacks: Mutex::new(callbacks),
             closed: AtomicBool::new(false),
             is_client,
+            expected_remote_fingerprint,
+            started: AtomicBool::new(false),
+        });
+
+        // Auto-start: install an `on_state_change` shim on the lower ICE
+        // transport that kicks the DTLS handshake the moment ICE first
+        // reaches Connected (or Completed), then drains any handshake
+        // records that got stuck in the outbound BIO while ICE didn't
+        // yet have a selected pair. The existing user-installed
+        // `on_state_change` is captured and re-fired afterwards so the
+        // chain is preserved.
+        //
+        // We deliberately install this BEFORE `start()` (which itself
+        // chains in its own shim once called). `start()` is idempotent
+        // — see `started` AtomicBool — so racing the auto-start with a
+        // manual `start()` call is harmless.
+        let prev = ice.callbacks();
+        let dtls_for_cb = DtlsTransport {
+            bridge: Arc::clone(&bridge),
+        };
+        let new_on_state_change = {
+            let prev_state = Arc::clone(&prev.on_state_change);
+            Arc::new(move |s: IceState| {
+                if matches!(s, IceState::Connected | IceState::Completed) {
+                    // start() is idempotent: no-op if we've already
+                    // started, otherwise drives the ClientHello.
+                    if let Err(e) = dtls_for_cb.start() {
+                        // Only Closed should bubble out here; everything
+                        // else (Ice / SSL handshake error) is logged.
+                        warn!("DtlsTransport: auto-start on ICE-Connected failed: {e}");
+                    }
+                    // Drain the outbound BIO: ClientHello bytes pushed
+                    // during a prior `start()` may have been stranded
+                    // because ICE didn't have a selected pair at the
+                    // time. Now that we're Connected, push them.
+                    let mut g = dtls_for_cb.bridge.inner.lock();
+                    let _ = drain_outbound_locked(&mut g, &dtls_for_cb.bridge);
+                }
+                (prev_state)(s);
+            })
+        };
+        ice.set_callbacks(IceTransportCallbacks {
+            on_state_change: new_on_state_change,
+            on_gathering_state_change: prev.on_gathering_state_change,
+            on_candidate: prev.on_candidate,
+            on_data: prev.on_data,
         });
 
         Ok(DtlsTransport { bridge })
@@ -338,19 +406,55 @@ impl DtlsTransport {
         FingerprintAlgorithm::Sha256
     }
 
+    /// Pin the expected remote certificate fingerprint. The verify
+    /// callback installed on this transport's `SSL_CTX` compares every
+    /// peer certificate it sees against this value (uppercase
+    /// colon-separated SHA-256 hex by default). A mismatch — or calling
+    /// [`start`](Self::start) without ever calling this — causes the
+    /// DTLS handshake to abort and the transport to transition to
+    /// [`DtlsState::Failed`].
+    ///
+    /// Callers MUST set the remote fingerprint before [`start`](Self::start),
+    /// otherwise verification fails on the first peer certificate seen.
+    pub fn set_remote_fingerprint(&self, fingerprint: Fingerprint) {
+        *self.bridge.expected_remote_fingerprint.lock() = Some(fingerprint);
+    }
+
+    /// Returns the expected remote fingerprint if it has been set via
+    /// [`set_remote_fingerprint`](Self::set_remote_fingerprint).
+    pub fn remote_fingerprint(&self) -> Option<Fingerprint> {
+        self.bridge.expected_remote_fingerprint.lock().clone()
+    }
+
     /// Start the DTLS handshake. Installs an `on_data` shim on the
     /// underlying [`IceTransport`] that pumps incoming bytes through
     /// the SSL state machine, then (if we're the client) drives the
     /// first `SSL_do_handshake` to emit a ClientHello.
     ///
-    /// This is idempotent: a second call after the first returns Ok
-    /// without restarting the handshake.
+    /// This is idempotent: subsequent calls (whether from the user or
+    /// from the auto-start ICE-Connected hook installed by [`new`](Self::new))
+    /// return `Ok(())` without re-driving the handshake.
+    ///
+    /// # Important
+    ///
+    /// You MUST call [`set_remote_fingerprint`](Self::set_remote_fingerprint)
+    /// before `start()`, otherwise the verify callback will reject the
+    /// peer's certificate as soon as the handshake produces one and the
+    /// transport will transition to [`DtlsState::Failed`].
     pub fn start(&self) -> Result<(), DtlsTransportError> {
         if self.bridge.closed.load(Ordering::SeqCst) {
             return Err(DtlsTransportError::Closed);
         }
 
-        // Idempotency: only transition to Connecting once.
+        // Idempotency guard #1: AtomicBool so the auto-start
+        // on_state_change callback and an explicit user call can race
+        // safely. The second caller short-circuits here.
+        if self.bridge.started.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        // Idempotency guard #2: only transition to Connecting if we're
+        // still in New (covers the close-during-start race).
         {
             let mut s = self.bridge.state.lock();
             if !matches!(*s, DtlsState::New) {
@@ -500,7 +604,10 @@ impl DtlsTransport {
 // SSL_CTX construction
 // ---------------------------------------------------------------------------
 
-fn build_ssl_context(certificate: &Certificate) -> Result<SslContext, DtlsTransportError> {
+fn build_ssl_context(
+    certificate: &Certificate,
+    expected_remote_fingerprint: SharedFingerprint,
+) -> Result<SslContext, DtlsTransportError> {
     let mut builder = SslContextBuilder::new(SslMethod::dtls())?;
     // Options inherited from dtlstransport.cpp:754.
     builder.set_options(
@@ -512,12 +619,63 @@ fn build_ssl_context(certificate: &Certificate) -> Result<SslContext, DtlsTransp
     builder.set_cipher_list(CIPHER_LIST)?;
 
     // Verify mode matches dtlstransport.cpp:762 — REQUIRE the peer
-    // certificate. The callback always accepts (returns 1) because
-    // RFC 8827 says authentication happens via the SDP fingerprint.
-    // Phase G-5b will swap this for a fingerprint check.
+    // certificate. The callback ports the C++
+    // `DtlsTransport::CertificateCallback` at
+    // `native/libdatachannel/src/impl/dtlstransport.cpp:1035`: ignore
+    // OpenSSL's `preverify_ok` (self-signed certs always preverify-fail,
+    // which is fine per RFC 8827 — DTLS-SRTP authenticates the peer via
+    // the SDP fingerprint), grab the peer leaf cert, hash it, compare
+    // against the pinned fingerprint.
     builder.set_verify_callback(
         SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,
-        |_preverify_ok, _store_ctx| true,
+        move |_preverify_ok, store_ctx| {
+            // Pull out the cert currently under inspection. None at
+            // chain root or if OpenSSL hasn't surfaced one yet — reject.
+            let Some(cert) = store_ctx.current_cert() else {
+                warn!("DtlsTransport verify: no current cert in X509 store ctx");
+                return false;
+            };
+            // The expected fingerprint MUST have been set before the
+            // handshake started. None here means the application
+            // forgot to call `set_remote_fingerprint` — fail closed.
+            let expected = match expected_remote_fingerprint.lock().clone() {
+                Some(fp) => fp,
+                None => {
+                    warn!(
+                        "DtlsTransport verify: no remote fingerprint set; \
+                         rejecting peer cert (call set_remote_fingerprint \
+                         before start())"
+                    );
+                    return false;
+                }
+            };
+            // Hash the peer cert with the algorithm the application
+            // pinned, then render in the same SDP shape as
+            // `Certificate::fingerprint`.
+            let md = message_digest_for(expected.algorithm);
+            let actual = match cert.digest(md) {
+                Ok(d) => format_fingerprint(d.as_ref()),
+                Err(e) => {
+                    warn!("DtlsTransport verify: X509_digest failed: {e}");
+                    return false;
+                }
+            };
+            // Case-insensitive equality match. `Fingerprint::value` is
+            // always uppercase per `format_fingerprint`, but the
+            // application could have constructed one manually with
+            // lowercase hex; the C++ comparator is case-insensitive too
+            // (see `make_fingerprint` callers around dtlstransport.cpp).
+            if actual.eq_ignore_ascii_case(&expected.value) {
+                true
+            } else {
+                warn!(
+                    "DtlsTransport verify: peer fingerprint mismatch \
+                     (expected {}, got {})",
+                    expected.value, actual
+                );
+                false
+            }
+        },
     );
 
     // Wire in our cert + key.
@@ -526,6 +684,19 @@ fn build_ssl_context(certificate: &Certificate) -> Result<SslContext, DtlsTransp
     builder.check_private_key()?;
 
     Ok(builder.build())
+}
+
+/// Translate our [`FingerprintAlgorithm`] enum into the OpenSSL
+/// [`MessageDigest`] used by `X509_digest`. Used only inside the
+/// verify callback.
+fn message_digest_for(algo: FingerprintAlgorithm) -> MessageDigest {
+    match algo {
+        FingerprintAlgorithm::Sha1 => MessageDigest::sha1(),
+        FingerprintAlgorithm::Sha224 => MessageDigest::sha224(),
+        FingerprintAlgorithm::Sha256 => MessageDigest::sha256(),
+        FingerprintAlgorithm::Sha384 => MessageDigest::sha384(),
+        FingerprintAlgorithm::Sha512 => MessageDigest::sha512(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -922,6 +1093,567 @@ mod tests {
             dtls.close().expect("close");
             assert_eq!(a_calls.load(Ordering::SeqCst), 0);
             assert_eq!(b_calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    // -------------------------------------------------------------------
+    // Phase G-5b: remote-fingerprint pinning + end-to-end handshake.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn set_remote_fingerprint_getter_round_trips() {
+        rt().block_on(async {
+            let ice = make_ice(Role::Active);
+            let cert = Certificate::generate_default().unwrap();
+            let dtls = DtlsTransport::new(ice, cert, DtlsTransportCallbacks::default())
+                .expect("dtls new");
+            assert!(dtls.remote_fingerprint().is_none(), "starts unset");
+
+            let other = Certificate::generate_default().unwrap();
+            let fp = other
+                .fingerprint(FingerprintAlgorithm::Sha256)
+                .expect("fingerprint");
+            dtls.set_remote_fingerprint(fp.clone());
+
+            let round = dtls.remote_fingerprint().expect("set");
+            assert_eq!(round.algorithm, fp.algorithm);
+            assert_eq!(round.value, fp.value);
+        });
+    }
+
+    /// Spin until `pred` is true or `timeout_ms` elapses.
+    async fn wait_for_dtls<F: FnMut() -> bool>(mut pred: F, timeout_ms: u64) -> bool {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(timeout_ms);
+        while std::time::Instant::now() < deadline {
+            if pred() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// Build the standard A/B ICE-pair on loopback, wire their candidate
+    /// callbacks together, exchange descriptions, and gather. Returns
+    /// the two transports once both sides have ICE-Connected. Reused by
+    /// the DTLS end-to-end tests below.
+    async fn pair_ice_loopback() -> (Arc<IceTransport>, Arc<IceTransport>) {
+        use crate::candidate::Candidate;
+        use crate::description::Type as DescriptionType;
+        use crate::ice_transport::State as IceState;
+
+        let a_cands: Arc<Mutex<Vec<Candidate>>> = Arc::new(Mutex::new(Vec::new()));
+        let b_cands: Arc<Mutex<Vec<Candidate>>> = Arc::new(Mutex::new(Vec::new()));
+        let a_connected = Arc::new(AtomicBool::new(false));
+        let b_connected = Arc::new(AtomicBool::new(false));
+
+        let ac = a_connected.clone();
+        let bc = b_connected.clone();
+        let a_cands_cb = a_cands.clone();
+        let b_cands_cb = b_cands.clone();
+
+        let a_callbacks = IceTransportCallbacks {
+            on_state_change: Arc::new(move |s| {
+                if matches!(s, IceState::Connected | IceState::Completed) {
+                    ac.store(true, Ordering::SeqCst);
+                }
+            }),
+            on_candidate: Arc::new(move |c| a_cands_cb.lock().push(c)),
+            ..IceTransportCallbacks::default()
+        };
+        let b_callbacks = IceTransportCallbacks {
+            on_state_change: Arc::new(move |s| {
+                if matches!(s, IceState::Connected | IceState::Completed) {
+                    bc.store(true, Ordering::SeqCst);
+                }
+            }),
+            on_candidate: Arc::new(move |c| b_cands_cb.lock().push(c)),
+            ..IceTransportCallbacks::default()
+        };
+
+        let mut cfg = Configuration::new();
+        cfg.bind_address = Some("127.0.0.1".to_string());
+
+        let a = IceTransport::new(&cfg, Role::ActPass, a_callbacks).expect("a");
+        let b = IceTransport::new(&cfg, Role::Active, b_callbacks).expect("b");
+
+        a.gather().expect("a gather");
+        // Wait for A's gathering to finish.
+        let _ = wait_for_dtls(
+            || {
+                a.gathering_state()
+                    == crate::ice_transport::GatheringState::Complete
+            },
+            3000,
+        )
+        .await;
+        let desc_a = a
+            .get_local_description(DescriptionType::Offer)
+            .expect("a sdp");
+        b.set_remote_description(&desc_a).expect("b set remote");
+
+        b.gather().expect("b gather");
+        let _ = wait_for_dtls(
+            || {
+                b.gathering_state()
+                    == crate::ice_transport::GatheringState::Complete
+            },
+            3000,
+        )
+        .await;
+        let desc_b = b
+            .get_local_description(DescriptionType::Answer)
+            .expect("b sdp");
+        a.set_remote_description(&desc_b).expect("a set remote");
+
+        for c in a_cands.lock().iter() {
+            b.add_remote_candidate(c).expect("trickle a→b");
+        }
+        for c in b_cands.lock().iter() {
+            a.add_remote_candidate(c).expect("trickle b→a");
+        }
+        a.set_remote_end_of_candidates().expect("a eoc");
+        b.set_remote_end_of_candidates().expect("b eoc");
+
+        let connected = wait_for_dtls(
+            || {
+                a_connected.load(Ordering::SeqCst)
+                    && b_connected.load(Ordering::SeqCst)
+            },
+            5000,
+        )
+        .await;
+        assert!(
+            connected,
+            "ice loopback failed: a={:?}, b={:?}",
+            a.state(),
+            b.state()
+        );
+
+        (a, b)
+    }
+
+    #[test]
+    fn dtls_handshake_completes_over_ice_loopback() {
+        rt().block_on(async {
+            let t_start = std::time::Instant::now();
+
+            // ICE first — build a paired transport up to Connected.
+            // We construct DTLS BEFORE driving ICE through the pair
+            // dance so the auto-start ICE-Connected hook is in place
+            // when each side reaches Connected.
+            //
+            // We can't use the shared helper because it builds + drives
+            // ICE before returning, but the auto-start hook must be
+            // installed before ICE reaches Connected. So we inline the
+            // pairing here with DTLS layered on top.
+
+            use crate::candidate::Candidate;
+            use crate::description::Type as DescriptionType;
+            use crate::ice_transport::State as IceState;
+
+            let a_cands: Arc<Mutex<Vec<Candidate>>> = Arc::new(Mutex::new(Vec::new()));
+            let b_cands: Arc<Mutex<Vec<Candidate>>> = Arc::new(Mutex::new(Vec::new()));
+            let a_cands_cb = a_cands.clone();
+            let b_cands_cb = b_cands.clone();
+
+            let a_callbacks = IceTransportCallbacks {
+                on_candidate: Arc::new(move |c| a_cands_cb.lock().push(c)),
+                ..IceTransportCallbacks::default()
+            };
+            let b_callbacks = IceTransportCallbacks {
+                on_candidate: Arc::new(move |c| b_cands_cb.lock().push(c)),
+                ..IceTransportCallbacks::default()
+            };
+
+            let mut cfg = Configuration::new();
+            cfg.bind_address = Some("127.0.0.1".to_string());
+
+            // A is the offerer / ActPass → resolves to Passive (DTLS server).
+            // B is the answerer / Active → DTLS client.
+            let ice_a = IceTransport::new(&cfg, Role::ActPass, a_callbacks).expect("ice a");
+            let ice_b = IceTransport::new(&cfg, Role::Active, b_callbacks).expect("ice b");
+
+            // Per-side DTLS state buffers.
+            let a_dtls_connected = Arc::new(AtomicBool::new(false));
+            let b_dtls_connected = Arc::new(AtomicBool::new(false));
+            let a_dtls_failed = Arc::new(AtomicBool::new(false));
+            let b_dtls_failed = Arc::new(AtomicBool::new(false));
+            let a_recv: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+            let b_recv: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+
+            let cert_a = Certificate::generate_default().expect("cert a");
+            let cert_b = Certificate::generate_default().expect("cert b");
+            let fp_a = cert_a
+                .fingerprint(FingerprintAlgorithm::Sha256)
+                .expect("fp a");
+            let fp_b = cert_b
+                .fingerprint(FingerprintAlgorithm::Sha256)
+                .expect("fp b");
+
+            let a_dtls_connected_cb = a_dtls_connected.clone();
+            let a_dtls_failed_cb = a_dtls_failed.clone();
+            let a_recv_cb = a_recv.clone();
+            let a_dtls_cbs = DtlsTransportCallbacks {
+                on_state_change: Arc::new(move |s| match s {
+                    DtlsState::Connected => {
+                        a_dtls_connected_cb.store(true, Ordering::SeqCst);
+                    }
+                    DtlsState::Failed => {
+                        a_dtls_failed_cb.store(true, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }),
+                on_data: Arc::new(move |d| a_recv_cb.lock().extend_from_slice(d)),
+            };
+
+            let b_dtls_connected_cb = b_dtls_connected.clone();
+            let b_dtls_failed_cb = b_dtls_failed.clone();
+            let b_recv_cb = b_recv.clone();
+            let b_dtls_cbs = DtlsTransportCallbacks {
+                on_state_change: Arc::new(move |s| match s {
+                    DtlsState::Connected => {
+                        b_dtls_connected_cb.store(true, Ordering::SeqCst);
+                    }
+                    DtlsState::Failed => {
+                        b_dtls_failed_cb.store(true, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }),
+                on_data: Arc::new(move |d| b_recv_cb.lock().extend_from_slice(d)),
+            };
+
+            let dtls_a = DtlsTransport::new(Arc::clone(&ice_a), cert_a, a_dtls_cbs)
+                .expect("dtls a");
+            let dtls_b = DtlsTransport::new(Arc::clone(&ice_b), cert_b, b_dtls_cbs)
+                .expect("dtls b");
+
+            // Cross-pin fingerprints BEFORE start() / auto-start fires.
+            dtls_a.set_remote_fingerprint(fp_b);
+            dtls_b.set_remote_fingerprint(fp_a);
+
+            // Now drive ICE through its gather/exchange dance. As soon
+            // as each side hits Connected, the auto-start hook installed
+            // by DtlsTransport::new will fire and drive the handshake.
+            ice_a.gather().expect("a gather");
+            assert!(
+                wait_for_dtls(
+                    || ice_a.gathering_state()
+                        == crate::ice_transport::GatheringState::Complete,
+                    3000
+                )
+                .await,
+                "a never finished gathering"
+            );
+            let desc_a = ice_a
+                .get_local_description(DescriptionType::Offer)
+                .expect("a sdp");
+            ice_b.set_remote_description(&desc_a).expect("b set remote");
+
+            ice_b.gather().expect("b gather");
+            assert!(
+                wait_for_dtls(
+                    || ice_b.gathering_state()
+                        == crate::ice_transport::GatheringState::Complete,
+                    3000
+                )
+                .await,
+                "b never finished gathering"
+            );
+            let desc_b = ice_b
+                .get_local_description(DescriptionType::Answer)
+                .expect("b sdp");
+            ice_a.set_remote_description(&desc_b).expect("a set remote");
+
+            for c in a_cands.lock().iter() {
+                ice_b.add_remote_candidate(c).expect("trickle a→b");
+            }
+            for c in b_cands.lock().iter() {
+                ice_a.add_remote_candidate(c).expect("trickle b→a");
+            }
+            ice_a.set_remote_end_of_candidates().expect("a eoc");
+            ice_b.set_remote_end_of_candidates().expect("b eoc");
+
+            // Wait for DTLS to converge on both sides.
+            let connected = wait_for_dtls(
+                || {
+                    a_dtls_connected.load(Ordering::SeqCst)
+                        && b_dtls_connected.load(Ordering::SeqCst)
+                },
+                8000,
+            )
+            .await;
+            let elapsed = t_start.elapsed();
+            assert!(
+                connected,
+                "DTLS handshake did not converge in {:?}: \
+                 a={:?} (connected={}, failed={}), \
+                 b={:?} (connected={}, failed={}), \
+                 ice_a={:?}, ice_b={:?}",
+                elapsed,
+                dtls_a.state(),
+                a_dtls_connected.load(Ordering::SeqCst),
+                a_dtls_failed.load(Ordering::SeqCst),
+                dtls_b.state(),
+                b_dtls_connected.load(Ordering::SeqCst),
+                b_dtls_failed.load(Ordering::SeqCst),
+                ice_a.state(),
+                ice_b.state(),
+            );
+            eprintln!("DTLS handshake converged in {:?}", elapsed);
+
+            // Round-trip an application record each direction.
+            dtls_b.send(b"ping").expect("send ping (b→a)");
+            assert!(
+                wait_for_dtls(|| !a_recv.lock().is_empty(), 2000).await,
+                "a never received ping"
+            );
+            assert_eq!(&*a_recv.lock(), b"ping");
+
+            dtls_a.send(b"pong").expect("send pong (a→b)");
+            assert!(
+                wait_for_dtls(|| !b_recv.lock().is_empty(), 2000).await,
+                "b never received pong"
+            );
+            assert_eq!(&*b_recv.lock(), b"pong");
+
+            // Suppress unused-variable warnings on IceState import.
+            let _ = IceState::New;
+        });
+    }
+
+    #[test]
+    fn dtls_handshake_aborts_on_fingerprint_mismatch() {
+        rt().block_on(async {
+            use crate::candidate::Candidate;
+            use crate::description::Type as DescriptionType;
+
+            let a_cands: Arc<Mutex<Vec<Candidate>>> = Arc::new(Mutex::new(Vec::new()));
+            let b_cands: Arc<Mutex<Vec<Candidate>>> = Arc::new(Mutex::new(Vec::new()));
+            let a_cands_cb = a_cands.clone();
+            let b_cands_cb = b_cands.clone();
+
+            let a_callbacks = IceTransportCallbacks {
+                on_candidate: Arc::new(move |c| a_cands_cb.lock().push(c)),
+                ..IceTransportCallbacks::default()
+            };
+            let b_callbacks = IceTransportCallbacks {
+                on_candidate: Arc::new(move |c| b_cands_cb.lock().push(c)),
+                ..IceTransportCallbacks::default()
+            };
+
+            let mut cfg = Configuration::new();
+            cfg.bind_address = Some("127.0.0.1".to_string());
+
+            let ice_a = IceTransport::new(&cfg, Role::ActPass, a_callbacks).expect("ice a");
+            let ice_b = IceTransport::new(&cfg, Role::Active, b_callbacks).expect("ice b");
+
+            let a_failed = Arc::new(AtomicBool::new(false));
+            let b_failed = Arc::new(AtomicBool::new(false));
+
+            let cert_a = Certificate::generate_default().expect("cert a");
+            let cert_b = Certificate::generate_default().expect("cert b");
+            let fp_a = cert_a
+                .fingerprint(FingerprintAlgorithm::Sha256)
+                .expect("fp a");
+            // The "wrong" fingerprint: hash of an entirely-unrelated cert.
+            let cert_decoy = Certificate::generate_default().expect("decoy");
+            let fp_wrong = cert_decoy
+                .fingerprint(FingerprintAlgorithm::Sha256)
+                .expect("fp decoy");
+
+            let af = a_failed.clone();
+            let bf = b_failed.clone();
+            let dtls_a = DtlsTransport::new(
+                Arc::clone(&ice_a),
+                cert_a,
+                DtlsTransportCallbacks {
+                    on_state_change: Arc::new(move |s| {
+                        if matches!(s, DtlsState::Failed) {
+                            af.store(true, Ordering::SeqCst);
+                        }
+                    }),
+                    ..DtlsTransportCallbacks::default()
+                },
+            )
+            .expect("dtls a");
+            let dtls_b = DtlsTransport::new(
+                Arc::clone(&ice_b),
+                cert_b,
+                DtlsTransportCallbacks {
+                    on_state_change: Arc::new(move |s| {
+                        if matches!(s, DtlsState::Failed) {
+                            bf.store(true, Ordering::SeqCst);
+                        }
+                    }),
+                    ..DtlsTransportCallbacks::default()
+                },
+            )
+            .expect("dtls b");
+
+            // A pins the WRONG fingerprint; B pins the correct one.
+            dtls_a.set_remote_fingerprint(fp_wrong);
+            dtls_b.set_remote_fingerprint(fp_a);
+
+            // Drive ICE.
+            ice_a.gather().expect("a gather");
+            assert!(
+                wait_for_dtls(
+                    || ice_a.gathering_state()
+                        == crate::ice_transport::GatheringState::Complete,
+                    3000
+                )
+                .await
+            );
+            let desc_a = ice_a
+                .get_local_description(DescriptionType::Offer)
+                .unwrap();
+            ice_b.set_remote_description(&desc_a).unwrap();
+            ice_b.gather().expect("b gather");
+            assert!(
+                wait_for_dtls(
+                    || ice_b.gathering_state()
+                        == crate::ice_transport::GatheringState::Complete,
+                    3000
+                )
+                .await
+            );
+            let desc_b = ice_b
+                .get_local_description(DescriptionType::Answer)
+                .unwrap();
+            ice_a.set_remote_description(&desc_b).unwrap();
+            for c in a_cands.lock().iter() {
+                ice_b.add_remote_candidate(c).unwrap();
+            }
+            for c in b_cands.lock().iter() {
+                ice_a.add_remote_candidate(c).unwrap();
+            }
+            ice_a.set_remote_end_of_candidates().unwrap();
+            ice_b.set_remote_end_of_candidates().unwrap();
+
+            // We expect the mismatch side to flip to Failed within the
+            // handshake window. The OTHER side may go Failed too once it
+            // sees the fatal alert; we only assert on the side we know
+            // must reject.
+            let failed = wait_for_dtls(
+                || a_failed.load(Ordering::SeqCst),
+                8000,
+            )
+            .await;
+            assert!(
+                failed,
+                "mismatch side did not reach Failed: a={:?}, b={:?}",
+                dtls_a.state(),
+                dtls_b.state()
+            );
+        });
+    }
+
+    #[test]
+    fn verify_callback_rejects_when_no_remote_fingerprint_set() {
+        // Same as the e2e but with NO fingerprint pinned on side A.
+        // The verify callback rejects on the first peer cert and A
+        // transitions to Failed.
+        rt().block_on(async {
+            use crate::candidate::Candidate;
+            use crate::description::Type as DescriptionType;
+
+            let a_cands: Arc<Mutex<Vec<Candidate>>> = Arc::new(Mutex::new(Vec::new()));
+            let b_cands: Arc<Mutex<Vec<Candidate>>> = Arc::new(Mutex::new(Vec::new()));
+            let a_cands_cb = a_cands.clone();
+            let b_cands_cb = b_cands.clone();
+            let a_callbacks = IceTransportCallbacks {
+                on_candidate: Arc::new(move |c| a_cands_cb.lock().push(c)),
+                ..IceTransportCallbacks::default()
+            };
+            let b_callbacks = IceTransportCallbacks {
+                on_candidate: Arc::new(move |c| b_cands_cb.lock().push(c)),
+                ..IceTransportCallbacks::default()
+            };
+            let mut cfg = Configuration::new();
+            cfg.bind_address = Some("127.0.0.1".to_string());
+            let ice_a = IceTransport::new(&cfg, Role::ActPass, a_callbacks).expect("ice a");
+            let ice_b = IceTransport::new(&cfg, Role::Active, b_callbacks).expect("ice b");
+
+            let a_failed = Arc::new(AtomicBool::new(false));
+            let af = a_failed.clone();
+            let cert_a = Certificate::generate_default().expect("cert a");
+            let cert_b = Certificate::generate_default().expect("cert b");
+            let fp_a = cert_a
+                .fingerprint(FingerprintAlgorithm::Sha256)
+                .expect("fp a");
+            let dtls_a = DtlsTransport::new(
+                Arc::clone(&ice_a),
+                cert_a,
+                DtlsTransportCallbacks {
+                    on_state_change: Arc::new(move |s| {
+                        if matches!(s, DtlsState::Failed) {
+                            af.store(true, Ordering::SeqCst);
+                        }
+                    }),
+                    ..DtlsTransportCallbacks::default()
+                },
+            )
+            .expect("dtls a");
+            let dtls_b = DtlsTransport::new(
+                Arc::clone(&ice_b),
+                cert_b,
+                DtlsTransportCallbacks::default(),
+            )
+            .expect("dtls b");
+            // Deliberately do NOT set A's fingerprint. B gets the right one.
+            dtls_b.set_remote_fingerprint(fp_a);
+
+            ice_a.gather().expect("a gather");
+            assert!(
+                wait_for_dtls(
+                    || ice_a.gathering_state()
+                        == crate::ice_transport::GatheringState::Complete,
+                    3000
+                )
+                .await
+            );
+            let desc_a = ice_a
+                .get_local_description(DescriptionType::Offer)
+                .unwrap();
+            ice_b.set_remote_description(&desc_a).unwrap();
+            ice_b.gather().expect("b gather");
+            assert!(
+                wait_for_dtls(
+                    || ice_b.gathering_state()
+                        == crate::ice_transport::GatheringState::Complete,
+                    3000
+                )
+                .await
+            );
+            let desc_b = ice_b
+                .get_local_description(DescriptionType::Answer)
+                .unwrap();
+            ice_a.set_remote_description(&desc_b).unwrap();
+            for c in a_cands.lock().iter() {
+                ice_b.add_remote_candidate(c).unwrap();
+            }
+            for c in b_cands.lock().iter() {
+                ice_a.add_remote_candidate(c).unwrap();
+            }
+            ice_a.set_remote_end_of_candidates().unwrap();
+            ice_b.set_remote_end_of_candidates().unwrap();
+
+            let failed = wait_for_dtls(
+                || a_failed.load(Ordering::SeqCst),
+                8000,
+            )
+            .await;
+            assert!(
+                failed,
+                "expected A to Fail without remote fingerprint pinned (state={:?}, dtls_b={:?})",
+                dtls_a.state(),
+                dtls_b.state(),
+            );
+            // Suppress the unused-helper warning when pair_ice_loopback
+            // is only referenced from the loopback test.
+            let _ = pair_ice_loopback;
         });
     }
 }
