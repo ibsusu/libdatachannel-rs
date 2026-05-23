@@ -11,8 +11,10 @@
 // During the in-progress port we accept dead code — modules land in pieces.
 #![allow(dead_code)]
 
+mod candidate;
 mod error;
 
+pub use candidate::{Candidate, CandidateType, Family, ParseError as CandidateParseError, TransportType};
 pub use error::{Error, Result};
 
 /// Optional resource preload (no-op until task #17 lands the runtime).
