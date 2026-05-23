@@ -564,8 +564,13 @@ impl DtlsTransport {
         *self.bridge.callbacks.lock() = callbacks;
     }
 
-    /// Snapshot of the currently-installed callback set (symmetric with
-    /// [`IceTransport::callbacks`]).
+    /// Snapshot the current callbacks bag, so a layered transport (SCTP)
+    /// can install its own `on_data` while keeping the upstream handlers.
+    ///
+    /// Mirrors [`IceTransport::callbacks`]; consumed by
+    /// [`crate::SctpTransport`] in Phase G-6a, which chains its own
+    /// `on_data` onto DTLS while preserving the PeerConnection-owned
+    /// `on_state_change`.
     pub fn callbacks(&self) -> DtlsTransportCallbacks {
         let g = self.bridge.callbacks.lock();
         DtlsTransportCallbacks {
@@ -1654,6 +1659,48 @@ mod tests {
             // Suppress the unused-helper warning when pair_ice_loopback
             // is only referenced from the loopback test.
             let _ = pair_ice_loopback;
+        });
+    }
+
+    #[test]
+    fn dtls_callbacks_getter_round_trips() {
+        // The callbacks() snapshot must hand back the same closures that
+        // were installed, so a layered transport (SCTP, G-6a) can chain
+        // its own on_data while preserving the upstream on_state_change.
+        rt().block_on(async {
+            let state_calls = Arc::new(AtomicUsize::new(0));
+            let data_bytes = Arc::new(AtomicUsize::new(0));
+            let sc = state_calls.clone();
+            let db = data_bytes.clone();
+
+            let callbacks = DtlsTransportCallbacks {
+                on_state_change: Arc::new(move |_s| {
+                    sc.fetch_add(1, Ordering::SeqCst);
+                }),
+                on_data: Arc::new(move |d| {
+                    db.fetch_add(d.len(), Ordering::SeqCst);
+                }),
+            };
+            let ice = make_ice(Role::Active);
+            let cert = Certificate::generate_default().unwrap();
+            let dtls =
+                DtlsTransport::new(ice, cert, callbacks).expect("dtls new");
+
+            // Snapshot and invoke the returned closures directly.
+            let snap = dtls.callbacks();
+            (snap.on_state_change)(DtlsState::Connecting);
+            (snap.on_data)(b"hello");
+
+            assert_eq!(
+                state_calls.load(Ordering::SeqCst),
+                1,
+                "snapshot on_state_change must be the installed closure"
+            );
+            assert_eq!(
+                data_bytes.load(Ordering::SeqCst),
+                5,
+                "snapshot on_data must be the installed closure"
+            );
         });
     }
 }

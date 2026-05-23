@@ -19,6 +19,7 @@ mod dtls_transport;
 mod error;
 mod ice_transport;
 mod reliability;
+mod sctp_transport;
 
 pub use candidate::{Candidate, CandidateType, Family, ParseError as CandidateParseError, TransportType};
 pub use certificate::{Certificate, CertificateError};
@@ -38,6 +39,10 @@ pub use ice_transport::{
     GatheringState, IceTransport, IceTransportCallbacks, IceTransportError, State as IceState,
 };
 pub use reliability::{Reliability, ReliabilityType};
+pub use sctp_transport::{
+    PayloadProtocolId, SctpMessage, SctpState, SctpTransport, SctpTransportCallbacks,
+    SctpTransportError,
+};
 
 /// Optional resource preload (no-op until task #17 lands the runtime).
 pub fn preload() {}
