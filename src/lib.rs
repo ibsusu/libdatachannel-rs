@@ -12,13 +12,16 @@
 #![allow(dead_code)]
 
 mod candidate;
+mod certificate;
 mod configuration;
 mod description;
+mod dtls_transport;
 mod error;
 mod ice_transport;
 mod reliability;
 
 pub use candidate::{Candidate, CandidateType, Family, ParseError as CandidateParseError, TransportType};
+pub use certificate::{Certificate, CertificateError};
 pub use configuration::{
     CertificateType, Configuration, CongestionControl, IceServer, IceServerParseError,
     IceServerType, IceTransportPolicy, ProxyServer, ProxyType, RelayType, TransportPolicy,
@@ -26,6 +29,9 @@ pub use configuration::{
 pub use description::{
     Application, Description, DescriptionParseError, Direction, Fingerprint,
     FingerprintAlgorithm, Role, Type,
+};
+pub use dtls_transport::{
+    DtlsState, DtlsTransport, DtlsTransportCallbacks, DtlsTransportError,
 };
 pub use error::{Error, Result};
 pub use ice_transport::{

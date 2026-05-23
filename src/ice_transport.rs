@@ -743,6 +743,28 @@ impl IceTransport {
         let mut guard = self.bridge.callbacks.lock();
         *guard = callbacks;
     }
+
+    /// Snapshot of the currently-installed callback set.
+    ///
+    /// Layered transports (DTLS in Phase G-5a, SCTP in G-5c) use this
+    /// to remember the upper-layer callbacks before they install their
+    /// own shims with [`set_callbacks`](Self::set_callbacks) — for
+    /// example, DTLS stashes the original `on_data` so it can chain
+    /// application-record bytes back to the original recipient once
+    /// the handshake is up.
+    ///
+    /// Each callback in the returned set is an `Arc::clone` of what's
+    /// currently installed, so the snapshot keeps working even after
+    /// a subsequent `set_callbacks` swap.
+    pub fn callbacks(&self) -> IceTransportCallbacks {
+        let guard = self.bridge.callbacks.lock();
+        IceTransportCallbacks {
+            on_state_change: Arc::clone(&guard.on_state_change),
+            on_gathering_state_change: Arc::clone(&guard.on_gathering_state_change),
+            on_candidate: Arc::clone(&guard.on_candidate),
+            on_data: Arc::clone(&guard.on_data),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1380,6 +1402,62 @@ mod tests {
                 b_calls.load(Ordering::SeqCst),
                 1,
                 "new callback must fire on close()"
+            );
+        });
+    }
+
+    #[test]
+    fn callbacks_getter_round_trips() {
+        // The snapshot returned by `callbacks()` should be a live Arc
+        // clone of the currently-installed set: invoking it dispatches
+        // to the same closures, and a subsequent `set_callbacks` does
+        // NOT mutate the snapshot we already took.
+        rt().block_on(async {
+            let original_calls = Arc::new(AtomicUsize::new(0));
+            let original_calls_cb = original_calls.clone();
+            let initial = IceTransportCallbacks {
+                on_state_change: Arc::new(move |_s| {
+                    original_calls_cb.fetch_add(1, Ordering::SeqCst);
+                }),
+                ..IceTransportCallbacks::default()
+            };
+
+            let cfg = Configuration::new();
+            let t = IceTransport::new(&cfg, Role::ActPass, initial).expect("construct");
+
+            // Snapshot the original on_state_change closure.
+            let snapshot = t.callbacks();
+
+            // Now install something else.
+            let replacement_calls = Arc::new(AtomicUsize::new(0));
+            let replacement_calls_cb = replacement_calls.clone();
+            t.set_callbacks(IceTransportCallbacks {
+                on_state_change: Arc::new(move |_s| {
+                    replacement_calls_cb.fetch_add(1, Ordering::SeqCst);
+                }),
+                ..IceTransportCallbacks::default()
+            });
+
+            // Manually invoke the snapshot — it should still point at
+            // the original closure (Arc keepalive).
+            (snapshot.on_state_change)(State::Connected);
+            assert_eq!(
+                original_calls.load(Ordering::SeqCst),
+                1,
+                "snapshot must keep the original closure alive"
+            );
+            assert_eq!(
+                replacement_calls.load(Ordering::SeqCst),
+                0,
+                "snapshot must not see the replacement"
+            );
+
+            // And the transport itself now dispatches to the replacement.
+            t.close().expect("close");
+            assert_eq!(
+                replacement_calls.load(Ordering::SeqCst),
+                1,
+                "transport must dispatch to the replacement after set_callbacks"
             );
         });
     }
