@@ -12,15 +12,22 @@
 #![allow(dead_code)]
 
 mod candidate;
+mod configuration;
 mod description;
 mod error;
+mod reliability;
 
 pub use candidate::{Candidate, CandidateType, Family, ParseError as CandidateParseError, TransportType};
+pub use configuration::{
+    CertificateType, Configuration, CongestionControl, IceServer, IceServerParseError,
+    IceServerType, IceTransportPolicy, ProxyServer, ProxyType, RelayType, TransportPolicy,
+};
 pub use description::{
     Application, Description, DescriptionParseError, Direction, Fingerprint,
     FingerprintAlgorithm, Role, Type,
 };
 pub use error::{Error, Result};
+pub use reliability::{Reliability, ReliabilityType};
 
 /// Optional resource preload (no-op until task #17 lands the runtime).
 pub fn preload() {}
