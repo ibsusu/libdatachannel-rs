@@ -15,6 +15,7 @@ mod candidate;
 mod configuration;
 mod description;
 mod error;
+mod ice_transport;
 mod reliability;
 
 pub use candidate::{Candidate, CandidateType, Family, ParseError as CandidateParseError, TransportType};
@@ -27,6 +28,9 @@ pub use description::{
     FingerprintAlgorithm, Role, Type,
 };
 pub use error::{Error, Result};
+pub use ice_transport::{
+    GatheringState, IceTransport, IceTransportCallbacks, IceTransportError, State as IceState,
+};
 pub use reliability::{Reliability, ReliabilityType};
 
 /// Optional resource preload (no-op until task #17 lands the runtime).
