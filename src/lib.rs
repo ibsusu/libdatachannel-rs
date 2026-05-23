@@ -12,9 +12,14 @@
 #![allow(dead_code)]
 
 mod candidate;
+mod description;
 mod error;
 
 pub use candidate::{Candidate, CandidateType, Family, ParseError as CandidateParseError, TransportType};
+pub use description::{
+    Application, Description, DescriptionParseError, Direction, Fingerprint,
+    FingerprintAlgorithm, Role, Type,
+};
 pub use error::{Error, Result};
 
 /// Optional resource preload (no-op until task #17 lands the runtime).
