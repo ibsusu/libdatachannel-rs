@@ -41,6 +41,7 @@
 //! - DTLS handoff — the `on_data` callback is the seam for Task #14.
 
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -197,30 +198,21 @@ pub struct IceTransport {
     /// to either Active or Passive in `set_remote_description`, matching
     /// the C++ behaviour at `icetransport.cpp:215`.
     role: Mutex<Role>,
-    /// Current dc-side state. Updated from the libjuice state callback
-    /// (and once at construction time to `New`).
-    state: Mutex<State>,
-    /// Current gathering state.
-    gathering_state: Mutex<GatheringState>,
-    /// The mid used to stamp inbound trickled candidates. Defaults to
-    /// `"0"` (matching `IceTransport::mMid("0")` in
-    /// `icetransport.cpp:53`); overwritten when `set_remote_description`
-    /// pulls a `bundleMid()` out of the remote SDP.
-    mid: Mutex<String>,
-    /// Shared callback set (kept so [`IceTransport::set_callbacks`]
-    /// could be implemented later if needed; for now it's set once at
-    /// construction and never mutated).
-    #[allow(dead_code)]
-    callbacks: IceTransportCallbacks,
+    /// Shared bridge holding the dc-side state machine + callback set.
+    /// The libjuice handler closures hold their own clones of this Arc;
+    /// `IceTransport` holds this clone so [`set_callbacks`] and
+    /// [`close`] can mutate the shared state.
+    bridge: Arc<Bridge>,
 }
 
 impl std::fmt::Debug for IceTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IceTransport")
-            .field("state", &*self.state.lock())
-            .field("gathering_state", &*self.gathering_state.lock())
+            .field("state", &*self.bridge.state.lock())
+            .field("gathering_state", &*self.bridge.gathering_state.lock())
             .field("role", &*self.role.lock())
-            .field("mid", &*self.mid.lock())
+            .field("mid", &*self.bridge.mid.lock())
+            .field("closed", &self.bridge.closed.load(Ordering::SeqCst))
             .finish()
     }
 }
@@ -295,7 +287,8 @@ impl IceTransport {
             state: Mutex::new(State::New),
             gathering_state: Mutex::new(GatheringState::New),
             mid: Mutex::new("0".to_string()),
-            callbacks: callbacks.clone(),
+            callbacks: Mutex::new(callbacks),
+            closed: AtomicBool::new(false),
         });
 
         // --- build the libjuice Handler with our shims. ---
@@ -399,21 +392,18 @@ impl IceTransport {
         Ok(Arc::new(IceTransport {
             agent,
             role: Mutex::new(role),
-            state: Mutex::new(State::New),
-            gathering_state: Mutex::new(GatheringState::New),
-            mid: Mutex::new("0".to_string()),
-            callbacks,
+            bridge,
         }))
     }
 
     /// Current ICE state. Updated by the libjuice state callback.
     pub fn state(&self) -> State {
-        *self.state.lock()
+        *self.bridge.state.lock()
     }
 
     /// Current gathering state.
     pub fn gathering_state(&self) -> GatheringState {
-        *self.gathering_state.lock()
+        *self.bridge.gathering_state.lock()
     }
 
     /// Current DTLS role (`actpass` until [`set_remote_description`]
@@ -426,13 +416,16 @@ impl IceTransport {
     /// (libjuice's driver simply ignores the second command and we update
     /// the gathering state to `InProgress` once).
     pub fn gather(&self) -> Result<(), IceTransportError> {
+        if self.bridge.closed.load(Ordering::SeqCst) {
+            return Err(IceTransportError::Closed);
+        }
         // Update our own gathering-state machine first so the first
         // `on_candidate` callback (which may fire synchronously on the
         // driver task) sees `InProgress`. Matches the C++ comment at
         // `icetransport.cpp:243` ("Change state now as candidates calls
         // can be synchronous").
         let prev = {
-            let mut g = self.gathering_state.lock();
+            let mut g = self.bridge.gathering_state.lock();
             let was = *g;
             if was == GatheringState::New {
                 *g = GatheringState::InProgress;
@@ -440,7 +433,11 @@ impl IceTransport {
             was
         };
         if prev == GatheringState::New {
-            (self.callbacks.on_gathering_state_change)(GatheringState::InProgress);
+            let cb = {
+                let guard = self.bridge.callbacks.lock();
+                Arc::clone(&guard.on_gathering_state_change)
+            };
+            (cb)(GatheringState::InProgress);
             self.agent.gather_candidates()?;
         }
         Ok(())
@@ -484,7 +481,7 @@ impl IceTransport {
         // Description ctor that does the same plucking).
         let (ufrag, pwd) = extract_ice_creds(&sdp_fragment);
 
-        let mid = self.mid.lock().clone();
+        let mid = self.bridge.mid.lock().clone();
         let mut desc = Description::new(typ, role_to_use);
         if let Some(u) = ufrag {
             desc.set_ice_ufrag(u);
@@ -516,6 +513,9 @@ impl IceTransport {
         &self,
         desc: &Description,
     ) -> Result<(), IceTransportError> {
+        if self.bridge.closed.load(Ordering::SeqCst) {
+            return Err(IceTransportError::Closed);
+        }
         // Role resolution.
         {
             let mut role = self.role.lock();
@@ -530,7 +530,7 @@ impl IceTransport {
 
         // Record the bundle mid so candidate-callback shims can stamp
         // trickled candidates.
-        *self.mid.lock() = desc.bundle_mid();
+        *self.bridge.mid.lock() = desc.bundle_mid();
 
         // libjuice's `set_remote_description` accepts an SDP fragment
         // (it only looks for ice-ufrag / ice-pwd / candidate lines), so
@@ -552,6 +552,9 @@ impl IceTransport {
         &self,
         candidate: &Candidate,
     ) -> Result<bool, IceTransportError> {
+        if self.bridge.closed.load(Ordering::SeqCst) {
+            return Err(IceTransportError::Closed);
+        }
         if !candidate.is_resolved() {
             return Ok(false);
         }
@@ -563,6 +566,9 @@ impl IceTransport {
 
     /// Signal that the remote peer has finished trickling candidates.
     pub fn set_remote_end_of_candidates(&self) -> Result<(), IceTransportError> {
+        if self.bridge.closed.load(Ordering::SeqCst) {
+            return Err(IceTransportError::Closed);
+        }
         self.agent
             .set_remote_gathering_done()
             .map_err(IceTransportError::Juice)
@@ -572,6 +578,9 @@ impl IceTransport {
     /// (via libjuice's [`Error::NotAvailable`](libjuice::Error)) if no
     /// pair has been nominated yet.
     pub fn send(&self, data: &[u8]) -> Result<(), IceTransportError> {
+        if self.bridge.closed.load(Ordering::SeqCst) {
+            return Err(IceTransportError::Closed);
+        }
         self.agent.send(data).map_err(IceTransportError::Juice)
     }
 
@@ -584,7 +593,7 @@ impl IceTransport {
             .agent
             .get_selected_candidates()
             .map_err(|_| IceTransportError::NoSelectedPair)?;
-        let mid = self.mid.lock().clone();
+        let mid = self.bridge.mid.lock().clone();
         let local = Candidate::parse(&local_sdp, &mid)?;
         let remote = Candidate::parse(&remote_sdp, &mid)?;
         Ok((local, remote))
@@ -599,6 +608,140 @@ impl IceTransport {
         self.agent
             .get_selected_addresses()
             .map_err(|_| IceTransportError::NoSelectedPair)
+    }
+
+    /// Request an ICE restart.
+    ///
+    /// In W3C terms an ICE restart resets the local gathering and
+    /// connection state and produces a fresh ufrag/pwd pair so a new
+    /// round of connectivity checks can be triggered.
+    ///
+    /// libjuice's [`Agent`] does not yet expose a restart API (see
+    /// `native/rust/libjuice/src/agent/mod.rs` — there is no
+    /// `restart`/`restart_gather` command). This implementation is a
+    /// best-effort stub: it resets the dc-side `state` and
+    /// `gathering_state` flags to [`State::New`] /
+    /// [`GatheringState::New`] and fires the corresponding callbacks so
+    /// upper layers can observe the transition, but it does NOT cycle
+    /// libjuice's own state machine or generate a fresh ufrag/pwd.
+    ///
+    /// TODO: once `libjuice::Agent` grows a `restart_gather` (or
+    /// similar) entry point, plumb it through here so the local
+    /// ufrag/pwd actually rotates. The relevant file is
+    /// `native/rust/libjuice/src/agent/mod.rs`.
+    pub fn restart_ice(&self) -> Result<(), IceTransportError> {
+        if self.bridge.closed.load(Ordering::SeqCst) {
+            return Err(IceTransportError::Closed);
+        }
+
+        warn!(
+            "IceTransport::restart_ice: best-effort stub — libjuice backend \
+             does not yet expose a restart API; resetting dc-side state \
+             flags only (no fresh ufrag/pwd)"
+        );
+
+        let gathering_changed = {
+            let mut g = self.bridge.gathering_state.lock();
+            if *g != GatheringState::New {
+                *g = GatheringState::New;
+                true
+            } else {
+                false
+            }
+        };
+        let state_changed = {
+            let mut s = self.bridge.state.lock();
+            if *s != State::New {
+                *s = State::New;
+                true
+            } else {
+                false
+            }
+        };
+
+        if gathering_changed {
+            let cb = {
+                let guard = self.bridge.callbacks.lock();
+                Arc::clone(&guard.on_gathering_state_change)
+            };
+            (cb)(GatheringState::New);
+        }
+        if state_changed {
+            let cb = {
+                let guard = self.bridge.callbacks.lock();
+                Arc::clone(&guard.on_state_change)
+            };
+            (cb)(State::New);
+        }
+
+        Ok(())
+    }
+
+    /// Eagerly close the transport.
+    ///
+    /// Transitions the dc-side state to [`State::Closed`] and fires
+    /// `on_state_change(Closed)` exactly once. Subsequent calls are
+    /// a no-op (idempotent).
+    ///
+    /// After `close()`:
+    /// - [`send`](Self::send), [`gather`](Self::gather),
+    ///   [`add_remote_candidate`](Self::add_remote_candidate),
+    ///   [`set_remote_description`](Self::set_remote_description), and
+    ///   [`set_remote_end_of_candidates`](Self::set_remote_end_of_candidates)
+    ///   all return [`IceTransportError::Closed`].
+    /// - The `on_data` callback will no longer be invoked even if more
+    ///   bytes arrive on the libjuice driver task.
+    ///
+    /// Note: this does NOT tear down the libjuice [`Agent`] — libjuice's
+    /// driver only exits when the last `Arc` reference to it drops.
+    /// `IceTransport` keeps that `Arc` alive (for example so the
+    /// closures above this layer can still inspect the selected pair
+    /// for diagnostics). The driver is released on `Drop`.
+    pub fn close(&self) -> Result<(), IceTransportError> {
+        // Mark closed first. If we were already closed, bail out — this
+        // makes the operation idempotent and ensures the callback fires
+        // exactly once.
+        let was_closed = self.bridge.closed.swap(true, Ordering::SeqCst);
+        if was_closed {
+            return Ok(());
+        }
+
+        let state_changed = {
+            let mut s = self.bridge.state.lock();
+            if *s != State::Closed {
+                *s = State::Closed;
+                true
+            } else {
+                false
+            }
+        };
+
+        if state_changed {
+            let cb = {
+                let guard = self.bridge.callbacks.lock();
+                Arc::clone(&guard.on_state_change)
+            };
+            (cb)(State::Closed);
+        }
+
+        Ok(())
+    }
+
+    /// Swap the callback set at runtime.
+    ///
+    /// Wired in for Task #14 (DTLS): the DTLS transport constructs the
+    /// underlying `IceTransport` first (so it can use it to push
+    /// handshake records into the agent), then installs its own
+    /// `on_data` handler to receive raw bytes off the wire. The full
+    /// `IceTransportCallbacks` set is replaced atomically — pass
+    /// [`IceTransportCallbacks::default`] for an all-no-ops set.
+    ///
+    /// The dispatch path locks the callbacks mutex only long enough to
+    /// clone the relevant `Arc<dyn Fn>` out, so callbacks are free to
+    /// call back into `IceTransport` without deadlocking.
+    pub fn set_callbacks(&self, callbacks: IceTransportCallbacks) {
+        let mut guard = self.bridge.callbacks.lock();
+        *guard = callbacks;
     }
 }
 
@@ -615,11 +758,31 @@ struct Bridge {
     state: Mutex<State>,
     gathering_state: Mutex<GatheringState>,
     mid: Mutex<String>,
-    callbacks: IceTransportCallbacks,
+    /// Callback set, behind a Mutex so [`IceTransport::set_callbacks`]
+    /// can swap it at runtime (used by DTLS in Task #14 to install its
+    /// own `on_data` after construction).
+    ///
+    /// Each dispatch path locks the mutex only long enough to clone the
+    /// relevant `Arc<dyn Fn>`, then releases the lock before invoking
+    /// the callback. This keeps callbacks free to call back into
+    /// `IceTransport` (which might in turn try to `set_callbacks`)
+    /// without deadlocking.
+    callbacks: Mutex<IceTransportCallbacks>,
+    /// Set true by [`IceTransport::close`]. Gates the recv handler so
+    /// `on_data` no longer fires once the transport is closed, even if
+    /// the libjuice driver delivers more bytes before its socket is
+    /// torn down on `Drop`.
+    closed: AtomicBool,
 }
 
 impl Bridge {
     fn on_juice_state(&self, s: libjuice::State) {
+        // Once we're closed, our `state` mutex is pinned at `Closed`
+        // and the user has already been notified. Silently drop any
+        // late libjuice state callbacks rather than risk re-firing.
+        if self.closed.load(Ordering::SeqCst) {
+            return;
+        }
         let new_state = map_state(s);
         let changed = {
             let mut g = self.state.lock();
@@ -631,14 +794,27 @@ impl Bridge {
             }
         };
         if changed {
-            (self.callbacks.on_state_change)(new_state);
+            let cb = {
+                let guard = self.callbacks.lock();
+                Arc::clone(&guard.on_state_change)
+            };
+            (cb)(new_state);
         }
     }
 
     fn on_juice_candidate(&self, sdp: String) {
+        if self.closed.load(Ordering::SeqCst) {
+            return;
+        }
         let mid = self.mid.lock().clone();
         match Candidate::parse(&sdp, &mid) {
-            Ok(c) => (self.callbacks.on_candidate)(c),
+            Ok(c) => {
+                let cb = {
+                    let guard = self.callbacks.lock();
+                    Arc::clone(&guard.on_candidate)
+                };
+                (cb)(c);
+            }
             Err(e) => {
                 // Match the C++ "ignore malformed candidates" stance at
                 // `icetransport.cpp:344`.
@@ -648,6 +824,9 @@ impl Bridge {
     }
 
     fn on_juice_gathering_done(&self) {
+        if self.closed.load(Ordering::SeqCst) {
+            return;
+        }
         let changed = {
             let mut g = self.gathering_state.lock();
             if *g != GatheringState::Complete {
@@ -658,12 +837,26 @@ impl Bridge {
             }
         };
         if changed {
-            (self.callbacks.on_gathering_state_change)(GatheringState::Complete);
+            let cb = {
+                let guard = self.callbacks.lock();
+                Arc::clone(&guard.on_gathering_state_change)
+            };
+            (cb)(GatheringState::Complete);
         }
     }
 
     fn on_juice_recv(&self, data: &[u8]) {
-        (self.callbacks.on_data)(data);
+        // Drop any datagrams that race past close — DTLS in Task #14
+        // relies on this gate to safely tear down its own state before
+        // a final flurry of records lands.
+        if self.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        let cb = {
+            let guard = self.callbacks.lock();
+            Arc::clone(&guard.on_data)
+        };
+        (cb)(data);
     }
 }
 
@@ -1007,6 +1200,201 @@ mod tests {
             // Sanity: selected pair queryable on both sides now.
             assert!(a.get_selected_pair().is_ok());
             assert!(b.get_selected_pair().is_ok());
+        });
+    }
+
+    // ---------------------------------------------------------------
+    // Phase G-4b: ICE restart, eager close, runtime callback swap.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn restart_ice_resets_state_flags() {
+        rt().block_on(async {
+            // Capture gathering-state transitions so we can assert the
+            // restart fires `on_gathering_state_change(New)`.
+            let gstates: Arc<Mutex<Vec<GatheringState>>> = Arc::new(Mutex::new(Vec::new()));
+            let gstates_cb = gstates.clone();
+            let callbacks = IceTransportCallbacks {
+                on_gathering_state_change: Arc::new(move |g| {
+                    gstates_cb.lock().push(g);
+                }),
+                ..IceTransportCallbacks::default()
+            };
+
+            let mut cfg = Configuration::new();
+            cfg.bind_address = Some("127.0.0.1".to_string());
+            let t = IceTransport::new(&cfg, Role::ActPass, callbacks).expect("construct");
+
+            t.gather().expect("gather");
+            assert_eq!(t.gathering_state(), GatheringState::InProgress);
+            // The synchronous part of gather() must have pushed
+            // InProgress already.
+            assert!(
+                gstates.lock().iter().any(|g| *g == GatheringState::InProgress),
+                "expected InProgress in {:?}",
+                gstates.lock().clone()
+            );
+
+            t.restart_ice().expect("restart_ice");
+            assert_eq!(t.gathering_state(), GatheringState::New);
+
+            // The restart should have fired a New transition on the
+            // gathering-state callback.
+            assert!(
+                gstates.lock().iter().any(|g| *g == GatheringState::New),
+                "expected New after restart in {:?}",
+                gstates.lock().clone()
+            );
+        });
+    }
+
+    #[test]
+    fn close_transitions_to_closed_state() {
+        rt().block_on(async {
+            let states: Arc<Mutex<Vec<State>>> = Arc::new(Mutex::new(Vec::new()));
+            let states_cb = states.clone();
+            let callbacks = IceTransportCallbacks {
+                on_state_change: Arc::new(move |s| states_cb.lock().push(s)),
+                ..IceTransportCallbacks::default()
+            };
+
+            let cfg = Configuration::new();
+            let t = IceTransport::new(&cfg, Role::ActPass, callbacks).expect("construct");
+
+            t.close().expect("close");
+            assert_eq!(t.state(), State::Closed);
+            assert!(
+                states.lock().iter().any(|s| *s == State::Closed),
+                "expected Closed in {:?}",
+                states.lock().clone()
+            );
+        });
+    }
+
+    #[test]
+    fn close_is_idempotent() {
+        rt().block_on(async {
+            let closed_calls = Arc::new(AtomicUsize::new(0));
+            let closed_calls_cb = closed_calls.clone();
+            let callbacks = IceTransportCallbacks {
+                on_state_change: Arc::new(move |s| {
+                    if s == State::Closed {
+                        closed_calls_cb.fetch_add(1, Ordering::SeqCst);
+                    }
+                }),
+                ..IceTransportCallbacks::default()
+            };
+
+            let cfg = Configuration::new();
+            let t = IceTransport::new(&cfg, Role::ActPass, callbacks).expect("construct");
+
+            t.close().expect("first close");
+            t.close().expect("second close");
+
+            assert_eq!(
+                closed_calls.load(Ordering::SeqCst),
+                1,
+                "close() must fire the Closed callback exactly once"
+            );
+            assert_eq!(t.state(), State::Closed);
+        });
+    }
+
+    #[test]
+    fn send_after_close_errors() {
+        rt().block_on(async {
+            let cfg = Configuration::new();
+            let t = IceTransport::new(&cfg, Role::ActPass, IceTransportCallbacks::default())
+                .expect("construct");
+            t.close().expect("close");
+            let err = t.send(b"hi").expect_err("send after close must fail");
+            assert!(
+                matches!(err, IceTransportError::Closed),
+                "expected Closed, got {err:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn add_remote_candidate_after_close_errors() {
+        rt().block_on(async {
+            let cfg = Configuration::new();
+            let t = IceTransport::new(&cfg, Role::ActPass, IceTransportCallbacks::default())
+                .expect("construct");
+            t.close().expect("close");
+            // Construct a syntactically-valid host candidate so the
+            // pre-flight `is_resolved` check doesn't short-circuit
+            // before the closed check.
+            let cand = Candidate::parse(
+                "candidate:1 1 UDP 2122252543 127.0.0.1 54321 typ host",
+                "0",
+            )
+            .expect("parse cand");
+            let err = t
+                .add_remote_candidate(&cand)
+                .expect_err("add_remote_candidate after close must fail");
+            assert!(
+                matches!(err, IceTransportError::Closed),
+                "expected Closed, got {err:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn set_callbacks_replaces_existing() {
+        rt().block_on(async {
+            let a_calls = Arc::new(AtomicUsize::new(0));
+            let b_calls = Arc::new(AtomicUsize::new(0));
+            let a_calls_cb = a_calls.clone();
+
+            // Initial callbacks: only A counts state transitions.
+            let initial = IceTransportCallbacks {
+                on_state_change: Arc::new(move |_s| {
+                    a_calls_cb.fetch_add(1, Ordering::SeqCst);
+                }),
+                ..IceTransportCallbacks::default()
+            };
+
+            let cfg = Configuration::new();
+            let t = IceTransport::new(&cfg, Role::ActPass, initial).expect("construct");
+
+            // Swap in a new set: only B counts.
+            let b_calls_cb = b_calls.clone();
+            let replacement = IceTransportCallbacks {
+                on_state_change: Arc::new(move |_s| {
+                    b_calls_cb.fetch_add(1, Ordering::SeqCst);
+                }),
+                ..IceTransportCallbacks::default()
+            };
+            t.set_callbacks(replacement);
+
+            // Trigger a state change via close().
+            t.close().expect("close");
+
+            assert_eq!(
+                a_calls.load(Ordering::SeqCst),
+                0,
+                "old callback must not fire after set_callbacks"
+            );
+            assert_eq!(
+                b_calls.load(Ordering::SeqCst),
+                1,
+                "new callback must fire on close()"
+            );
+        });
+    }
+
+    #[test]
+    fn callbacks_default_are_safe_noops() {
+        rt().block_on(async {
+            let cfg = Configuration::new();
+            let t = IceTransport::new(&cfg, Role::ActPass, IceTransportCallbacks::default())
+                .expect("construct");
+            t.set_callbacks(IceTransportCallbacks::default());
+            // Trigger close() — the default on_state_change must just
+            // do nothing rather than panic.
+            t.close().expect("close");
+            assert_eq!(t.state(), State::Closed);
         });
     }
 }
