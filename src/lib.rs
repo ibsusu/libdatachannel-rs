@@ -21,9 +21,12 @@ mod error;
 mod ice_transport;
 mod peer_connection;
 mod reliability;
+mod rtp;
+mod rtp_packetizer;
 mod sctp_transport;
 mod srtp_sys;
 mod srtp_transport;
+mod track;
 mod usrsctp_sys;
 
 pub use candidate::{Candidate, CandidateType, Family, ParseError as CandidateParseError, TransportType};
@@ -51,6 +54,17 @@ pub use peer_connection::{
     PeerConnectionError, PeerConnectionState, SignalingState,
 };
 pub use reliability::{Reliability, ReliabilityType};
+pub use rtp::{
+    is_rtcp, RtcpHeader, RtcpReportBlock, RtcpRr, RtcpSr, RtpExtensionHeader, RtpHeader, Ssrc,
+    RTCP_HEADER_SIZE, RTCP_PT_BYE, RTCP_PT_RR, RTCP_PT_SDES, RTCP_PT_SR, RTCP_REPORT_BLOCK_SIZE,
+    RTP_HEADER_SIZE,
+};
+pub use rtp_packetizer::{
+    DepacketizedFrame, RtpDepacketizer, RtpPacketizationConfig, RtpPacketizer, VIDEO_CLOCK_RATE,
+};
+pub use track::{
+    Codec, Media as TrackMedia, RtpMap, SsrcEntry, Track, TrackCallbacks, TrackError, TrackInit,
+};
 pub use sctp_transport::{
     PayloadProtocolId, SctpMessage, SctpState, SctpTransport, SctpTransportCallbacks,
     SctpTransportError,
