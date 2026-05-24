@@ -67,9 +67,17 @@ const SOCK_STREAM: i32 = 1;
 const SOL_SOCKET: i32 = 0xffff; // macOS/BSD SOL_SOCKET
 const SOL_SOCKET_LINUX: i32 = 1; // Linux SOL_SOCKET
 
-// SOL_SOCKET option names (BSD/macOS values; usrsctp uses BSD numbering
-// in userspace regardless of host OS).
-const SO_LINGER: i32 = 0x0080;
+// SOL_SOCKET-level option NAMES. Unlike the IPPROTO_SCTP options below
+// (which usrsctp defines itself, with BSD numbering, regardless of host),
+// usrsctp's `SOL_SOCKET` switch matches the option name against the host's
+// own `SO_*` macros (it includes the system <sys/socket.h>). So these must
+// carry the HOST value, not a fixed BSD value:
+//   SO_LINGER = 0x0080 on macOS/BSD, but 13 on Linux.
+// Sending the BSD value on Linux makes usrsctp_setsockopt fall through to
+// `default: errno = EINVAL`, which previously failed SCTP setup at the very
+// first setsockopt (SO_LINGER) and dropped the association into Failed.
+const SO_LINGER: i32 = 0x0080; // macOS/BSD SO_LINGER
+const SO_LINGER_LINUX: i32 = 13; // Linux SO_LINGER
 
 // IPPROTO_SCTP socket options.
 const SCTP_NODELAY: i32 = 0x04;
@@ -95,9 +103,23 @@ const SCTP_SENDV_SPA: u32 = 4;
 const SCTP_SEND_SNDINFO_VALID: u32 = 0x1;
 const SCTP_SEND_PRINFO_VALID: u32 = 0x2;
 
-// msg flags.
+// msg flags returned by usrsctp_recvv in the `flags` out-param.
+//
+// MSG_NOTIFICATION is defined by usrsctp itself (usrsctp.h: `#ifndef
+// MSG_NOTIFICATION #define ... 0x2000`), and neither host's <sys/socket.h>
+// defines it, so 0x2000 is correct everywhere.
+//
+// MSG_EOR, however, is only #defined by usrsctp inside its `_WIN32` block;
+// on every other host usrsctp picks up the system <sys/socket.h> value. That
+// value is platform-dependent: 0x8 on macOS/BSD but 0x80 on Linux. usrsctp
+// ORs the *host* MSG_EOR into the returned flags, so the Rust side must
+// compare against the matching host value. With the BSD 0x8 hard-coded, the
+// EOR bit was never seen on Linux: inbound notifications (incl. the
+// SCTP_COMM_UP that drives Connecting -> Connected) were buffered but never
+// flushed, so the association stalled in Connecting until timeout -> Failed.
 const MSG_NOTIFICATION: i32 = 0x2000;
-const MSG_EOR: i32 = 0x8;
+const MSG_EOR: i32 = 0x8; // macOS/BSD MSG_EOR
+const MSG_EOR_LINUX: i32 = 0x80; // Linux MSG_EOR
 
 // snd_flags.
 const SCTP_UNORDERED: u16 = 0x0400;
@@ -145,6 +167,31 @@ fn sol_socket() -> i32 {
         SOL_SOCKET_LINUX
     } else {
         SOL_SOCKET
+    }
+}
+
+/// Resolve the platform `SO_LINGER` option name. Same rationale as
+/// [`sol_socket`]: usrsctp's `SOL_SOCKET` switch compares against the host's
+/// `SO_LINGER` macro, which differs by platform (0x80 BSD/macOS vs 13 Linux).
+#[inline]
+fn so_linger() -> i32 {
+    if cfg!(target_os = "linux") || cfg!(target_os = "android") {
+        SO_LINGER_LINUX
+    } else {
+        SO_LINGER
+    }
+}
+
+/// Resolve the platform `MSG_EOR` flag bit. usrsctp ORs the host's
+/// `<sys/socket.h>` `MSG_EOR` into the flags returned by `usrsctp_recvv`
+/// (it only self-defines `MSG_EOR` on Windows), and that value is 0x8 on
+/// macOS/BSD but 0x80 on Linux. See the `MSG_EOR` const comment.
+#[inline]
+fn msg_eor() -> i32 {
+    if cfg!(target_os = "linux") || cfg!(target_os = "android") {
+        MSG_EOR_LINUX
+    } else {
+        MSG_EOR
     }
 }
 
@@ -671,7 +718,7 @@ impl SctpTransport {
                 l_onoff: 1,
                 l_linger: 0,
             };
-            setsockopt(sock, sol_socket(), SO_LINGER, &sol)?;
+            setsockopt(sock, sol_socket(), so_linger(), &sol)?;
 
             // SCTP_ENABLE_STREAM_RESET on all associations.
             let av = sys::sctp_assoc_value {
@@ -1010,10 +1057,13 @@ impl SctpTransport {
             let len = len as usize;
             let chunk = &buffer[..len];
 
+            // MSG_EOR's bit value is host-dependent (see `msg_eor`).
+            let eor = flags & msg_eor() != 0;
+
             if flags & MSG_NOTIFICATION != 0 {
                 let mut g = self.inner.lock();
                 g.partial_notification.extend_from_slice(chunk);
-                if flags & MSG_EOR != 0 {
+                if eor {
                     let notif = std::mem::take(&mut g.partial_notification);
                     drop(g);
                     self.process_notification(&notif);
@@ -1024,7 +1074,7 @@ impl SctpTransport {
                 if g.partial_message.len() > self.max_message_size {
                     g.partial_message.truncate(self.max_message_size);
                 }
-                if flags & MSG_EOR != 0 {
+                if eor {
                     let data = std::mem::take(&mut g.partial_message);
                     drop(g);
                     if infotype == SCTP_RECVV_RCVINFO {
