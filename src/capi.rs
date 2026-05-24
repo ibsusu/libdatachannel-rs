@@ -300,6 +300,26 @@ static USER_POINTERS: Lazy<Mutex<HashMap<c_int, usize>>> =
 /// Optional global log callback installed by `rtcInitLogger`.
 static LOG_CALLBACK: Lazy<Mutex<Option<RtcLogCallbackFunc>>> = Lazy::new(|| Mutex::new(None));
 
+/// Process-global Tokio runtime backing the C-ABI surface.
+///
+/// The high-level Rust API (`PeerConnection`, the libjuice agent's
+/// `tokio::spawn` of its event-loop driver) requires an **entered** Tokio
+/// runtime on the calling thread — Rust consumers get this from
+/// `rt.block_on(...)`. A C/C++ consumer calling the `rtc*` symbols runs on a
+/// plain OS thread with no runtime in context, so without this `tokio::spawn`
+/// panics ("there is no reactor running"). We therefore stand up a single
+/// multi-threaded runtime for the whole process and *enter* it for the body of
+/// every exported call (see [`guard`]/[`guard_bool`]/[`dispatch`]); entering is
+/// cheap (just sets a thread-local handle) and idempotent across nested calls.
+/// The runtime lives for the program's lifetime — matching libdatachannel's own
+/// global thread pool / poll service that `rtcCleanup` tears down.
+static RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("libdatachannel-rust: failed to build global Tokio runtime")
+});
+
 fn next_id() -> c_int {
     LAST_ID.fetch_add(1, Ordering::SeqCst) + 1
 }
@@ -341,7 +361,11 @@ fn get_dc(id: c_int) -> Option<DataChannel> {
 /// and mapping a panic to `RTC_ERR_FAILURE`, mirroring the C++ `wrap()` which
 /// turns a `std::exception` into `RTC_ERR_FAILURE`.
 fn guard<F: FnOnce() -> c_int + std::panic::UnwindSafe>(f: F) -> c_int {
-    match std::panic::catch_unwind(f) {
+    // Enter the global runtime so any `tokio::spawn` in the body has a reactor,
+    // even when called from a non-Tokio C/C++ thread. `enter()` is unwind-safe
+    // (it just installs/uninstalls a thread-local handle on drop).
+    let _rt = RUNTIME.enter();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(v) => v,
         Err(_) => RTC_ERR_FAILURE,
     }
@@ -349,7 +373,8 @@ fn guard<F: FnOnce() -> c_int + std::panic::UnwindSafe>(f: F) -> c_int {
 
 /// Run a `bool`-returning body, mapping a panic to `false`.
 fn guard_bool<F: FnOnce() -> bool + std::panic::UnwindSafe>(f: F) -> bool {
-    std::panic::catch_unwind(f).unwrap_or(false)
+    let _rt = RUNTIME.enter();
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(false)
 }
 
 /// Invoke a C callback inside `catch_unwind` so a panic in the (rare) event a
@@ -357,7 +382,8 @@ fn guard_bool<F: FnOnce() -> bool + std::panic::UnwindSafe>(f: F) -> bool {
 /// threads either. The C callback itself is `extern "C"`, so a panic *inside*
 /// the C code is already its problem; this guards our marshalling.
 fn dispatch<F: FnOnce() + std::panic::UnwindSafe>(f: F) {
-    let _ = std::panic::catch_unwind(f);
+    let _rt = RUNTIME.enter();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
 }
 
 /// libdatachannel's `copyAndReturn(string, buffer, size)`:
