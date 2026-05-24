@@ -14,6 +14,7 @@
 mod candidate;
 mod certificate;
 mod configuration;
+mod data_channel;
 mod description;
 mod dtls_transport;
 mod error;
@@ -40,9 +41,12 @@ pub use error::{Error, Result};
 pub use ice_transport::{
     GatheringState, IceTransport, IceTransportCallbacks, IceTransportError, State as IceState,
 };
+pub use data_channel::{
+    DataChannel, DataChannelCallbacks, DataChannelError, DataChannelInit,
+};
 pub use peer_connection::{
-    DataChannelStub, GatheringState as PeerGatheringState, PeerConnection,
-    PeerConnectionCallbacks, PeerConnectionError, PeerConnectionState, SignalingState,
+    GatheringState as PeerGatheringState, PeerConnection, PeerConnectionCallbacks,
+    PeerConnectionError, PeerConnectionState, SignalingState,
 };
 pub use reliability::{Reliability, ReliabilityType};
 pub use sctp_transport::{

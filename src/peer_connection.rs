@@ -45,14 +45,17 @@
 //! and the SCTP transport only comes up once an application m-line was
 //! negotiated.
 //!
-//! ## DataChannel scope (#17 vs #18)
+//! ## DataChannels + DCEP (#18)
 //!
-//! `create_data_channel` here is the **minimal** registration the task
-//! calls for: it records the requested channel (label + optional id),
-//! ensures the application m-line is advertised so SCTP comes up, and
-//! exposes an `on_data_channel` hook. The full DCEP `OPEN`/`ACK` handshake
-//! and the `DataChannel` object itself are **task #18** — see the `TODO`s on
-//! [`PeerConnection::create_data_channel`].
+//! [`PeerConnection::create_data_channel`] returns a real [`DataChannel`]
+//! handle. It records the channel (ensuring the application m-line is
+//! advertised so SCTP comes up) and, once SCTP reaches `Connected`, drives
+//! the DCEP `DATA_CHANNEL_OPEN`/`ACK` handshake (RFC 8832) over the SCTP
+//! Control PPID. Stream ids follow RFC 8832 §6 — the DTLS client uses even
+//! ids, the server odd. Inbound `OPEN`s allocate a channel, reply with an
+//! `ACK`, and fire [`PeerConnectionCallbacks::on_data_channel`] with the new
+//! handle; inbound user data (String/Binary PPIDs) routes to the channel
+//! bound to its SCTP stream. See [`crate::data_channel`] for the protocol.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -75,9 +78,13 @@ use crate::ice_transport::{
     State as IceState,
 };
 use crate::sctp_transport::{
-    SctpState, SctpTransport, SctpTransportCallbacks,
+    PayloadProtocolId, SctpMessage, SctpState, SctpTransport, SctpTransportCallbacks,
 };
 use crate::candidate::Candidate;
+use crate::data_channel::{
+    decode_control, DataChannel, DataChannelCallbacks, DataChannelInit, DcepMessage,
+    StreamIdAllocator,
+};
 
 /// Aggregate connection state, mirroring W3C `RTCPeerConnectionState` and the
 /// C++ `rtc::PeerConnection::State`.
@@ -187,10 +194,11 @@ pub struct PeerConnectionCallbacks {
     pub on_signaling_state_change: Arc<dyn Fn(SignalingState) + Send + Sync>,
     /// Fires for each local ICE candidate the agent surfaces (trickle).
     pub on_local_candidate: Arc<dyn Fn(Candidate) + Send + Sync>,
-    /// Fires when the remote peer opens a data channel. Phase #17 only
-    /// surfaces the channel **label**; the full `DataChannel` object lands
-    /// in #18 with the DCEP protocol.
-    pub on_data_channel: Arc<dyn Fn(String) + Send + Sync>,
+    /// Fires when the remote peer opens a data channel, delivering a real
+    /// [`DataChannel`] handle. The handle arrives already bound to its
+    /// inbound SCTP stream and ACK'd; install callbacks on it via
+    /// [`DataChannel::set_callbacks`] to receive messages.
+    pub on_data_channel: Arc<dyn Fn(DataChannel) + Send + Sync>,
 }
 
 impl Default for PeerConnectionCallbacks {
@@ -203,20 +211,6 @@ impl Default for PeerConnectionCallbacks {
             on_data_channel: Arc::new(|_| {}),
         }
     }
-}
-
-/// A registered (but not yet DCEP-opened) data channel.
-///
-/// Phase #17 only tracks the label and the locally-assigned stream id; the
-/// actual open handshake is task #18.
-#[derive(Debug, Clone)]
-pub struct DataChannelStub {
-    /// Application-supplied label.
-    pub label: String,
-    /// Locally-assigned SCTP stream id (even for the DTLS client, odd for
-    /// the server — RFC 8832 §6). Assigned lazily once SCTP is up in #18;
-    /// `None` until then.
-    pub stream: Option<u16>,
 }
 
 // ---------------------------------------------------------------------------
@@ -261,8 +255,22 @@ struct Inner {
     gathering_state: Mutex<GatheringState>,
     signaling_state: Mutex<SignalingState>,
 
-    /// Data channels registered via [`PeerConnection::create_data_channel`].
-    data_channels: Mutex<Vec<DataChannelStub>>,
+    /// Data channels keyed by their assigned SCTP stream id. Holds both
+    /// locally-created channels (allocated a stream up front) and channels
+    /// created from inbound DCEP OPENs. Channels created before SCTP is up
+    /// have already been allocated a stream id, so the map is the single
+    /// source of truth for stream→channel routing.
+    data_channels: Mutex<std::collections::HashMap<u16, DataChannel>>,
+
+    /// Allocates stream ids per RFC 8832 §6 once the DTLS role is known.
+    /// `None` until SCTP comes up and the role is resolved (the allocator's
+    /// parity depends on whether we are the DTLS client).
+    stream_allocator: Mutex<Option<StreamIdAllocator>>,
+
+    /// Locally-created channels still awaiting a stream id (created before
+    /// the DTLS role was resolved). Flushed into `data_channels` with a real
+    /// stream id once SCTP is up.
+    pending_local_channels: Mutex<Vec<DataChannel>>,
 
     /// True once we are the offerer (so we know to advertise actpass and
     /// know whether the local m-line should exist for SCTP).
@@ -314,7 +322,9 @@ impl PeerConnection {
             state: Mutex::new(PeerConnectionState::New),
             gathering_state: Mutex::new(GatheringState::New),
             signaling_state: Mutex::new(SignalingState::Stable),
-            data_channels: Mutex::new(Vec::new()),
+            data_channels: Mutex::new(std::collections::HashMap::new()),
+            stream_allocator: Mutex::new(None),
+            pending_local_channels: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
         });
         Ok(PeerConnection { inner })
@@ -352,32 +362,90 @@ impl PeerConnection {
         self.inner.local_fingerprint.clone()
     }
 
-    // -- data channels (minimal — full DCEP is #18) ---------------------------
+    // -- data channels (DCEP, task #18) ---------------------------------------
 
-    /// Register a data channel by label.
-    ///
-    /// **Scope (task #17):** this is the minimal registration the task
-    /// asks for. It records the channel so the application m-line is
-    /// advertised (ensuring the SCTP transport is brought up during
-    /// negotiation), and returns a [`DataChannelStub`].
-    ///
-    /// TODO(#18): drive the DCEP `DATA_CHANNEL_OPEN` / `ACK` protocol over
-    /// SCTP, assign the stream id per RFC 8832 §6 (even for the DTLS
-    /// client, odd for the server), expose a real `DataChannel` handle, and
-    /// fire `on_data_channel` on the remote side from an inbound DCEP OPEN
-    /// rather than from this stub.
-    pub fn create_data_channel(&self, label: impl Into<String>) -> DataChannelStub {
-        let stub = DataChannelStub {
-            label: label.into(),
-            stream: None,
-        };
-        self.inner.data_channels.lock().push(stub.clone());
-        stub
+    /// Create a locally-initiated data channel with default settings.
+    /// Equivalent to [`create_data_channel_ext`](Self::create_data_channel_ext)
+    /// with a default [`DataChannelInit`] and no callbacks.
+    pub fn create_data_channel(&self, label: impl Into<String>) -> DataChannel {
+        self.create_data_channel_ext(label, DataChannelInit::default(), DataChannelCallbacks::default())
     }
 
-    /// Currently-registered data channel stubs.
-    pub fn data_channels(&self) -> Vec<DataChannelStub> {
-        self.inner.data_channels.lock().clone()
+    /// Create a locally-initiated data channel.
+    ///
+    /// Registers the channel so the application m-line is advertised
+    /// (bringing up SCTP during negotiation) and returns a real
+    /// [`DataChannel`] handle. The DCEP `DATA_CHANNEL_OPEN` is sent
+    /// automatically once the SCTP association reaches `Connected`; the
+    /// channel fires `on_open` when the peer's `ACK` arrives. User data sent
+    /// before then is buffered (matching libdatachannel).
+    ///
+    /// The stream id follows RFC 8832 §6: if the DTLS role is already
+    /// resolved we allocate one immediately (even for the DTLS client, odd
+    /// for the server); otherwise the channel is parked until SCTP comes up
+    /// and the role is known. An explicit `init.stream` is honoured verbatim.
+    pub fn create_data_channel_ext(
+        &self,
+        label: impl Into<String>,
+        init: DataChannelInit,
+        callbacks: DataChannelCallbacks,
+    ) -> DataChannel {
+        let label = label.into();
+
+        // Try to assign a stream id now. We can if the caller pinned one, or
+        // if the DTLS role is already resolved (allocator present).
+        let mut alloc_guard = self.inner.stream_allocator.lock();
+        let assigned: Option<u16> = match init.stream {
+            Some(s) => {
+                if let Some(a) = alloc_guard.as_mut() {
+                    a.reserve(s);
+                }
+                Some(s)
+            }
+            None => alloc_guard.as_mut().map(|a| a.allocate()),
+        };
+        drop(alloc_guard);
+
+        match assigned {
+            Some(stream) => {
+                let dc = DataChannel::new_outgoing(label, stream, init, callbacks);
+                if let Some(sctp) = self.inner.sctp.lock().as_ref().cloned() {
+                    dc.attach_transport(sctp);
+                    // SCTP already up: drive the OPEN immediately.
+                    if matches!(self.sctp_state(), SctpState::Connected) {
+                        let _ = dc.send_open();
+                    }
+                }
+                self.inner.data_channels.lock().insert(stream, dc.clone());
+                dc
+            }
+            None => {
+                // No stream id yet — park it; the stream is assigned and the
+                // OPEN is flushed when SCTP comes up (`flush_local_channels`).
+                // Use a placeholder stream id of 0; it is replaced on flush.
+                let dc = DataChannel::new_outgoing(label, 0, init, callbacks);
+                self.inner.pending_local_channels.lock().push(dc.clone());
+                dc
+            }
+        }
+    }
+
+    /// Snapshot of the currently-registered data channels (both
+    /// locally-created and inbound), keyed by stream id is collapsed to a
+    /// flat list.
+    pub fn data_channels(&self) -> Vec<DataChannel> {
+        self.inner.data_channels.lock().values().cloned().collect()
+    }
+
+    /// Current SCTP association state, or [`SctpState::New`] if SCTP hasn't
+    /// been created yet.
+    fn sctp_state(&self) -> SctpState {
+        self.inner
+            .sctp
+            .lock()
+            .as_ref()
+            .map(|s| s.state())
+            .unwrap_or(SctpState::New)
     }
 
     // -- offer / answer -------------------------------------------------------
@@ -931,13 +999,16 @@ impl PeerConnection {
         };
 
         let pc = self.clone();
+        let pc_msg = self.clone();
+        let pc_low = self.clone();
         let sctp_cbs = SctpTransportCallbacks {
             on_state_change: Arc::new(move |s| pc.on_sctp_state(s)),
-            on_message: Arc::new(|_| {
-                // TODO(#18): route inbound SCTP messages to DataChannels and
-                // parse DCEP control messages here.
+            on_message: Arc::new(move |m| pc_msg.on_sctp_message(m)),
+            on_buffered_amount_low: Arc::new(move |stream| {
+                if let Some(dc) = pc_low.inner.data_channels.lock().get(&stream) {
+                    dc.fire_buffered_amount_low();
+                }
             }),
-            on_buffered_amount_low: Arc::new(|_| {}),
         };
 
         // `SctpTransport::new` installs an auto-connect hook on `dtls` that
@@ -959,15 +1030,156 @@ impl PeerConnection {
             }
             SctpState::Connected => {
                 self.change_state(PeerConnectionState::Connected);
-                // TODO(#18): assignDataChannels() + openDataChannels() —
-                // drive DCEP OPEN for every channel registered via
-                // create_data_channel, and fire on_data_channel for inbound
-                // OPENs.
+                // assignDataChannels() + openDataChannels(): now that the
+                // DTLS role is resolved we can build the stream allocator,
+                // assign stream ids to any channels created before SCTP came
+                // up, attach the transport, and drive the DCEP OPEN for each.
+                self.flush_local_channels();
             }
             SctpState::Failed => {
                 self.change_state(PeerConnectionState::Failed);
             }
             SctpState::New | SctpState::Closed => {}
+        }
+    }
+
+    // -- internal: DCEP / data-channel plumbing -------------------------------
+
+    /// True if this peer is the DTLS **client** (resolved `a=setup:active`).
+    /// Determines stream-id parity per RFC 8832 §6 (client = even).
+    fn is_dtls_client(&self) -> bool {
+        self.inner
+            .ice
+            .lock()
+            .as_ref()
+            .map(|i| matches!(i.role(), Role::Active))
+            .unwrap_or(false)
+    }
+
+    /// Ensure the stream-id allocator exists, building it from the resolved
+    /// DTLS role on first call. Returns a clone-free borrow via the closure
+    /// is awkward; instead we just (idempotently) construct it.
+    fn ensure_stream_allocator(&self) {
+        let mut guard = self.inner.stream_allocator.lock();
+        if guard.is_none() {
+            *guard = Some(StreamIdAllocator::new(self.is_dtls_client()));
+        }
+    }
+
+    /// Called once SCTP is `Connected`: build the allocator, assign stream
+    /// ids to any channels parked before the role was known, attach the SCTP
+    /// transport to every local channel, and drive the DCEP OPEN for each.
+    fn flush_local_channels(&self) {
+        self.ensure_stream_allocator();
+
+        let sctp = match self.inner.sctp.lock().as_ref().cloned() {
+            Some(s) => s,
+            None => return,
+        };
+
+        // Assign stream ids to parked channels and move them into the map.
+        let pending: Vec<DataChannel> =
+            std::mem::take(&mut *self.inner.pending_local_channels.lock());
+        for dc in pending {
+            let stream = {
+                let mut g = self.inner.stream_allocator.lock();
+                g.as_mut().expect("allocator built above").allocate()
+            };
+            dc.assign_stream(stream);
+            self.inner.data_channels.lock().insert(stream, dc);
+        }
+
+        // Attach the transport + drive OPEN for every local (non-incoming)
+        // channel that isn't open yet.
+        let channels: Vec<DataChannel> =
+            self.inner.data_channels.lock().values().cloned().collect();
+        for dc in channels {
+            if dc.is_incoming() {
+                continue;
+            }
+            dc.attach_transport(Arc::clone(&sctp));
+            if let Err(e) = dc.send_open() {
+                warn!("PeerConnection: failed to send DCEP OPEN: {e}");
+            }
+        }
+    }
+
+    /// Route an inbound SCTP message: Control(50)→DCEP handling; String/
+    /// StringEmpty→text; Binary/BinaryEmpty→binary; everything else ignored
+    /// (including the deprecated `*Partial` PPIDs, which never reach here as
+    /// reassembled messages).
+    fn on_sctp_message(&self, msg: SctpMessage) {
+        if self.inner.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        match msg.ppid {
+            PayloadProtocolId::Control => self.on_dcep_control(msg.stream, &msg.data),
+            PayloadProtocolId::String => self.deliver_to_channel(msg.stream, &msg.data, false),
+            PayloadProtocolId::StringEmpty => self.deliver_to_channel(msg.stream, &[], false),
+            PayloadProtocolId::Binary => self.deliver_to_channel(msg.stream, &msg.data, true),
+            PayloadProtocolId::BinaryEmpty => self.deliver_to_channel(msg.stream, &[], true),
+            // Deprecated PPID-based fragments are reassembled below the SCTP
+            // layer and never surface here; ignore defensively.
+            PayloadProtocolId::StringPartial | PayloadProtocolId::BinaryPartial => {}
+        }
+    }
+
+    /// Handle an inbound DCEP control message on `stream`.
+    fn on_dcep_control(&self, stream: u16, data: &[u8]) {
+        let parsed = match decode_control(data) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("PeerConnection: bad DCEP control on stream {stream}: {e}");
+                return;
+            }
+        };
+        match parsed {
+            DcepMessage::Open(open) => {
+                // Inbound OPEN: a channel already on this stream (e.g. a
+                // negotiated channel) just transitions open; otherwise build
+                // an incoming channel, ACK it, and surface it.
+                let existing = self.inner.data_channels.lock().get(&stream).cloned();
+                let dc = match existing {
+                    Some(dc) => dc,
+                    None => {
+                        let dc = DataChannel::new_incoming(stream, &open);
+                        // Keep our allocator from re-handing-out this id.
+                        self.ensure_stream_allocator();
+                        if let Some(a) = self.inner.stream_allocator.lock().as_mut() {
+                            a.reserve(stream);
+                        }
+                        self.inner.data_channels.lock().insert(stream, dc.clone());
+                        dc
+                    }
+                };
+                if let Some(sctp) = self.inner.sctp.lock().as_ref().cloned() {
+                    dc.attach_transport(sctp);
+                }
+                // Reply with ACK and mark open, then surface to the app.
+                if let Err(e) = dc.send_ack() {
+                    warn!("PeerConnection: failed to send DCEP ACK: {e}");
+                }
+                dc.mark_open();
+                let cb = {
+                    let g = self.inner.callbacks.lock();
+                    Arc::clone(&g.on_data_channel)
+                };
+                (cb)(dc);
+            }
+            DcepMessage::Ack => {
+                // Inbound ACK: the locally-created channel on this stream is
+                // now open.
+                if let Some(dc) = self.inner.data_channels.lock().get(&stream).cloned() {
+                    dc.mark_open();
+                }
+            }
+        }
+    }
+
+    /// Deliver a user message to the channel bound to `stream`, if any.
+    fn deliver_to_channel(&self, stream: u16, data: &[u8], binary: bool) {
+        if let Some(dc) = self.inner.data_channels.lock().get(&stream).cloned() {
+            dc.deliver_message(data, binary);
         }
     }
 
@@ -1307,6 +1519,151 @@ mod tests {
 
             assert_eq!(pc_a.state(), PeerConnectionState::Connected);
             assert_eq!(pc_b.state(), PeerConnectionState::Connected);
+        });
+    }
+
+    /// End-to-end DataChannel test: two PeerConnections negotiate to
+    /// Connected, A creates a data channel "chat", B receives it via
+    /// `on_data_channel` (driven by an inbound DCEP OPEN), then a message
+    /// round-trips A→B and B→A through the channel, asserted byte-equal.
+    #[test]
+    fn data_channel_message_round_trips_over_loopback() {
+        rt().block_on(async {
+            let a_state: Arc<Mutex<PeerConnectionState>> =
+                Arc::new(Mutex::new(PeerConnectionState::New));
+            let b_state: Arc<Mutex<PeerConnectionState>> =
+                Arc::new(Mutex::new(PeerConnectionState::New));
+            let a_cands: Arc<Mutex<Vec<Candidate>>> = Arc::new(Mutex::new(Vec::new()));
+            let b_cands: Arc<Mutex<Vec<Candidate>>> = Arc::new(Mutex::new(Vec::new()));
+
+            // B's inbound channel + the messages each side receives.
+            let b_channel: Arc<Mutex<Option<DataChannel>>> = Arc::new(Mutex::new(None));
+            let b_recv: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+            let a_recv: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+
+            let a_state_cb = a_state.clone();
+            let a_cands_cb = a_cands.clone();
+            let a_cbs = PeerConnectionCallbacks {
+                on_state_change: Arc::new(move |s| *a_state_cb.lock() = s),
+                on_local_candidate: Arc::new(move |c| a_cands_cb.lock().push(c)),
+                ..PeerConnectionCallbacks::default()
+            };
+
+            let b_state_cb = b_state.clone();
+            let b_cands_cb = b_cands.clone();
+            let b_channel_cb = b_channel.clone();
+            let b_recv_cb = b_recv.clone();
+            let b_cbs = PeerConnectionCallbacks {
+                on_state_change: Arc::new(move |s| *b_state_cb.lock() = s),
+                on_local_candidate: Arc::new(move |c| b_cands_cb.lock().push(c)),
+                on_data_channel: Arc::new(move |dc| {
+                    // Install message callbacks on the inbound channel and
+                    // stash it so the test body can send back on it.
+                    let recv = b_recv_cb.clone();
+                    dc.set_callbacks(DataChannelCallbacks {
+                        on_message: Arc::new(move |data, _binary| {
+                            recv.lock().push(data.to_vec());
+                        }),
+                        ..DataChannelCallbacks::default()
+                    });
+                    *b_channel_cb.lock() = Some(dc);
+                }),
+                ..PeerConnectionCallbacks::default()
+            };
+
+            let pc_a = PeerConnection::new(loopback_config(), a_cbs).expect("pc a");
+            let pc_b = PeerConnection::new(loopback_config(), b_cbs).expect("pc b");
+
+            // A creates the channel and installs its own receive callback.
+            let dc_a = pc_a.create_data_channel("chat");
+            let a_recv_cb = a_recv.clone();
+            dc_a.set_callbacks(DataChannelCallbacks {
+                on_message: Arc::new(move |data, _binary| {
+                    a_recv_cb.lock().push(data.to_vec());
+                }),
+                ..DataChannelCallbacks::default()
+            });
+
+            // --- Offer/answer + trickle (same dance as the connect test) ---
+            pc_a.set_local_description(DescriptionType::Offer)
+                .expect("a set local offer");
+            assert!(
+                wait_for(|| pc_a.gathering_state() == GatheringState::Complete, 3000).await,
+                "A never finished gathering"
+            );
+            let offer = pc_a.local_description().expect("a local description");
+
+            pc_b.set_remote_description(offer).expect("b set remote offer");
+            pc_b.set_local_description(DescriptionType::Answer)
+                .expect("b set local answer");
+            assert!(
+                wait_for(|| pc_b.gathering_state() == GatheringState::Complete, 3000).await,
+                "B never finished gathering"
+            );
+            let answer = pc_b.local_description().expect("b local description");
+            pc_a.set_remote_description(answer).expect("a set remote answer");
+
+            for c in a_cands.lock().iter() {
+                let _ = pc_b.add_remote_candidate(c);
+            }
+            for c in b_cands.lock().iter() {
+                let _ = pc_a.add_remote_candidate(c);
+            }
+            pc_a.set_remote_end_of_candidates().expect("a eoc");
+            pc_b.set_remote_end_of_candidates().expect("b eoc");
+
+            // --- Wait for both peers to reach Connected ---
+            assert!(
+                wait_for(
+                    || {
+                        *a_state.lock() == PeerConnectionState::Connected
+                            && *b_state.lock() == PeerConnectionState::Connected
+                    },
+                    12000,
+                )
+                .await,
+                "peers did not reach Connected: a={:?}, b={:?}",
+                *a_state.lock(),
+                *b_state.lock(),
+            );
+
+            // --- B receives the channel via DCEP OPEN ---
+            assert!(
+                wait_for(|| b_channel.lock().is_some(), 5000).await,
+                "B never received the data channel via on_data_channel"
+            );
+            let dc_b = b_channel.lock().clone().expect("b channel");
+            assert_eq!(dc_b.label(), "chat", "inbound channel label must match");
+            // RFC 8832 §6: A is the offerer → DTLS server (passive) → odd id;
+            // B is the answerer → DTLS client (active) → even id. A created
+            // the channel, so it carries A's (odd) parity on both ends.
+            assert_eq!(dc_b.stream() % 2, 1, "A's channel id must be odd (A is DTLS server)");
+            assert_eq!(dc_a.stream(), dc_b.stream(), "both ends share the stream id");
+
+            // A's channel opens once the ACK arrives.
+            assert!(
+                wait_for(|| dc_a.is_open(), 5000).await,
+                "A's channel never opened (no DCEP ACK?)"
+            );
+
+            // --- A → B ---
+            dc_a.send_text("hello-from-a").expect("a send");
+            assert!(
+                wait_for(|| !b_recv.lock().is_empty(), 5000).await,
+                "B never received A's message"
+            );
+            assert_eq!(b_recv.lock()[0], b"hello-from-a");
+
+            // --- B → A ---
+            dc_b.send_binary(b"hello-from-b").expect("b send");
+            assert!(
+                wait_for(|| !a_recv.lock().is_empty(), 5000).await,
+                "A never received B's message"
+            );
+            assert_eq!(a_recv.lock()[0], b"hello-from-b");
+
+            pc_a.close().expect("close a");
+            pc_b.close().expect("close b");
         });
     }
 }
