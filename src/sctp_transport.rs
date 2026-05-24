@@ -754,7 +754,12 @@ impl SctpTransport {
     /// Build a `sockaddr_conn` pointing at this transport's `self_ptr`.
     fn sockaddr_conn(self: &Arc<Self>, port: u16) -> sys::sockaddr_conn {
         let mut sconn = sys::sockaddr_conn::default();
-        sconn.sconn_family = AF_CONN as u8;
+        // `sconn_family` is `sa_family_t`, whose width is platform-dependent:
+        // 1 byte (u8) on BSD/Apple (the sockaddr there carries a leading
+        // `sa_len`), 2 bytes (u16) on Linux. bindgen reflects that, so cast
+        // through the field's own type rather than a hard-coded `u8` (which
+        // only compiled on macOS and broke the x86_64-linux cross build).
+        sconn.sconn_family = AF_CONN as _;
         sconn.sconn_port = port.to_be(); // htons
         sconn.sconn_addr = self.self_ptr();
         // Apple's sockaddr_conn has a leading sconn_len byte.
