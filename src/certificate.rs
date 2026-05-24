@@ -108,6 +108,20 @@ impl Certificate {
         Ok(Certificate { x509, pkey })
     }
 
+    /// Clone the certificate into an independent handle.
+    ///
+    /// Both `X509` and `PKey<Private>` are reference-counted in openssl-rs,
+    /// so this is a cheap reference clone rather than a re-derivation of the
+    /// keypair. Used by [`PeerConnection`](crate::PeerConnection), which holds
+    /// one certificate but constructs the [`DtlsTransport`](crate::DtlsTransport)
+    /// (which takes ownership of a `Certificate`) lazily.
+    pub fn try_clone(&self) -> Result<Self, CertificateError> {
+        Ok(Certificate {
+            x509: self.x509.clone(),
+            pkey: self.pkey.clone(),
+        })
+    }
+
     /// Borrow the X.509 certificate.
     pub fn x509(&self) -> &X509 {
         &self.x509

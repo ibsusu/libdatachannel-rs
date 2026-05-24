@@ -18,6 +18,7 @@ mod description;
 mod dtls_transport;
 mod error;
 mod ice_transport;
+mod peer_connection;
 mod reliability;
 mod sctp_transport;
 mod usrsctp_sys;
@@ -38,6 +39,10 @@ pub use dtls_transport::{
 pub use error::{Error, Result};
 pub use ice_transport::{
     GatheringState, IceTransport, IceTransportCallbacks, IceTransportError, State as IceState,
+};
+pub use peer_connection::{
+    DataChannelStub, GatheringState as PeerGatheringState, PeerConnection,
+    PeerConnectionCallbacks, PeerConnectionError, PeerConnectionState, SignalingState,
 };
 pub use reliability::{Reliability, ReliabilityType};
 pub use sctp_transport::{
