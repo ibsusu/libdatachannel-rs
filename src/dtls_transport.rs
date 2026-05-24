@@ -391,6 +391,89 @@ impl DtlsTransport {
         *self.bridge.state.lock()
     }
 
+    // -----------------------------------------------------------------------
+    // DTLS-SRTP seam (consumed by [`crate::SrtpTransport`])
+    //
+    // These three methods are the *minimal* surface the SRTP layer needs to
+    // reach into the SSL object. They keep the SCTP/DataChannel path behaving
+    // identically when SRTP is not requested (none of them is called unless a
+    // `SrtpTransport` is layered on top). All three serialize through the same
+    // `inner` mutex as every other OpenSSL call, per the concurrency model.
+    // -----------------------------------------------------------------------
+
+    /// Enable the DTLS `use_srtp` extension with the given OpenSSL profile
+    /// list (e.g. `"SRTP_AEAD_AES_128_GCM:SRTP_AES128_CM_SHA1_80"`) on the
+    /// underlying `SSL` object via `SSL_set_tlsext_use_srtp`.
+    ///
+    /// MUST be called **before** [`start`](Self::start): OpenSSL only sends
+    /// the extension in the ClientHello / ServerHello, which the handshake
+    /// emits on the first `SSL_do_handshake`. Returns an error if OpenSSL
+    /// rejects the profile string.
+    ///
+    /// This is the seam [`crate::SrtpTransport`] uses; the
+    /// SCTP/DataChannel path never calls it, so the default behaviour is
+    /// unchanged.
+    pub fn set_srtp_profiles(&self, profiles: &str) -> Result<(), DtlsTransportError> {
+        let c = std::ffi::CString::new(profiles)
+            .map_err(|_| DtlsTransportError::Handshake(-1))?;
+        let g = self.bridge.inner.lock();
+        // SSL_set_tlsext_use_srtp returns 0 on success, non-zero on error
+        // (the inverse of most OpenSSL calls).
+        let ret = unsafe { ossl_sys::SSL_set_tlsext_use_srtp(ssl_ptr(&g.ssl), c.as_ptr()) };
+        if ret != 0 {
+            return Err(DtlsTransportError::Handshake(ret));
+        }
+        Ok(())
+    }
+
+    /// Name of the SRTP protection profile OpenSSL negotiated during the
+    /// handshake (e.g. `"SRTP_AEAD_AES_128_GCM"`), or `None` if no profile was
+    /// selected (or the handshake has not completed). Wraps
+    /// `SSL_get_selected_srtp_profile`.
+    pub fn selected_srtp_profile(&self) -> Option<String> {
+        let g = self.bridge.inner.lock();
+        unsafe {
+            let profile = ossl_sys::SSL_get_selected_srtp_profile(ssl_ptr(&g.ssl));
+            if profile.is_null() {
+                return None;
+            }
+            let name = (*profile).name;
+            if name.is_null() {
+                return None;
+            }
+            Some(std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned())
+        }
+    }
+
+    /// Export `out.len()` bytes of keying material under the given RFC 5705
+    /// `label`, with no context, via `SSL_export_keying_material`. The SRTP
+    /// layer calls this post-handshake with the `"EXTRACTOR-dtls_srtp"` label
+    /// to derive the SRTP master keys/salts (RFC 5764). Returns an error if
+    /// OpenSSL's export fails (return value <= 0).
+    pub fn export_keying_material(
+        &self,
+        out: &mut [u8],
+        label: &str,
+    ) -> Result<(), DtlsTransportError> {
+        let g = self.bridge.inner.lock();
+        let ret = unsafe {
+            ossl_sys::SSL_export_keying_material(
+                ssl_ptr(&g.ssl),
+                out.as_mut_ptr(),
+                out.len(),
+                label.as_ptr() as *const std::ffi::c_char,
+                label.len(),
+                std::ptr::null(),
+                0,
+                0,
+            )
+        };
+        if ret <= 0 {
+            return Err(DtlsTransportError::Handshake(ret));
+        }
+        Ok(())
+    }
+
     /// True if this side is acting as the DTLS client (Active role).
     pub fn is_client(&self) -> bool {
         self.bridge.is_client

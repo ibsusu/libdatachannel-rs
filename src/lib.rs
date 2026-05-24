@@ -22,6 +22,8 @@ mod ice_transport;
 mod peer_connection;
 mod reliability;
 mod sctp_transport;
+mod srtp_sys;
+mod srtp_transport;
 mod usrsctp_sys;
 
 pub use candidate::{Candidate, CandidateType, Family, ParseError as CandidateParseError, TransportType};
@@ -52,6 +54,10 @@ pub use reliability::{Reliability, ReliabilityType};
 pub use sctp_transport::{
     PayloadProtocolId, SctpMessage, SctpState, SctpTransport, SctpTransportCallbacks,
     SctpTransportError,
+};
+pub use srtp_transport::{
+    srtp_version, SrtpTransport, SrtpTransportCallbacks, SrtpTransportError,
+    DEFAULT_SRTP_PROFILES,
 };
 
 /// Optional resource preload (no-op until task #17 lands the runtime).
