@@ -1959,17 +1959,23 @@ pub extern "C" fn rtcRequestKeyframe(tr: c_int) -> c_int {
     })
 }
 
-/// `rtcRequestBitrate` — no runtime REMB sender on `Track` yet. Validate the
-/// handle and report not-available.
-//
-// TODO(#20/#21): wire to a REMB sender once the media-handler chain lands.
+/// `rtcRequestBitrate` — request a target bitrate from the remote by driving the
+/// track's runtime media-handler chain (REMB). A chained
+/// [`crate::RtcpReceivingSession`] queues a REMB packet that is flushed back to
+/// the peer; with no such handler the request succeeds as a no-op (mirroring the
+/// C++ default `requestBitrate`). Backed by the runtime `Track` chain.
 #[unsafe(no_mangle)]
-pub extern "C" fn rtcRequestBitrate(tr: c_int, _bitrate: c_uint) -> c_int {
-    if get_tr(tr).is_none() {
-        RTC_ERR_INVALID
-    } else {
-        RTC_ERR_NOT_AVAIL
-    }
+pub extern "C" fn rtcRequestBitrate(tr: c_int, bitrate: c_uint) -> c_int {
+    guard(|| {
+        let t = match get_tr(tr) {
+            Some(t) => t,
+            None => return RTC_ERR_INVALID,
+        };
+        match t.request_bitrate(bitrate) {
+            Ok(_) => RTC_ERR_SUCCESS,
+            Err(_) => RTC_ERR_FAILURE,
+        }
+    })
 }
 
 /// `rtcChainRtcpReceivingSession` — append an [`crate::RtcpReceivingSession`] to
@@ -2489,8 +2495,11 @@ mod tests {
         assert_eq!(rtcChainRtcpSrReporter(tr), RTC_ERR_SUCCESS);
         assert_eq!(rtcChainRtcpNackResponder(tr, 0), RTC_ERR_SUCCESS);
         assert_eq!(rtcChainPacingHandler(tr, 800_000.0, 5), RTC_ERR_SUCCESS);
-        // rtcRequestBitrate has no runtime REMB sender on the Track yet.
-        assert_eq!(rtcRequestBitrate(tr, 100_000), RTC_ERR_NOT_AVAIL);
+        // rtcRequestBitrate now drives the runtime media-handler chain (the
+        // RtcpReceivingSession chained above honours it via REMB): success on a
+        // valid handle, INVALID on an unknown one.
+        assert_eq!(rtcRequestBitrate(tr, 100_000), RTC_ERR_SUCCESS);
+        assert_eq!(rtcRequestBitrate(999_999, 100_000), RTC_ERR_INVALID);
         // Invalid handle on a chain function reports INVALID.
         assert_eq!(rtcChainRtcpReceivingSession(999_999), RTC_ERR_INVALID);
         // Deleting an unknown track is INVALID.

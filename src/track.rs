@@ -486,6 +486,32 @@ impl Track {
         self.send_rtp(&pli.serialize())
     }
 
+    /// Request a target bitrate from the remote by driving the runtime
+    /// media-handler chain's `request_bitrate` path (RFC 8888 / REMB), mirroring
+    /// `rtc::Track::requestBitrate`. Unlike [`request_keyframe`](Self::request_keyframe)
+    /// there is no single canonical "direct" packet for a bitrate request, so the
+    /// request is delegated to the chain: a handler such as an
+    /// [`RtcpReceivingSession`](crate::RtcpReceivingSession) queues a REMB packet
+    /// which is then flushed back to the peer through the bound SRTP transport.
+    ///
+    /// With no chain installed the request is a no-op (nothing in the chain to
+    /// honour it) but still succeeds, mirroring the C++ default `requestBitrate`
+    /// returning `true` even when no handler ultimately emits a packet.
+    pub fn request_bitrate(&self, bitrate: u32) -> Result<(), TrackError> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(TrackError::Closed);
+        }
+        let (replies, srtp) = {
+            let mut g = self.inner.lock();
+            let (replies, _handled) = g.chain.request_bitrate(u64::from(bitrate));
+            (replies, g.srtp.clone())
+        };
+        if let Some(srtp) = srtp {
+            Self::flush_chain_replies(&srtp, replies);
+        }
+        Ok(())
+    }
+
     /// Replace the media description. The `mid` must match, mirroring
     /// `impl::Track::setDescription`.
     pub fn set_description(&self, media: Media) -> Result<(), TrackError> {
@@ -1152,5 +1178,39 @@ mod tests {
         let extra = track.inner.lock().chain.outgoing(&mut msgs);
         assert!(msgs.is_empty(), "pacing buffers all outbound packets");
         assert!(extra.is_empty(), "nothing released immediately");
+    }
+
+    /// `Track::request_bitrate` drives the runtime media-handler chain's
+    /// `request_bitrate` path: an `RtcpReceivingSession` honours it by queuing a
+    /// REMB packet carrying the requested bitrate. Asserts the REMB reaches the
+    /// chain (parsed back from the queued reply) and that the public method
+    /// succeeds even with no SRTP transport bound (the flush is then a no-op).
+    #[test]
+    fn track_request_bitrate_drives_chain_remb() {
+        let track = Track::new(video_init(), TrackCallbacks::default());
+        track.chain_media_handler(Box::new(crate::RtcpReceivingSession::new()));
+
+        // Drive the same chain the public path uses, and inspect the queued REMB.
+        let (replies, handled) = track.inner.lock().chain.request_bitrate(250_000);
+        assert!(handled, "RtcpReceivingSession honours the bitrate request");
+        assert_eq!(replies.len(), 1, "exactly one REMB packet queued");
+        let remb = crate::rtp::RtcpRemb::parse(&replies[0].data)
+            .expect("queued reply parses as a REMB");
+        assert_eq!(remb.bitrate, 250_000, "REMB carries the requested bitrate");
+
+        // The public method succeeds (no SRTP bound -> flush is a no-op).
+        assert!(track.request_bitrate(250_000).is_ok());
+    }
+
+    /// On a closed track, `request_bitrate` is rejected with `Closed`.
+    #[test]
+    fn track_request_bitrate_closed_errors() {
+        let track = Track::new(video_init(), TrackCallbacks::default());
+        track.chain_media_handler(Box::new(crate::RtcpReceivingSession::new()));
+        track.close();
+        assert!(matches!(
+            track.request_bitrate(100_000),
+            Err(TrackError::Closed)
+        ));
     }
 }
