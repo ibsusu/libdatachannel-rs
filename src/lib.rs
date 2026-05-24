@@ -31,6 +31,7 @@ mod srtp_sys;
 mod srtp_transport;
 mod track;
 mod usrsctp_sys;
+mod websocket;
 
 pub use candidate::{Candidate, CandidateType, Family, ParseError as CandidateParseError, TransportType};
 pub use certificate::{Certificate, CertificateError};
@@ -88,6 +89,11 @@ pub use sctp_transport::{
 pub use srtp_transport::{
     srtp_version, SrtpTransport, SrtpTransportCallbacks, SrtpTransportError,
     DEFAULT_SRTP_PROFILES,
+};
+pub use websocket::{
+    compute_accept_key, generate_key, DecodeOutcome, Frame, Opcode, State as WebSocketState,
+    WebSocket, WebSocketConfig, WebSocketError, WsHandshake, WsMessage, WsResult, WsUrl,
+    DEFAULT_WS_MAX_MESSAGE_SIZE,
 };
 
 /// Optional resource preload (no-op until task #17 lands the runtime).
