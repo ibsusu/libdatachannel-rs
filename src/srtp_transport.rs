@@ -616,13 +616,23 @@ impl SrtpTransport {
             return false;
         }
         let first = data[0];
-        // 20..=63 → DTLS, 128..=191 → RTP/RTCP (RFC 5764 §5.1.2).
-        if (20..=63).contains(&first) {
-            return false; // DTLS record — let the lower path handle it.
-        }
+        // RFC 5764 §5.1.2 demux on the first byte:
+        //   0..=19    → STUN / misc.
+        //   20..=63   → DTLS record
+        //   64..=79   → TURN channel
+        //   128..=191 → RTP/RTCP
+        // We consume ONLY the genuine RTP/RTCP range. Everything else must
+        // fall through to the previously-installed `on_data` handler.
+        //
+        // This is critical when SCTP is co-layered on the same DTLS transport
+        // (a DataChannel + media PeerConnection): the bytes reaching `on_data`
+        // are *already-decrypted* DTLS application records carrying the SCTP
+        // packet, whose first byte is the SCTP source port high byte (0x13 for
+        // port 5000 → 19). Consuming/dropping anything outside 128..=191 here
+        // would swallow those SCTP packets and the association would never
+        // complete. So treat non-media as "not ours" and fall through.
         if !(128..=191).contains(&first) {
-            trace!(value = first, "SrtpTransport: unknown packet type, dropping");
-            return true; // consume (and drop) unknown media-range bytes
+            return false;
         }
         // Media. An RTCP packet is >= 8 bytes, RTP >= 12.
         if data.len() < 8 {

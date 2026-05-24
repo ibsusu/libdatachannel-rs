@@ -40,7 +40,7 @@ pub use configuration::{
 };
 pub use description::{
     Application, Description, DescriptionParseError, Direction, Fingerprint,
-    FingerprintAlgorithm, Role, Type,
+    FingerprintAlgorithm, MediaSection, Role, Type,
 };
 pub use dtls_transport::{
     DtlsState, DtlsTransport, DtlsTransportCallbacks, DtlsTransportError,

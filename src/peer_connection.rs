@@ -85,6 +85,10 @@ use crate::data_channel::{
     decode_control, DataChannel, DataChannelCallbacks, DataChannelInit, DcepMessage,
     StreamIdAllocator,
 };
+use crate::description::MediaSection;
+use crate::rtp::RtpHeader;
+use crate::srtp_transport::{SrtpTransport, SrtpTransportCallbacks};
+use crate::track::{Track, TrackCallbacks, TrackInit};
 
 /// Aggregate connection state, mirroring W3C `RTCPeerConnectionState` and the
 /// C++ `rtc::PeerConnection::State`.
@@ -210,6 +214,12 @@ pub struct PeerConnectionCallbacks {
     /// inbound SCTP stream and ACK'd; install callbacks on it via
     /// [`DataChannel::set_callbacks`] to receive messages.
     pub on_data_channel: Arc<dyn Fn(DataChannel) + Send + Sync>,
+    /// Fires when a remote media track is negotiated (a remote `m=audio` /
+    /// `m=video` section appears in an applied remote description that this
+    /// peer didn't create locally). Delivers a real [`Track`] handle, already
+    /// recorded so inbound RTP for its SSRC routes to it once the DTLS-SRTP
+    /// transport is up; install callbacks via [`Track::set_callbacks`].
+    pub on_track: Arc<dyn Fn(Arc<Track>) + Send + Sync>,
 }
 
 impl Default for PeerConnectionCallbacks {
@@ -221,6 +231,7 @@ impl Default for PeerConnectionCallbacks {
             on_local_description: Arc::new(|_| {}),
             on_local_candidate: Arc::new(|_| {}),
             on_data_channel: Arc::new(|_| {}),
+            on_track: Arc::new(|_| {}),
         }
     }
 }
@@ -252,6 +263,11 @@ struct Inner {
     ice: Mutex<Option<Arc<IceTransport>>>,
     dtls: Mutex<Option<DtlsTransport>>,
     sctp: Mutex<Option<Arc<SctpTransport>>>,
+    /// DTLS-SRTP media transport, created alongside SCTP in
+    /// [`Self::init_dtls_transport`] when media has been negotiated. Inbound
+    /// RTP/RTCP demuxes off this transport's `on_rtp`/`on_rtcp` hooks and
+    /// routes to the track bound to the packet's SSRC.
+    srtp: Mutex<Option<Arc<SrtpTransport>>>,
 
     // --- descriptions ---
     local_description: Mutex<Option<Description>>,
@@ -293,9 +309,28 @@ struct Inner {
     /// stream id once SCTP is up.
     pending_local_channels: Mutex<Vec<DataChannel>>,
 
+    /// Media tracks keyed by their `mid`. Holds both locally-added tracks
+    /// (via [`PeerConnection::add_track`]) and remote tracks surfaced through
+    /// `on_track`. Each entry records the track plus the SSRC it carries so
+    /// inbound RTP can be routed to the right track.
+    tracks: Mutex<std::collections::HashMap<String, TrackEntry>>,
+
     /// True once we are the offerer (so we know to advertise actpass and
     /// know whether the local m-line should exist for SCTP).
     closed: AtomicBool,
+}
+
+/// A recorded track plus the metadata the PeerConnection needs to advertise
+/// its media section and route inbound RTP.
+struct TrackEntry {
+    track: Arc<Track>,
+    /// The modeled media section advertised for this track in the local SDP.
+    media: MediaSection,
+    /// The SSRC this track sends/receives on (for inbound RTP routing).
+    ssrc: u32,
+    /// True for a remote track (surfaced via `on_track`) — these are NOT
+    /// advertised in our local description (the remote already did).
+    remote: bool,
 }
 
 impl std::fmt::Debug for PeerConnection {
@@ -337,6 +372,7 @@ impl PeerConnection {
             ice: Mutex::new(None),
             dtls: Mutex::new(None),
             sctp: Mutex::new(None),
+            srtp: Mutex::new(None),
             local_description: Mutex::new(None),
             remote_description: Mutex::new(None),
             pending_local_type: Mutex::new(None),
@@ -347,6 +383,7 @@ impl PeerConnection {
             data_channels: Mutex::new(std::collections::HashMap::new()),
             stream_allocator: Mutex::new(None),
             pending_local_channels: Mutex::new(Vec::new()),
+            tracks: Mutex::new(std::collections::HashMap::new()),
             closed: AtomicBool::new(false),
         });
         Ok(PeerConnection { inner })
@@ -468,6 +505,62 @@ impl PeerConnection {
             .as_ref()
             .map(|s| s.state())
             .unwrap_or(SctpState::New)
+    }
+
+    // -- media tracks (task #27) ----------------------------------------------
+
+    /// Add a local media track. Records the track so its `m=audio`/`m=video`
+    /// section is advertised in the next local description, and so inbound RTP
+    /// for its SSRC routes to it once the DTLS-SRTP transport is up. Returns a
+    /// real [`Track`] handle.
+    ///
+    /// Mirrors `rtc::PeerConnection::addTrack`. The track is **not** open until
+    /// the media transport's keys are derived (after the DTLS handshake); it
+    /// fires `on_open` then. Sending before that errors with
+    /// [`crate::TrackError::NotOpen`].
+    pub fn add_track(&self, init: TrackInit) -> Arc<Track> {
+        self.add_track_with(init, TrackCallbacks::default())
+    }
+
+    /// Like [`add_track`](Self::add_track) but with callbacks installed up
+    /// front (so they are present before the track opens).
+    pub fn add_track_with(&self, init: TrackInit, callbacks: TrackCallbacks) -> Arc<Track> {
+        let media = MediaSection::from_track_media(&crate::TrackMedia::from_init(&init));
+        let ssrc = init.ssrc;
+        let mid = init.mid.clone();
+        let track = Track::new(init, callbacks);
+        self.inner.tracks.lock().insert(
+            mid,
+            TrackEntry {
+                track: Arc::clone(&track),
+                media,
+                ssrc,
+                remote: false,
+            },
+        );
+        // If the SRTP transport is already up (track added after connect),
+        // open the track immediately.
+        if let Some(srtp) = self.inner.srtp.lock().as_ref().cloned() {
+            if srtp.is_ready() {
+                track.open(srtp);
+            }
+        }
+        track
+    }
+
+    /// Snapshot of all recorded tracks (local + remote) in arbitrary order.
+    pub fn tracks(&self) -> Vec<Arc<Track>> {
+        self.inner
+            .tracks
+            .lock()
+            .values()
+            .map(|e| Arc::clone(&e.track))
+            .collect()
+    }
+
+    /// True if any media (audio/video) track has been added locally.
+    fn has_local_media(&self) -> bool {
+        self.inner.tracks.lock().values().any(|e| !e.remote)
     }
 
     // -- offer / answer -------------------------------------------------------
@@ -629,9 +722,84 @@ impl PeerConnection {
             self.pin_remote_fingerprint(dtls);
         }
 
+        // Surface any remote media tracks (m=audio/m=video sections we didn't
+        // add locally) via `on_track`. Mirrors libdatachannel's incoming-track
+        // negotiation: each remote section creates a Track recorded under its
+        // mid + SSRC so inbound RTP routes to it; the app installs callbacks
+        // and the track opens once SRTP keys are derived.
+        self.surface_remote_tracks();
+
         self.set_signaling_state(next_sig);
 
         Ok(())
+    }
+
+    /// Create + surface a [`Track`] for each remote media section we don't
+    /// already track locally. Called from [`Self::set_remote_description`].
+    fn surface_remote_tracks(&self) {
+        let remote = match self.inner.remote_description.lock().as_ref().cloned() {
+            Some(d) => d,
+            None => return,
+        };
+        let mut new_tracks: Vec<Arc<Track>> = Vec::new();
+        {
+            let mut tracks = self.inner.tracks.lock();
+            for media in remote.media_sections() {
+                let mid = media.mid().to_string();
+                if tracks.contains_key(&mid) {
+                    continue; // locally added or already surfaced
+                }
+                // Our local direction is the reciprocal of the remote's: if the
+                // remote is sendonly we are recvonly, and vice-versa.
+                let local_dir = match media.direction() {
+                    crate::Direction::SendOnly => crate::Direction::RecvOnly,
+                    crate::Direction::RecvOnly => crate::Direction::SendOnly,
+                    other => other,
+                };
+                // Pick the first advertised payload type / codec.
+                let (payload_type, ssrc) = (
+                    media.rtp_maps().first().map(|m| m.payload_type).unwrap_or(0),
+                    media.ssrcs().first().map(|s| s.ssrc).unwrap_or(0),
+                );
+                let codec = media
+                    .rtp_maps()
+                    .first()
+                    .and_then(|m| codec_from_rtpmap(&m.format))
+                    .unwrap_or(crate::Codec::H264);
+                let init = TrackInit::new(local_dir, codec, payload_type, ssrc, mid.clone());
+                // The media section WE advertise in the answer mirrors the
+                // offer's payload type / mid but carries OUR (reciprocal)
+                // direction. Build it from the track's own media description.
+                let local_media =
+                    MediaSection::from_track_media(&Track::new(init.clone(), TrackCallbacks::default()).description());
+                let track = Track::new(init, TrackCallbacks::default());
+                tracks.insert(
+                    mid,
+                    TrackEntry {
+                        track: Arc::clone(&track),
+                        media: local_media,
+                        ssrc,
+                        remote: true,
+                    },
+                );
+                new_tracks.push(track);
+            }
+        }
+        // If SRTP is already up, open the freshly-surfaced tracks.
+        if let Some(srtp) = self.inner.srtp.lock().as_ref().cloned() {
+            if srtp.is_ready() {
+                for t in &new_tracks {
+                    t.open(Arc::clone(&srtp));
+                }
+            }
+        }
+        let cb = {
+            let g = self.inner.callbacks.lock();
+            Arc::clone(&g.on_track)
+        };
+        for t in new_tracks {
+            (cb)(t);
+        }
     }
 
     /// Trickle a remote ICE candidate received out of band.
@@ -675,10 +843,17 @@ impl PeerConnection {
         if self.inner.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        // Tear down from the top down (SCTP → DTLS → ICE), mirroring the
-        // C++ `PeerConnection::close()`.
+        // Close all media tracks first.
+        for entry in self.inner.tracks.lock().values() {
+            entry.track.close();
+        }
+        // Tear down from the top down (SCTP / SRTP → DTLS → ICE), mirroring
+        // the C++ `PeerConnection::close()`.
         if let Some(sctp) = self.inner.sctp.lock().take() {
             let _ = sctp.close();
+        }
+        if let Some(srtp) = self.inner.srtp.lock().take() {
+            let _ = srtp.close();
         }
         if let Some(dtls) = self.inner.dtls.lock().take() {
             let _ = dtls.close();
@@ -773,8 +948,21 @@ impl PeerConnection {
                 .unwrap_or(256 * 1024),
         );
         desc.set_application(app);
+        self.apply_local_media(&mut desc);
         desc.hint_type(typ);
         Ok(desc)
+    }
+
+    /// Fold every recorded track's media section into the description. Both
+    /// locally-added tracks and remote tracks are advertised: the answerer
+    /// must echo the offer's m-lines (with its own reciprocal direction), and
+    /// `TrackEntry::media` already holds OUR side's section for remote tracks
+    /// (see [`Self::surface_remote_tracks`]).
+    fn apply_local_media(&self, desc: &mut Description) {
+        let tracks = self.inner.tracks.lock();
+        for entry in tracks.values() {
+            desc.add_media(entry.media.clone());
+        }
     }
 
     /// Re-render the stored local description from the current ICE
@@ -806,6 +994,7 @@ impl PeerConnection {
         app.set_sctp_port(5000);
         app.set_max_message_size(self.inner.config.max_message_size.unwrap_or(256 * 1024));
         desc.set_application(app);
+        self.apply_local_media(&mut desc);
         desc.hint_type(typ);
         *self.inner.local_description.lock() = Some(desc.clone());
 
@@ -978,6 +1167,16 @@ impl PeerConnection {
             self.init_sctp_transport();
         }
 
+        // Likewise bring the DTLS-SRTP media transport up *before* the
+        // handshake starts, so the `use_srtp` extension is present on the
+        // ClientHello/ServerHello (SrtpTransport::new sets it via
+        // SSL_set_tlsext_use_srtp). The transport derives its keys off the
+        // DTLS-Connected callback (on its own worker thread) and demuxes
+        // inbound media off the chained DTLS on_data hook.
+        if self.negotiated_has_media() {
+            self.init_srtp_transport();
+        }
+
         // ICE is already Connected, so the DtlsTransport's own auto-start
         // hook (which fires on the ICE-Connected transition) has already
         // missed its window. Drive the handshake explicitly. start() is
@@ -985,6 +1184,141 @@ impl PeerConnection {
         if let Err(e) = dtls.start() {
             warn!("PeerConnection: DTLS start failed: {e}");
             self.change_state(PeerConnectionState::Failed);
+        }
+    }
+
+    /// Create the DTLS-SRTP transport and route its inbound RTP/RTCP to the
+    /// recorded tracks. Runs once (guarded by the `srtp` slot). Called from
+    /// [`Self::init_dtls_transport`] *before* `dtls.start()` so the `use_srtp`
+    /// extension is set on the handshake. When SRTP signals Connected (keys
+    /// derived) every recorded track is opened so it can send/receive.
+    fn init_srtp_transport(&self) {
+        let mut guard = self.inner.srtp.lock();
+        if guard.is_some() {
+            return;
+        }
+        let dtls = match self.inner.dtls.lock().as_ref().cloned() {
+            Some(dtls) => dtls,
+            None => {
+                warn!("PeerConnection: cannot init SRTP — no DTLS transport stored");
+                return;
+            }
+        };
+
+        let pc_rtp = self.clone();
+        let pc_rtcp = self.clone();
+        let pc_state = self.clone();
+        let cbs = SrtpTransportCallbacks {
+            on_rtp: Arc::new(move |pkt| pc_rtp.route_inbound_media(pkt)),
+            on_rtcp: Arc::new(move |pkt| pc_rtcp.route_inbound_media(pkt)),
+            on_state_change: Arc::new(move |s| {
+                if matches!(s, DtlsState::Connected) {
+                    pc_state.open_tracks();
+                }
+            }),
+        };
+
+        match SrtpTransport::new(Arc::new(dtls), cbs) {
+            Ok(srtp) => {
+                *guard = Some(srtp);
+            }
+            Err(e) => {
+                warn!("PeerConnection: SRTP transport init failed: {e}");
+            }
+        }
+    }
+
+    /// Open every recorded track against the (now key-derived) SRTP transport.
+    /// Idempotent — `Track::open` only fires `on_open` once. Called when SRTP
+    /// reports keys derived, and also when a track is added after connect.
+    fn open_tracks(&self) {
+        let srtp = match self.inner.srtp.lock().as_ref().cloned() {
+            Some(s) => s,
+            None => return,
+        };
+        // The on_state_change(Connected) fires before keys are derived (it is
+        // forwarded straight from the lower DTLS layer); the key derivation
+        // happens on the srtp-derive worker thread. Poll briefly for readiness
+        // on a detached thread so we don't block the DTLS callback.
+        if srtp.is_ready() {
+            let tracks = self.tracks();
+            for t in tracks {
+                t.open(Arc::clone(&srtp));
+            }
+            return;
+        }
+        let pc = self.clone();
+        std::thread::Builder::new()
+            .name("pc-open-tracks".into())
+            .spawn(move || {
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(10);
+                loop {
+                    let ready = pc
+                        .inner
+                        .srtp
+                        .lock()
+                        .as_ref()
+                        .map(|s| s.is_ready())
+                        .unwrap_or(false);
+                    if ready {
+                        if let Some(srtp) = pc.inner.srtp.lock().as_ref().cloned() {
+                            for t in pc.tracks() {
+                                t.open(Arc::clone(&srtp));
+                            }
+                        }
+                        return;
+                    }
+                    if std::time::Instant::now() >= deadline || pc.inner.closed.load(Ordering::SeqCst)
+                    {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            })
+            .expect("spawn pc-open-tracks thread");
+    }
+
+    /// Route an inbound (SRTP-unprotected) RTP/RTCP packet to the track bound
+    /// to its SSRC. For RTP we read the SSRC from the header; for RTCP (and
+    /// when the SSRC isn't recognised) we fall back to delivering to the sole
+    /// recorded track if there is exactly one. Mirrors the BUNDLE'd demux: a
+    /// single media transport feeds every m-line, keyed by SSRC.
+    fn route_inbound_media(&self, pkt: &[u8]) {
+        if self.inner.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        // Try SSRC-based routing for RTP.
+        if let Some((header, _)) = RtpHeader::parse(pkt) {
+            let ssrc = header.ssrc;
+            let target = self
+                .inner
+                .tracks
+                .lock()
+                .values()
+                .find(|e| e.ssrc == ssrc)
+                .map(|e| Arc::clone(&e.track));
+            if let Some(track) = target {
+                track.incoming(pkt);
+                return;
+            }
+        }
+        // Fallback: deliver to the single recorded track, if unambiguous.
+        let tracks: Vec<Arc<Track>> = self
+            .inner
+            .tracks
+            .lock()
+            .values()
+            .map(|e| Arc::clone(&e.track))
+            .collect();
+        if tracks.len() == 1 {
+            tracks[0].incoming(pkt);
+        } else {
+            // Ambiguous SSRC with multiple tracks — deliver to all so an app
+            // wiring on_message still sees it (matches a best-effort demux).
+            for t in tracks {
+                t.incoming(pkt);
+            }
         }
     }
 
@@ -1020,6 +1354,32 @@ impl PeerConnection {
             }
             DtlsState::New | DtlsState::Closed => {}
         }
+    }
+
+    /// True if either the negotiated descriptions or a locally-added track
+    /// imply a media (SRTP) path. We bring SRTP up if *either* side advertises
+    /// media, or we have a local track, so the `use_srtp` extension is on the
+    /// DTLS handshake. Mirrors libdatachannel creating the DTLS-SRTP transport
+    /// whenever any media m-line is present.
+    fn negotiated_has_media(&self) -> bool {
+        if self.has_local_media() {
+            return true;
+        }
+        let local_media = self
+            .inner
+            .local_description
+            .lock()
+            .as_ref()
+            .map(|d| d.has_media())
+            .unwrap_or(false);
+        let remote_media = self
+            .inner
+            .remote_description
+            .lock()
+            .as_ref()
+            .map(|d| d.has_media())
+            .unwrap_or(false);
+        local_media || remote_media
     }
 
     /// True if both local and remote descriptions advertise an application
@@ -1346,6 +1706,19 @@ impl PeerConnection {
             };
             (cb)(new_state);
         }
+    }
+}
+
+/// Map an rtpmap encoding name (case-insensitive) to a [`crate::Codec`].
+fn codec_from_rtpmap(format: &str) -> Option<crate::Codec> {
+    match format.to_ascii_uppercase().as_str() {
+        "H264" => Some(crate::Codec::H264),
+        "H265" => Some(crate::Codec::H265),
+        "VP8" => Some(crate::Codec::Vp8),
+        "VP9" => Some(crate::Codec::Vp9),
+        "AV1" | "AV1X" => Some(crate::Codec::Av1),
+        "OPUS" => Some(crate::Codec::Opus),
+        _ => None,
     }
 }
 
@@ -1793,6 +2166,179 @@ mod tests {
                 "A never received B's message"
             );
             assert_eq!(a_recv.lock()[0], b"hello-from-b");
+
+            pc_a.close().expect("close a");
+            pc_b.close().expect("close b");
+        });
+    }
+
+    /// A locally-added video track must surface in the offer as a modeled
+    /// `m=video` section carrying the codec, mid and (after gathering) the
+    /// session ICE credentials.
+    #[test]
+    fn add_track_advertises_video_in_offer() {
+        rt().block_on(async {
+            let pc = PeerConnection::new(loopback_config(), PeerConnectionCallbacks::default())
+                .expect("construct");
+            let init = TrackInit::new(
+                crate::Direction::SendRecv,
+                crate::Codec::H264,
+                96,
+                0x1234_5678,
+                "video0",
+            );
+            let track = pc.add_track(init);
+            assert_eq!(track.mid(), "video0");
+
+            pc.set_local_description(DescriptionType::Offer)
+                .expect("set local offer");
+            assert!(
+                wait_for(|| pc.gathering_state() == GatheringState::Complete, 3000).await,
+                "never finished gathering"
+            );
+            let offer = pc.local_description().expect("local description");
+            let sdp = offer.to_sdp();
+            assert!(sdp.contains("m=video 9 UDP/TLS/RTP/SAVPF 96"), "offer lacks m=video:\n{sdp}");
+            assert!(sdp.contains("a=mid:video0"));
+            assert!(sdp.contains("a=rtpmap:96 H264/90000"));
+            assert!(sdp.contains("a=ice-ufrag:"), "m-line offer lacks ICE creds:\n{sdp}");
+            assert!(sdp.contains("a=ice-pwd:"));
+            assert!(offer.has_media());
+            assert_eq!(offer.media_by_mid("video0").unwrap().rtp_maps()[0].payload_type, 96);
+        });
+    }
+
+    /// End-to-end media test: A adds a sendrecv video track and offers; B
+    /// receives the remote track via `on_track`; both peers reach Connected;
+    /// A sends a media payload that arrives at B's track `on_frame` after the
+    /// full packetize → SRTP protect → DTLS/ICE → unprotect → depacketize path.
+    #[test]
+    fn media_track_round_trips_over_loopback() {
+        rt().block_on(async {
+            let a_state: Arc<Mutex<PeerConnectionState>> =
+                Arc::new(Mutex::new(PeerConnectionState::New));
+            let b_state: Arc<Mutex<PeerConnectionState>> =
+                Arc::new(Mutex::new(PeerConnectionState::New));
+            let a_cands: Arc<Mutex<Vec<Candidate>>> = Arc::new(Mutex::new(Vec::new()));
+            let b_cands: Arc<Mutex<Vec<Candidate>>> = Arc::new(Mutex::new(Vec::new()));
+
+            // B's remote track + frames it recovers.
+            let b_track: Arc<Mutex<Option<Arc<Track>>>> = Arc::new(Mutex::new(None));
+            let b_frames: Arc<Mutex<Vec<(Vec<u8>, u32, u8)>>> = Arc::new(Mutex::new(Vec::new()));
+
+            let a_state_cb = a_state.clone();
+            let a_cands_cb = a_cands.clone();
+            let a_cbs = PeerConnectionCallbacks {
+                on_state_change: Arc::new(move |s| *a_state_cb.lock() = s),
+                on_local_candidate: Arc::new(move |c| a_cands_cb.lock().push(c)),
+                ..PeerConnectionCallbacks::default()
+            };
+
+            let b_state_cb = b_state.clone();
+            let b_cands_cb = b_cands.clone();
+            let b_track_cb = b_track.clone();
+            let b_frames_cb = b_frames.clone();
+            let b_cbs = PeerConnectionCallbacks {
+                on_state_change: Arc::new(move |s| *b_state_cb.lock() = s),
+                on_local_candidate: Arc::new(move |c| b_cands_cb.lock().push(c)),
+                on_track: Arc::new(move |t| {
+                    let frames = b_frames_cb.clone();
+                    t.set_callbacks(TrackCallbacks {
+                        on_frame: Arc::new(move |p, ts, pt| {
+                            frames.lock().push((p.to_vec(), ts, pt));
+                        }),
+                        ..TrackCallbacks::default()
+                    });
+                    *b_track_cb.lock() = Some(t);
+                }),
+                ..PeerConnectionCallbacks::default()
+            };
+
+            let pc_a = PeerConnection::new(loopback_config(), a_cbs).expect("pc a");
+            let pc_b = PeerConnection::new(loopback_config(), b_cbs).expect("pc b");
+
+            // A adds a sendrecv video track (SSRC pins inbound routing on B).
+            let init = TrackInit::new(
+                crate::Direction::SendRecv,
+                crate::Codec::H264,
+                96,
+                0x0BAD_F00D,
+                "video0",
+            );
+            let track_a = pc_a.add_track(init);
+
+            // --- Offer/answer + trickle ---
+            pc_a.set_local_description(DescriptionType::Offer)
+                .expect("a set local offer");
+            assert!(
+                wait_for(|| pc_a.gathering_state() == GatheringState::Complete, 3000).await,
+                "A never finished gathering"
+            );
+            let offer = pc_a.local_description().expect("a local description");
+            assert!(offer.to_sdp().contains("m=video"), "offer must carry m=video");
+
+            pc_b.set_remote_description(offer).expect("b set remote offer");
+            pc_b.set_local_description(DescriptionType::Answer)
+                .expect("b set local answer");
+            assert!(
+                wait_for(|| pc_b.gathering_state() == GatheringState::Complete, 3000).await,
+                "B never finished gathering"
+            );
+            let answer = pc_b.local_description().expect("b local description");
+            assert!(answer.to_sdp().contains("m=video"), "answer must echo m=video");
+            pc_a.set_remote_description(answer).expect("a set remote answer");
+
+            // B surfaces the remote track immediately on applying the offer.
+            assert!(
+                wait_for(|| b_track.lock().is_some(), 2000).await,
+                "B never received the track via on_track"
+            );
+            let track_b = b_track.lock().clone().expect("b track");
+            assert_eq!(track_b.mid(), "video0");
+
+            for c in a_cands.lock().iter() {
+                let _ = pc_b.add_remote_candidate(c);
+            }
+            for c in b_cands.lock().iter() {
+                let _ = pc_a.add_remote_candidate(c);
+            }
+            pc_a.set_remote_end_of_candidates().expect("a eoc");
+            pc_b.set_remote_end_of_candidates().expect("b eoc");
+
+            // --- Wait for both to reach Connected ---
+            assert!(
+                wait_for(
+                    || {
+                        *a_state.lock() == PeerConnectionState::Connected
+                            && *b_state.lock() == PeerConnectionState::Connected
+                    },
+                    12000,
+                )
+                .await,
+                "peers did not reach Connected: a={:?}, b={:?}",
+                *a_state.lock(),
+                *b_state.lock(),
+            );
+
+            // --- Both tracks open once SRTP keys are derived ---
+            assert!(
+                wait_for(|| track_a.is_open() && track_b.is_open(), 5000).await,
+                "tracks never opened (SRTP keys not derived?)"
+            );
+
+            // --- A sends a media payload; B recovers it via on_frame ---
+            let payload = b"hello-media-track".to_vec();
+            let n = track_a.send(&payload).expect("a send media");
+            assert_eq!(n, 1, "generic packetizer emits one RTP packet");
+
+            assert!(
+                wait_for(|| !b_frames.lock().is_empty(), 5000).await,
+                "B never received the media frame"
+            );
+            let frames = b_frames.lock();
+            assert_eq!(frames[0].0, payload, "payload round-trips through SRTP");
+            assert_eq!(frames[0].2, 96, "payload type preserved");
+            drop(frames);
 
             pc_a.close().expect("close a");
             pc_b.close().expect("close b");

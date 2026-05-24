@@ -16,6 +16,7 @@ use std::str::FromStr;
 use thiserror::Error;
 
 use crate::candidate::{Candidate, ParseError as CandidateParseError};
+use crate::track::{RtpMap, SsrcEntry};
 
 // --- session-level enums -----------------------------------------------------
 
@@ -294,6 +295,120 @@ impl Application {
     }
 }
 
+// --- audio / video media section --------------------------------------------
+
+/// A modeled `m=audio` / `m=video` media section. Mirrors the subset of
+/// `rtc::Description::Media` that the offer/answer + Track integration needs:
+/// the media kind, mid, direction, the advertised payload types / rtpmaps
+/// (reusing track.rs's [`RtpMap`]) and SSRC bindings ([`SsrcEntry`]).
+///
+/// Promoting these from raw-line passthrough means the [`Description`] now
+/// understands media m-lines: it can be queried by [`PeerConnection::add_track`]
+/// (to advertise a local track) and inspected when a remote offer/answer
+/// arrives (to fire `on_track`). Per-media ICE credentials and the DTLS
+/// fingerprint come from the session-level fields, matching the BUNDLE'd SDP
+/// libdatachannel emits (a single ICE transport for all m-lines).
+///
+/// [`PeerConnection::add_track`]: crate::PeerConnection::add_track
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaSection {
+    kind: String,
+    mid: String,
+    direction: Direction,
+    rtp_maps: Vec<RtpMap>,
+    ssrcs: Vec<SsrcEntry>,
+    /// Per-media attributes we don't model individually (without the leading
+    /// `a=`). Round-tripped verbatim so we don't lose attributes such as
+    /// `extmap`, `rtcp-fb`, `ssrc-group`, etc.
+    extra_attrs: Vec<String>,
+}
+
+impl MediaSection {
+    /// Build a media section from its components.
+    #[must_use]
+    pub fn new(
+        kind: impl Into<String>,
+        mid: impl Into<String>,
+        direction: Direction,
+        rtp_maps: Vec<RtpMap>,
+        ssrcs: Vec<SsrcEntry>,
+    ) -> Self {
+        MediaSection {
+            kind: kind.into(),
+            mid: mid.into(),
+            direction,
+            rtp_maps,
+            ssrcs,
+            extra_attrs: Vec::new(),
+        }
+    }
+
+    /// Build a media section from a track's [`crate::TrackMedia`] description.
+    #[must_use]
+    pub fn from_track_media(media: &crate::TrackMedia) -> Self {
+        MediaSection {
+            kind: media.kind().to_string(),
+            mid: media.mid().to_string(),
+            direction: media.direction(),
+            rtp_maps: media.rtp_maps().to_vec(),
+            ssrcs: media.ssrcs().to_vec(),
+            extra_attrs: Vec::new(),
+        }
+    }
+
+    /// Media kind (`"audio"` / `"video"`).
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// `a=mid:` value.
+    #[must_use]
+    pub fn mid(&self) -> &str {
+        &self.mid
+    }
+
+    /// Override the mid.
+    pub fn set_mid(&mut self, mid: impl Into<String>) {
+        self.mid = mid.into();
+    }
+
+    /// Media direction.
+    #[must_use]
+    pub fn direction(&self) -> Direction {
+        self.direction
+    }
+
+    /// Set the direction.
+    pub fn set_direction(&mut self, dir: Direction) {
+        self.direction = dir;
+    }
+
+    /// Advertised rtpmaps.
+    #[must_use]
+    pub fn rtp_maps(&self) -> &[RtpMap] {
+        &self.rtp_maps
+    }
+
+    /// SSRC bindings.
+    #[must_use]
+    pub fn ssrcs(&self) -> &[SsrcEntry] {
+        &self.ssrcs
+    }
+
+    /// Whether this media section advertises the given payload type.
+    #[must_use]
+    pub fn has_payload_type(&self, pt: u8) -> bool {
+        self.rtp_maps.iter().any(|m| m.payload_type == pt)
+    }
+
+    /// True for `m=video`.
+    #[must_use]
+    pub fn is_video(&self) -> bool {
+        self.kind == "video"
+    }
+}
+
 // --- description -------------------------------------------------------------
 
 /// Errors returned when parsing an SDP blob.
@@ -336,9 +451,14 @@ pub struct Description {
 
     application: Option<Application>,
 
-    /// Verbatim text of unrecognised media sections. Each entry begins with
-    /// the `m=` line and contains every subsequent line up to (not including)
-    /// the next `m=` line, terminated by `\r\n`. Round-tripped to `to_sdp`.
+    /// Modeled `m=audio` / `m=video` sections in declaration order.
+    media_sections: Vec<MediaSection>,
+
+    /// Verbatim text of media sections whose type we don't model
+    /// (anything other than `application`, `audio`, `video`). Each entry begins
+    /// with the `m=` line and contains every subsequent line up to (not
+    /// including) the next `m=` line, terminated by `\r\n`. Round-tripped to
+    /// `to_sdp`.
     other_sections: Vec<String>,
 
     candidates: Vec<Candidate>,
@@ -366,6 +486,7 @@ impl Description {
             extmap_allow_mixed: false,
             extra_attrs: Vec::new(),
             application: None,
+            media_sections: Vec::new(),
             other_sections: Vec::new(),
             candidates: Vec::new(),
             ended: false,
@@ -543,6 +664,38 @@ impl Description {
         self.application.is_some()
     }
 
+    // -- media sections (audio / video) ---------------------------------------
+
+    /// All modeled `m=audio` / `m=video` sections in declaration order.
+    pub fn media_sections(&self) -> &[MediaSection] {
+        &self.media_sections
+    }
+
+    /// True if at least one modeled media (audio/video) section exists.
+    pub fn has_media(&self) -> bool {
+        !self.media_sections.is_empty()
+    }
+
+    /// Borrow the media section with the given mid, if present.
+    pub fn media_by_mid(&self, mid: &str) -> Option<&MediaSection> {
+        self.media_sections.iter().find(|m| m.mid() == mid)
+    }
+
+    /// Add a media (audio/video) section, recording its mid in `bundle_mids`
+    /// so it joins the BUNDLE group. If a section with the same mid already
+    /// exists it is replaced.
+    pub fn add_media(&mut self, media: MediaSection) {
+        let mid = media.mid().to_string();
+        if let Some(existing) = self.media_sections.iter_mut().find(|m| m.mid() == mid) {
+            *existing = media;
+            return;
+        }
+        if !self.bundle_mids.iter().any(|m| m == &mid) {
+            self.bundle_mids.push(mid);
+        }
+        self.media_sections.push(media);
+    }
+
     // -- candidates -----------------------------------------------------------
 
     /// All trickled candidates.
@@ -647,17 +800,108 @@ impl Description {
             out.push_str(eol);
         }
 
-        // Application m-section (this is the only media type G-2 models).
+        // Application m-section (data channel).
         if let Some(app) = &self.application {
             self.write_application(&mut out, app, eol);
         }
 
-        // Verbatim other media sections (audio/video/etc.).
+        // Modeled audio / video media sections.
+        for media in &self.media_sections {
+            self.write_media(&mut out, media, eol);
+        }
+
+        // Verbatim media sections we don't model (unknown m-line types).
         for section in &self.other_sections {
             out.push_str(section);
         }
 
         out
+    }
+
+    /// Serialize a modeled `m=audio`/`m=video` section. The per-media ICE
+    /// credentials, setup role and DTLS fingerprint mirror the BUNDLE'd SDP
+    /// libdatachannel emits — they come from the session-level fields (a single
+    /// ICE/DTLS transport backs every BUNDLE'd m-line).
+    fn write_media(&self, out: &mut String, media: &MediaSection, eol: &str) {
+        let pts: Vec<String> = media
+            .rtp_maps
+            .iter()
+            .map(|m| m.payload_type.to_string())
+            .collect();
+        out.push_str(&format!("m={} 9 UDP/TLS/RTP/SAVPF {}", media.kind, pts.join(" ")));
+        out.push_str(eol);
+        out.push_str("c=IN IP4 0.0.0.0");
+        out.push_str(eol);
+        out.push_str("a=mid:");
+        out.push_str(&media.mid);
+        out.push_str(eol);
+        if media.direction != Direction::Unknown {
+            out.push_str("a=");
+            out.push_str(media.direction.as_sdp());
+            out.push_str(eol);
+        }
+        out.push_str("a=rtcp-mux");
+        out.push_str(eol);
+        out.push_str("a=setup:");
+        out.push_str(self.role.as_sdp());
+        out.push_str(eol);
+        if let Some(u) = &self.ice_ufrag {
+            out.push_str("a=ice-ufrag:");
+            out.push_str(u);
+            out.push_str(eol);
+        }
+        if let Some(p) = &self.ice_pwd {
+            out.push_str("a=ice-pwd:");
+            out.push_str(p);
+            out.push_str(eol);
+        }
+        if let Some(fp) = &self.fingerprint {
+            out.push_str("a=fingerprint:");
+            out.push_str(fp.algorithm.as_sdp());
+            out.push(' ');
+            out.push_str(&fp.value);
+            out.push_str(eol);
+        }
+        for m in &media.rtp_maps {
+            match &m.enc_params {
+                Some(params) => out.push_str(&format!(
+                    "a=rtpmap:{} {}/{}/{}",
+                    m.payload_type, m.format, m.clock_rate, params
+                )),
+                None => out.push_str(&format!(
+                    "a=rtpmap:{} {}/{}",
+                    m.payload_type, m.format, m.clock_rate
+                )),
+            }
+            out.push_str(eol);
+            for fmtp in &m.fmtps {
+                out.push_str(&format!("a=fmtp:{} {}", m.payload_type, fmtp));
+                out.push_str(eol);
+            }
+        }
+        for s in &media.ssrcs {
+            if let Some(name) = &s.name {
+                out.push_str(&format!("a=ssrc:{} cname:{}", s.ssrc, name));
+                out.push_str(eol);
+            }
+            if let (Some(msid), Some(track_id)) = (&s.msid, &s.track_id) {
+                out.push_str(&format!("a=ssrc:{} msid:{} {}", s.ssrc, msid, track_id));
+                out.push_str(eol);
+            }
+        }
+        for attr in &media.extra_attrs {
+            out.push_str("a=");
+            out.push_str(attr);
+            out.push_str(eol);
+        }
+        // Candidates attached to this section's mid.
+        for c in &self.candidates {
+            if c.mid() == media.mid {
+                out.push_str("a=");
+                out.push_str(&c.to_sdp());
+                out.push_str(eol);
+            }
+        }
     }
 
     fn write_application(&self, out: &mut String, app: &Application, eol: &str) {
@@ -744,6 +988,9 @@ impl fmt::Display for Description {
 /// What kind of media section the parser is currently accumulating.
 enum SectionKind {
     Application,
+    /// Modeled audio/video section.
+    Media,
+    /// Verbatim section for unmodeled m-line types.
     Other,
 }
 
@@ -751,6 +998,7 @@ fn parse_into(d: &mut Description, sdp: &str) -> Result<(), DescriptionParseErro
     // Section state. `current_kind` tracks what we're appending to.
     let mut current_kind: Option<SectionKind> = None;
     let mut current_app: Option<Application> = None;
+    let mut current_media: Option<MediaSection> = None;
     let mut current_other = String::new();
     let mut other_mid: Option<String> = None;
     let mut section_index: i32 = -1;
@@ -768,6 +1016,7 @@ fn parse_into(d: &mut Description, sdp: &str) -> Result<(), DescriptionParseErro
                 d,
                 &mut current_kind,
                 &mut current_app,
+                &mut current_media,
                 &mut current_other,
                 &mut other_mid,
             );
@@ -778,6 +1027,18 @@ fn parse_into(d: &mut Description, sdp: &str) -> Result<(), DescriptionParseErro
                 current_kind = Some(SectionKind::Application);
                 // Default mid is the section index (overridden by a=mid:).
                 current_app = Some(Application::new(section_index.to_string()));
+            } else if mtype == "audio" || mtype == "video" {
+                current_kind = Some(SectionKind::Media);
+                // Default mid is the section index (overridden by a=mid:); the
+                // rtpmap/ssrc lines populate the rest. Default direction is
+                // SendRecv until an explicit a=<dir> line says otherwise.
+                current_media = Some(MediaSection::new(
+                    mtype,
+                    section_index.to_string(),
+                    Direction::SendRecv,
+                    Vec::new(),
+                    Vec::new(),
+                ));
             } else {
                 current_kind = Some(SectionKind::Other);
                 current_other.clear();
@@ -879,6 +1140,8 @@ fn parse_into(d: &mut Description, sdp: &str) -> Result<(), DescriptionParseErro
                 "candidate" => {
                     let default_mid = if let Some(app) = &current_app {
                         app.mid().to_string()
+                    } else if let Some(m) = &current_media {
+                        m.mid().to_string()
                     } else if let Some(m) = &other_mid {
                         m.clone()
                     } else if let Some(first) = d.bundle_mids.first() {
@@ -947,6 +1210,64 @@ fn parse_into(d: &mut Description, sdp: &str) -> Result<(), DescriptionParseErro
                 }
             }
 
+            // Per-media (audio/video) attributes.
+            if let Some(media) = current_media.as_mut() {
+                match key {
+                    "mid" => {
+                        media.set_mid(value.trim());
+                        continue;
+                    }
+                    "sendonly" => {
+                        media.set_direction(Direction::SendOnly);
+                        continue;
+                    }
+                    "recvonly" => {
+                        media.set_direction(Direction::RecvOnly);
+                        continue;
+                    }
+                    "sendrecv" => {
+                        media.set_direction(Direction::SendRecv);
+                        continue;
+                    }
+                    "inactive" => {
+                        media.set_direction(Direction::Inactive);
+                        continue;
+                    }
+                    "rtcp-mux" => continue, // implied; regenerated by serializer
+                    "rtpmap" => {
+                        if let Some(rm) = parse_rtpmap(value) {
+                            media.rtp_maps.push(rm);
+                        }
+                        continue;
+                    }
+                    "fmtp" => {
+                        // a=fmtp:<pt> <params>
+                        let mut it = value.splitn(2, ' ');
+                        if let (Some(pt_str), Some(params)) = (it.next(), it.next()) {
+                            if let Ok(pt) = pt_str.parse::<u8>() {
+                                if let Some(rm) =
+                                    media.rtp_maps.iter_mut().find(|m| m.payload_type == pt)
+                                {
+                                    rm.fmtps.push(params.to_string());
+                                    continue;
+                                }
+                            }
+                        }
+                        media.extra_attrs.push(attr.to_string());
+                        continue;
+                    }
+                    "ssrc" => {
+                        parse_ssrc_into(&mut media.ssrcs, value);
+                        continue;
+                    }
+                    _ => {
+                        // Preserve unknown per-media attributes verbatim.
+                        media.extra_attrs.push(attr.to_string());
+                        continue;
+                    }
+                }
+            }
+
             // Session-level fallback for unknown attributes.
             d.extra_attrs.push(attr.to_string());
             continue;
@@ -965,6 +1286,7 @@ fn parse_into(d: &mut Description, sdp: &str) -> Result<(), DescriptionParseErro
         d,
         &mut current_kind,
         &mut current_app,
+        &mut current_media,
         &mut current_other,
         &mut other_mid,
     );
@@ -976,6 +1298,7 @@ fn flush_section(
     d: &mut Description,
     kind: &mut Option<SectionKind>,
     app: &mut Option<Application>,
+    media: &mut Option<MediaSection>,
     other: &mut String,
     other_mid: &mut Option<String>,
 ) {
@@ -985,6 +1308,15 @@ fn flush_section(
                 let mid = a.mid().to_string();
                 d.application = Some(a);
                 if !d.bundle_mids.iter().any(|m| m == &mid) {
+                    d.bundle_mids.push(mid);
+                }
+            }
+        }
+        Some(SectionKind::Media) => {
+            if let Some(m) = media.take() {
+                let mid = m.mid().to_string();
+                d.media_sections.push(m);
+                if !d.bundle_mids.iter().any(|x| x == &mid) {
                     d.bundle_mids.push(mid);
                 }
             }
@@ -1009,6 +1341,56 @@ fn parse_pair(attr: &str) -> (&str, &str) {
     match attr.find(':') {
         Some(i) => (&attr[..i], &attr[i + 1..]),
         None => (attr, ""),
+    }
+}
+
+/// Parse an `a=rtpmap:` value `<pt> <name>/<rate>[/<params>]` into an
+/// [`RtpMap`]. Returns `None` if the payload type doesn't parse.
+fn parse_rtpmap(value: &str) -> Option<RtpMap> {
+    let mut it = value.splitn(2, ' ');
+    let pt: u8 = it.next()?.trim().parse().ok()?;
+    let codec = it.next()?.trim();
+    let mut parts = codec.split('/');
+    let format = parts.next()?.to_string();
+    let clock_rate: u32 = parts.next()?.trim().parse().ok()?;
+    let enc_params = parts.next().map(|s| s.trim().to_string());
+    Some(RtpMap {
+        payload_type: pt,
+        format,
+        clock_rate,
+        enc_params,
+        fmtps: Vec::new(),
+    })
+}
+
+/// Parse an `a=ssrc:` value into / merging onto the section's SSRC list.
+/// Handles `<ssrc> cname:<name>` and `<ssrc> msid:<msid> <trackId>`, folding
+/// multiple lines for the same SSRC into one [`SsrcEntry`].
+fn parse_ssrc_into(ssrcs: &mut Vec<SsrcEntry>, value: &str) {
+    let mut it = value.splitn(2, ' ');
+    let ssrc: u32 = match it.next().and_then(|s| s.trim().parse().ok()) {
+        Some(v) => v,
+        None => return,
+    };
+    let rest = it.next().unwrap_or("").trim();
+    let entry = match ssrcs.iter_mut().find(|e| e.ssrc == ssrc) {
+        Some(e) => e,
+        None => {
+            ssrcs.push(SsrcEntry {
+                ssrc,
+                name: None,
+                msid: None,
+                track_id: None,
+            });
+            ssrcs.last_mut().unwrap()
+        }
+    };
+    if let Some(cname) = rest.strip_prefix("cname:") {
+        entry.name = Some(cname.trim().to_string());
+    } else if let Some(msid) = rest.strip_prefix("msid:") {
+        let mut m = msid.split_ascii_whitespace();
+        entry.msid = m.next().map(|s| s.to_string());
+        entry.track_id = m.next().map(|s| s.to_string());
     }
 }
 
@@ -1204,9 +1586,11 @@ a=msid-semantic:WMS *\r\n";
     }
 
     #[test]
-    fn other_media_preserved_verbatim() {
-        // libwebrtc-style fragment that includes audio. We don't model audio
-        // but the lines should round-trip into the serialized output.
+    fn audio_media_section_modeled_and_round_trips() {
+        // libwebrtc-style fragment that includes audio. Audio/video m-lines are
+        // now MODELED (not raw passthrough): the parser produces a
+        // `MediaSection` and the serializer regenerates a canonical form that
+        // preserves the codec, mid, direction, rtpmap and fmtp.
         let sdp = "v=0\r\n\
 o=rtc 42 0 IN IP4 127.0.0.1\r\n\
 s=-\r\n\
@@ -1231,11 +1615,71 @@ a=fmtp:111 minptime=10;useinbandfec=1\r\n";
         // bundle mids should pick up both the application and the audio section.
         assert!(d.bundle_mids().contains(&"audio".to_string()));
 
+        // The audio section is modeled.
+        assert!(d.has_media());
+        let m = d.media_by_mid("audio").expect("audio section modeled");
+        assert_eq!(m.kind(), "audio");
+        assert_eq!(m.direction(), Direction::SendRecv);
+        assert_eq!(m.rtp_maps().len(), 1);
+        assert_eq!(m.rtp_maps()[0].payload_type, 111);
+        assert_eq!(m.rtp_maps()[0].format, "opus");
+        assert_eq!(m.rtp_maps()[0].clock_rate, 48000);
+        assert_eq!(m.rtp_maps()[0].enc_params.as_deref(), Some("2"));
+        assert_eq!(m.rtp_maps()[0].fmtps, vec!["minptime=10;useinbandfec=1".to_string()]);
+
         let out = d.to_sdp();
-        // The audio block was preserved.
+        // The audio block regenerates canonically.
         assert!(out.contains("m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"), "audio m= missing in output");
+        assert!(out.contains("a=mid:audio\r\n"));
         assert!(out.contains("a=rtpmap:111 opus/48000/2\r\n"));
         assert!(out.contains("a=fmtp:111 minptime=10;useinbandfec=1\r\n"));
+
+        // And it survives a second parse→serialize (idempotent canonical form).
+        let d2 = Description::parse(&out).unwrap();
+        assert_eq!(d2.to_sdp(), out);
+    }
+
+    #[test]
+    fn add_video_media_section_emits_modeled_sdp() {
+        use crate::track::{Codec, RtpMap, SsrcEntry};
+        let mut d = Description::new(Type::Offer, Role::ActPass);
+        d.set_ice_ufrag("u");
+        d.set_ice_pwd("ppppppppppppppppppppppp");
+        d.set_fingerprint(Fingerprint {
+            algorithm: FingerprintAlgorithm::Sha256,
+            value: "ab:cd".to_string(),
+        });
+        let rtp = RtpMap {
+            payload_type: 96,
+            format: Codec::H264.rtpmap_name().to_string(),
+            clock_rate: 90000,
+            enc_params: None,
+            fmtps: vec!["profile-level-id=42e01f".to_string()],
+        };
+        let ssrc = SsrcEntry {
+            ssrc: 0x1234,
+            name: Some("cam".to_string()),
+            msid: None,
+            track_id: None,
+        };
+        d.add_media(MediaSection::new(
+            "video",
+            "video0",
+            Direction::SendRecv,
+            vec![rtp],
+            vec![ssrc],
+        ));
+        let out = d.to_sdp();
+        assert!(out.contains("a=group:BUNDLE video0\r\n") || out.contains(" video0"));
+        assert!(out.contains("m=video 9 UDP/TLS/RTP/SAVPF 96\r\n"));
+        assert!(out.contains("a=mid:video0\r\n"));
+        assert!(out.contains("a=sendrecv\r\n"));
+        assert!(out.contains("a=rtcp-mux\r\n"));
+        assert!(out.contains("a=setup:actpass\r\n"));
+        assert!(out.contains("a=ice-ufrag:u\r\n"));
+        assert!(out.contains("a=rtpmap:96 H264/90000\r\n"));
+        assert!(out.contains("a=fmtp:96 profile-level-id=42e01f\r\n"));
+        assert!(out.contains("a=ssrc:4660 cname:cam\r\n"));
     }
 
     #[test]

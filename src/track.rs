@@ -448,6 +448,34 @@ impl Track {
         self.inner.lock().media.to_sdp()
     }
 
+    /// The track's outbound RTP clock rate (Hz). Used by the
+    /// seconds↔timestamp transform helpers.
+    #[must_use]
+    pub fn clock_rate(&self) -> u32 {
+        self.packetizer.config().clock_rate
+    }
+
+    /// The primary media SSRC for this track (the first `a=ssrc:` binding, or
+    /// the packetizer's configured SSRC if the description carries none).
+    #[must_use]
+    pub fn media_ssrc(&self) -> u32 {
+        let g = self.inner.lock();
+        g.media
+            .ssrcs()
+            .first()
+            .map(|s| s.ssrc)
+            .unwrap_or_else(|| self.packetizer.config().ssrc)
+    }
+
+    /// Request a keyframe from the remote by sending an RTCP PLI (RFC 4585
+    /// §6.3.1) for this track's media SSRC. Returns the bytes sent, or a
+    /// [`TrackError`] if the track is not open / send not possible.
+    pub fn request_keyframe(&self) -> Result<(), TrackError> {
+        let ssrc = self.media_ssrc();
+        let pli = crate::rtp::RtcpPli { media_ssrc: ssrc };
+        self.send_rtp(&pli.serialize())
+    }
+
     /// Replace the media description. The `mid` must match, mirroring
     /// `impl::Track::setDescription`.
     pub fn set_description(&self, media: Media) -> Result<(), TrackError> {

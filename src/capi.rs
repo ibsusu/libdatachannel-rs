@@ -353,6 +353,20 @@ fn get_dc(id: c_int) -> Option<DataChannel> {
     }
 }
 
+fn get_tr(id: c_int) -> Option<Arc<Track>> {
+    match REGISTRY.lock().get(&id) {
+        Some(RtcObject::Tr(tr)) => Some(Arc::clone(tr)),
+        _ => None,
+    }
+}
+
+/// `track handle -> owning pc handle`. Populated when a track is added via
+/// `rtcAddTrack`/`rtcAddTrackEx` or surfaced via the `on_track` callback, so
+/// the media-handler chain / keyframe-request functions can resolve the
+/// PeerConnection backing the track.
+static TRACK_OWNERS: Lazy<Mutex<HashMap<c_int, c_int>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
 // ===========================================================================
 // Panic-safe boundary guards + string-buffer convention
 // ===========================================================================
@@ -585,6 +599,7 @@ struct PcCallbackSlots {
     gathering_state: Option<RtcGatheringStateCallbackFunc>,
     signaling_state: Option<RtcSignalingStateCallbackFunc>,
     data_channel: Option<RtcDataChannelCallbackFunc>,
+    track: Option<RtcTrackCallbackFunc>,
 }
 
 // SAFETY: the slots hold bare `extern "C" fn` pointers, which are `Send`/`Sync`
@@ -630,6 +645,7 @@ fn install_pc_callbacks(pc: c_int) -> c_int {
         let gs_cb = slots.gathering_state;
         let ss_cb = slots.signaling_state;
         let dc_cb = slots.data_channel;
+        let tr_cb = slots.track;
 
         if let Some(cb) = sc_cb {
             cbs.on_state_change = Arc::new(move |s| {
@@ -667,6 +683,18 @@ fn install_pc_callbacks(pc: c_int) -> c_int {
         if let Some(cb) = dc_cb {
             cbs.on_data_channel = Arc::new(move |dc| {
                 let id = emplace(RtcObject::Dc(dc));
+                // Inherit the pc's user pointer (capi.cpp does this).
+                let ptr = user_pointer(pc);
+                rtcSetUserPointer(id, ptr);
+                dispatch(move || cb(pc, id, ptr));
+            });
+        }
+        if let Some(cb) = tr_cb {
+            cbs.on_track = Arc::new(move |tr| {
+                let id = emplace(RtcObject::Tr(tr));
+                // Record which PeerConnection owns the track so the
+                // Chain/Transform/Request functions can resolve it.
+                TRACK_OWNERS.lock().insert(id, pc);
                 // Inherit the pc's user pointer (capi.cpp does this).
                 let ptr = user_pointer(pc);
                 rtcSetUserPointer(id, ptr);
@@ -1303,9 +1331,14 @@ fn install_dc_callbacks(id: c_int) -> c_int {
     })
 }
 
-/// `rtcSetOpenCallback`.
+/// `rtcSetOpenCallback`. Works on a DataChannel **or** a Track handle (rtc.h's
+/// generic-channel API).
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcSetOpenCallback(id: c_int, cb: Option<RtcOpenCallbackFunc>) -> c_int {
+    if get_tr(id).is_some() {
+        TRACK_SLOTS.lock().entry(id).or_default().open = cb;
+        return install_track_callbacks(id);
+    }
     if get_dc(id).is_none() {
         return RTC_ERR_INVALID;
     }
@@ -1313,9 +1346,13 @@ pub extern "C" fn rtcSetOpenCallback(id: c_int, cb: Option<RtcOpenCallbackFunc>)
     install_dc_callbacks(id)
 }
 
-/// `rtcSetClosedCallback`.
+/// `rtcSetClosedCallback`. DataChannel or Track handle.
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcSetClosedCallback(id: c_int, cb: Option<RtcClosedCallbackFunc>) -> c_int {
+    if get_tr(id).is_some() {
+        TRACK_SLOTS.lock().entry(id).or_default().closed = cb;
+        return install_track_callbacks(id);
+    }
     if get_dc(id).is_none() {
         return RTC_ERR_INVALID;
     }
@@ -1323,12 +1360,17 @@ pub extern "C" fn rtcSetClosedCallback(id: c_int, cb: Option<RtcClosedCallbackFu
     install_dc_callbacks(id)
 }
 
-/// `rtcSetErrorCallback`. Stored for ABI completeness; the runtime
-/// DataChannel has no error hook, so it will not fire.
+/// `rtcSetErrorCallback`. Stored for ABI completeness; neither the runtime
+/// DataChannel nor Track has an error hook, so it will not fire. DataChannel or
+/// Track handle.
 //
-// TODO(#22): wire to a DataChannel error hook when the runtime grows one.
+// TODO(#22): wire to an error hook when the runtime grows one.
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcSetErrorCallback(id: c_int, cb: Option<RtcErrorCallbackFunc>) -> c_int {
+    if get_tr(id).is_some() {
+        TRACK_SLOTS.lock().entry(id).or_default().error = cb;
+        return RTC_ERR_SUCCESS;
+    }
     if get_dc(id).is_none() {
         return RTC_ERR_INVALID;
     }
@@ -1336,9 +1378,13 @@ pub extern "C" fn rtcSetErrorCallback(id: c_int, cb: Option<RtcErrorCallbackFunc
     RTC_ERR_SUCCESS
 }
 
-/// `rtcSetMessageCallback`.
+/// `rtcSetMessageCallback`. DataChannel or Track handle.
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcSetMessageCallback(id: c_int, cb: Option<RtcMessageCallbackFunc>) -> c_int {
+    if get_tr(id).is_some() {
+        TRACK_SLOTS.lock().entry(id).or_default().message = cb;
+        return install_track_callbacks(id);
+    }
     if get_dc(id).is_none() {
         return RTC_ERR_INVALID;
     }
@@ -1355,6 +1401,22 @@ pub extern "C" fn rtcSetMessageCallback(id: c_int, cb: Option<RtcMessageCallback
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcSendMessage(id: c_int, data: *const c_char, size: c_int) -> c_int {
     guard(|| {
+        // For a Track handle, `data` is a pre-formed RTP/RTCP packet (binary).
+        if let Some(tr) = get_tr(id) {
+            if data.is_null() && size != 0 {
+                return RTC_ERR_INVALID;
+            }
+            let bytes: &[u8] = if size <= 0 || data.is_null() {
+                &[]
+            } else {
+                // SAFETY: caller guarantees `data` has `size` bytes.
+                unsafe { std::slice::from_raw_parts(data as *const u8, size as usize) }
+            };
+            return match tr.send_rtp(bytes) {
+                Ok(_) => RTC_ERR_SUCCESS,
+                Err(_) => RTC_ERR_FAILURE,
+            };
+        }
         let dc = match get_dc(id) {
             Some(d) => d,
             None => return RTC_ERR_INVALID,
@@ -1385,38 +1447,57 @@ pub extern "C" fn rtcSendMessage(id: c_int, data: *const c_char, size: c_int) ->
     })
 }
 
-/// `rtcClose` (generic channel close — DataChannel only in this port).
+/// `rtcClose` (generic channel close — DataChannel or Track).
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcClose(id: c_int) -> c_int {
-    guard(|| match get_dc(id) {
-        Some(d) => {
-            d.close();
-            RTC_ERR_SUCCESS
+    guard(|| {
+        if let Some(tr) = get_tr(id) {
+            tr.close();
+            return RTC_ERR_SUCCESS;
         }
-        None => RTC_ERR_INVALID,
+        match get_dc(id) {
+            Some(d) => {
+                d.close();
+                RTC_ERR_SUCCESS
+            }
+            None => RTC_ERR_INVALID,
+        }
     })
 }
 
-/// `rtcDelete` (generic channel delete — DataChannel only in this port).
+/// `rtcDelete` (generic channel delete — DataChannel or Track).
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcDelete(id: c_int) -> c_int {
+    if get_tr(id).is_some() {
+        return rtcDeleteTrack(id);
+    }
     rtcDeleteDataChannel(id)
 }
 
-/// `rtcIsOpen`.
+/// `rtcIsOpen`. DataChannel or Track handle.
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcIsOpen(id: c_int) -> bool {
-    guard_bool(|| get_dc(id).map(|d| d.is_open()).unwrap_or(false))
+    guard_bool(|| {
+        if let Some(tr) = get_tr(id) {
+            return tr.is_open();
+        }
+        get_dc(id).map(|d| d.is_open()).unwrap_or(false)
+    })
 }
 
-/// `rtcIsClosed`. The runtime DataChannel does not expose an `is_closed`
-/// accessor; we derive "closed" as "registered but not open". A handle that is
-/// open is definitely not closed; an unknown handle reports closed.
+/// `rtcIsClosed`. The runtime channels expose openness; we derive "closed" as
+/// "registered but not open". An open handle is definitely not closed; an
+/// unknown handle reports closed.
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcIsClosed(id: c_int) -> bool {
-    guard_bool(|| match get_dc(id) {
-        Some(d) => !d.is_open(),
-        None => true,
+    guard_bool(|| {
+        if let Some(tr) = get_tr(id) {
+            return tr.is_closed();
+        }
+        match get_dc(id) {
+            Some(d) => !d.is_open(),
+            None => true,
+        }
     })
 }
 
@@ -1510,159 +1591,505 @@ pub extern "C" fn rtcReceiveMessage(id: c_int, _buffer: *mut c_char, _size: *mut
 }
 
 // ===========================================================================
-// Track + media handlers — NOT backed by the runtime yet
+// Track + media handlers
 // ===========================================================================
 //
-// The runtime's `Track` is standalone: `PeerConnection` has no `addTrack` /
-// `onTrack` integration (that lands in a later task). Per task #22's scope,
-// every Track and RTCP-chain function therefore returns RTC_ERR_NOT_AVAIL with
-// a TODO rather than fabricating a handle/result. They are still exported so
-// node-datachannel links.
+// Tracks are now registry-backed (`RtcObject::Tr`) and wired to the runtime's
+// `PeerConnection::add_track` / `on_track`. The media-handler *chain* functions
+// (RTCP receiving session, SR reporter, NACK responder, PLI/REMB/pacing) have
+// no runtime backing on `Track` yet — the runtime's `Track::incoming` does not
+// run a `MediaHandlerChain` (that is follow-up #20/#21) — so they validate the
+// handle and report `RTC_ERR_NOT_AVAIL`. The handle plumbing, callbacks,
+// add/delete, accessors and keyframe/transform helpers are fully implemented.
 
-/// `rtcSetTrackCallback` — stub.
-// TODO(#22): wire once PeerConnection::on_track lands.
+/// Per-handle storage for the track-level callbacks so we can rebuild the
+/// TrackCallbacks set on every setter call (mirrors [`DcCallbackSlots`]).
+#[derive(Default, Clone)]
+struct TrackCallbackSlots {
+    open: Option<RtcOpenCallbackFunc>,
+    closed: Option<RtcClosedCallbackFunc>,
+    error: Option<RtcErrorCallbackFunc>,
+    message: Option<RtcMessageCallbackFunc>,
+}
+
+// SAFETY: bare `extern "C" fn` pointers are Send/Sync (code addresses).
+unsafe impl Send for TrackCallbackSlots {}
+unsafe impl Sync for TrackCallbackSlots {}
+
+static TRACK_SLOTS: Lazy<Mutex<HashMap<c_int, TrackCallbackSlots>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Map a runtime [`crate::Direction`] to the C `rtcDirection` enum value.
+fn direction_to_c(d: crate::Direction) -> c_int {
+    match d {
+        crate::Direction::Unknown => 0,  // RTC_DIRECTION_UNKNOWN
+        crate::Direction::SendOnly => 1, // RTC_DIRECTION_SENDONLY
+        crate::Direction::RecvOnly => 2, // RTC_DIRECTION_RECVONLY
+        crate::Direction::SendRecv => 3, // RTC_DIRECTION_SENDRECV
+        crate::Direction::Inactive => 4, // RTC_DIRECTION_INACTIVE
+    }
+}
+
+/// Map a C `rtcDirection` to the runtime [`crate::Direction`]. Unknown (0) and
+/// any out-of-range value default to `SendRecv`.
+fn direction_from_c(d: c_int) -> crate::Direction {
+    match d {
+        1 => crate::Direction::SendOnly,
+        2 => crate::Direction::RecvOnly,
+        4 => crate::Direction::Inactive,
+        _ => crate::Direction::SendRecv,
+    }
+}
+
+/// Map a C `rtcCodec` to the runtime [`crate::Codec`]. Returns `None` for codecs
+/// the runtime does not model.
+fn codec_from_c(c: c_int) -> Option<crate::Codec> {
+    Some(match c {
+        0 => crate::Codec::H264,   // RTC_CODEC_H264
+        1 => crate::Codec::Vp8,    // RTC_CODEC_VP8
+        2 => crate::Codec::Vp9,    // RTC_CODEC_VP9
+        3 => crate::Codec::H265,   // RTC_CODEC_H265
+        4 => crate::Codec::Av1,    // RTC_CODEC_AV1
+        128 => crate::Codec::Opus, // RTC_CODEC_OPUS
+        _ => return None,
+    })
+}
+
+/// Map an SDP rtpmap encoding name (e.g. `"H264"`, `"opus"`) to a runtime codec.
+fn codec_from_rtpmap_name(name: &str) -> Option<crate::Codec> {
+    match name.to_ascii_uppercase().as_str() {
+        "H264" => Some(crate::Codec::H264),
+        "H265" => Some(crate::Codec::H265),
+        "VP8" => Some(crate::Codec::Vp8),
+        "VP9" => Some(crate::Codec::Vp9),
+        "AV1" => Some(crate::Codec::Av1),
+        "OPUS" => Some(crate::Codec::Opus),
+        _ => None,
+    }
+}
+
+/// Rebuild + install the TrackCallbacks set for a track handle from its slots.
+fn install_track_callbacks(id: c_int) -> c_int {
+    guard(|| {
+        let tr = match get_tr(id) {
+            Some(t) => t,
+            None => return RTC_ERR_INVALID,
+        };
+        let slots = TRACK_SLOTS.lock().get(&id).cloned().unwrap_or_default();
+        let mut cbs = crate::TrackCallbacks::default();
+
+        if let Some(cb) = slots.open {
+            cbs.on_open = Arc::new(move || {
+                let ptr = user_pointer(id);
+                dispatch(move || cb(id, ptr));
+            });
+        }
+        if let Some(cb) = slots.closed {
+            cbs.on_closed = Arc::new(move || {
+                let ptr = user_pointer(id);
+                dispatch(move || cb(id, ptr));
+            });
+        }
+        if let Some(cb) = slots.message {
+            // Track inbound bytes are an RTP/RTCP packet — always binary.
+            cbs.on_message = Arc::new(move |data: &[u8]| {
+                let ptr = user_pointer(id);
+                let len = data.len() as c_int;
+                let p = data.as_ptr() as *const c_char;
+                dispatch(move || cb(id, p, len, ptr));
+            });
+        }
+        // `error` is stored for ABI completeness; the runtime Track has no
+        // error hook so it never fires.
+
+        tr.set_callbacks(cbs);
+        RTC_ERR_SUCCESS
+    })
+}
+
+/// `rtcSetTrackCallback` — install the PeerConnection-level incoming-track
+/// callback. Backed by the runtime's [`PeerConnectionCallbacks::on_track`].
 #[unsafe(no_mangle)]
-pub extern "C" fn rtcSetTrackCallback(pc: c_int, _cb: Option<RtcTrackCallbackFunc>) -> c_int {
+pub extern "C" fn rtcSetTrackCallback(pc: c_int, cb: Option<RtcTrackCallbackFunc>) -> c_int {
     if get_pc(pc).is_none() {
+        return RTC_ERR_INVALID;
+    }
+    PC_SLOTS.lock().entry(pc).or_default().track = cb;
+    install_pc_callbacks(pc)
+}
+
+/// `rtcAddTrack` — add a local track described by an SDP media section. We parse
+/// the media line (kind, mid, direction, first rtpmap → codec + payload type)
+/// and build a runtime [`crate::TrackInit`]. Returns the new track handle.
+///
+/// # Safety
+/// `media_description_sdp` must be a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtcAddTrack(pc: c_int, media_description_sdp: *const c_char) -> c_int {
+    guard(|| {
+        let pc_obj = match get_pc(pc) {
+            Some(p) => p,
+            None => return RTC_ERR_INVALID,
+        };
+        let sdp = match unsafe { cstr_opt(media_description_sdp) } {
+            Some(Some(s)) => s,
+            _ => return RTC_ERR_INVALID,
+        };
+        let init = match track_init_from_sdp(sdp) {
+            Some(i) => i,
+            None => return RTC_ERR_INVALID,
+        };
+        let track = pc_obj.add_track(init);
+        let id = emplace(RtcObject::Tr(track));
+        TRACK_OWNERS.lock().insert(id, pc);
+        let ptr = user_pointer(pc);
+        rtcSetUserPointer(id, ptr);
+        id
+    })
+}
+
+/// Parse a single SDP media section into a [`crate::TrackInit`]. Extracts the
+/// media kind/mid/direction and the first `a=rtpmap:` line for codec + payload
+/// type; reads `a=ssrc:` if present (else 0).
+fn track_init_from_sdp(sdp: &str) -> Option<crate::TrackInit> {
+    let mut kind = "";
+    let mut mid = String::new();
+    let mut direction = crate::Direction::SendRecv;
+    let mut payload_type: u8 = 0;
+    let mut codec: Option<crate::Codec> = None;
+    let mut ssrc: u32 = 0;
+
+    for line in sdp.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix("m=") {
+            // m=<kind> <port> <proto> <fmt...>
+            kind = rest.split_whitespace().next().unwrap_or("");
+        } else if let Some(v) = line.strip_prefix("a=mid:") {
+            mid = v.trim().to_string();
+        } else if line == "a=sendonly" {
+            direction = crate::Direction::SendOnly;
+        } else if line == "a=recvonly" {
+            direction = crate::Direction::RecvOnly;
+        } else if line == "a=sendrecv" {
+            direction = crate::Direction::SendRecv;
+        } else if line == "a=inactive" {
+            direction = crate::Direction::Inactive;
+        } else if let Some(v) = line.strip_prefix("a=rtpmap:") {
+            // <pt> <name>/<clock>[/<params>]
+            if codec.is_none() {
+                let mut parts = v.splitn(2, ' ');
+                if let (Some(pt_s), Some(spec)) = (parts.next(), parts.next()) {
+                    if let Ok(pt) = pt_s.trim().parse::<u8>() {
+                        let name = spec.split('/').next().unwrap_or("");
+                        if let Some(c) = codec_from_rtpmap_name(name) {
+                            payload_type = pt;
+                            codec = Some(c);
+                        }
+                    }
+                }
+            }
+        } else if let Some(v) = line.strip_prefix("a=ssrc:") {
+            if ssrc == 0 {
+                if let Some(first) = v.split_whitespace().next() {
+                    ssrc = first.parse::<u32>().unwrap_or(0);
+                }
+            }
+        }
+    }
+
+    if kind != "audio" && kind != "video" {
+        return None;
+    }
+    let codec = codec.unwrap_or(if kind == "audio" {
+        crate::Codec::Opus
+    } else {
+        crate::Codec::H264
+    });
+    if mid.is_empty() {
+        mid = kind.to_string();
+    }
+    Some(crate::TrackInit::new(
+        direction,
+        codec,
+        payload_type,
+        ssrc,
+        mid,
+    ))
+}
+
+/// `rtcAddTrackEx` — add a local track from a structured `rtcTrackInit`.
+///
+/// # Safety
+/// `init`, if non-null, must point to a valid `rtcTrackInit` whose string
+/// fields are NUL-terminated C strings or NULL.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtcAddTrackEx(pc: c_int, init: *const RtcTrackInit) -> c_int {
+    guard(|| {
+        let pc_obj = match get_pc(pc) {
+            Some(p) => p,
+            None => return RTC_ERR_INVALID,
+        };
+        if init.is_null() {
+            return RTC_ERR_INVALID;
+        }
+        // SAFETY: checked non-null; caller guarantees validity.
+        let i = unsafe { &*init };
+        let codec = match codec_from_c(i.codec) {
+            Some(c) => c,
+            None => return RTC_ERR_INVALID,
+        };
+        let mid = match unsafe { cstr_opt(i.mid) } {
+            Some(Some(s)) => s.to_string(),
+            Some(None) => codec.media_kind().to_string(),
+            None => return RTC_ERR_INVALID,
+        };
+        let pt = if i.payloadType < 0 || i.payloadType > 127 {
+            // Pick a sane default payload type per codec kind.
+            if codec.is_video() {
+                96
+            } else {
+                111
+            }
+        } else {
+            i.payloadType as u8
+        };
+
+        let mut track_init =
+            crate::TrackInit::new(direction_from_c(i.direction), codec, pt, i.ssrc, mid);
+        // Optional CNAME / msid / track id.
+        if let Some(Some(s)) = unsafe { cstr_opt(i.name) } {
+            track_init.name = Some(s.to_string());
+        }
+        if let Some(Some(s)) = unsafe { cstr_opt(i.msid) } {
+            track_init.msid = Some(s.to_string());
+        }
+        if let Some(Some(s)) = unsafe { cstr_opt(i.trackId) } {
+            track_init.track_id = Some(s.to_string());
+        }
+
+        let track = pc_obj.add_track(track_init);
+        let id = emplace(RtcObject::Tr(track));
+        TRACK_OWNERS.lock().insert(id, pc);
+        let ptr = user_pointer(pc);
+        rtcSetUserPointer(id, ptr);
+        id
+    })
+}
+
+/// `rtcDeleteTrack` — close + remove a track from the registry.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtcDeleteTrack(tr: c_int) -> c_int {
+    guard(|| {
+        let obj = REGISTRY.lock().remove(&tr);
+        match obj {
+            Some(RtcObject::Tr(t)) => {
+                t.close();
+                USER_POINTERS.lock().remove(&tr);
+                TRACK_SLOTS.lock().remove(&tr);
+                TRACK_OWNERS.lock().remove(&tr);
+                RTC_ERR_SUCCESS
+            }
+            Some(other) => {
+                REGISTRY.lock().insert(tr, other);
+                RTC_ERR_INVALID
+            }
+            None => RTC_ERR_INVALID,
+        }
+    })
+}
+
+/// `rtcGetTrackDescription` — copy the track's SDP media section into `buffer`.
+///
+/// # Safety
+/// `buffer`, if non-null, must point to at least `size` bytes.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtcGetTrackDescription(tr: c_int, buffer: *mut c_char, size: c_int) -> c_int {
+    guard(|| match get_tr(tr) {
+        Some(t) => copy_string(&t.description_sdp(), buffer, size),
+        None => RTC_ERR_INVALID,
+    })
+}
+
+/// `rtcGetTrackMid` — copy the track's `mid` into `buffer`.
+///
+/// # Safety
+/// `buffer`, if non-null, must point to at least `size` bytes.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtcGetTrackMid(tr: c_int, buffer: *mut c_char, size: c_int) -> c_int {
+    guard(|| match get_tr(tr) {
+        Some(t) => copy_string(&t.mid(), buffer, size),
+        None => RTC_ERR_INVALID,
+    })
+}
+
+/// `rtcGetTrackDirection` — write the track's direction as a `rtcDirection`.
+///
+/// # Safety
+/// `direction`, if non-null, must point to a valid `int`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtcGetTrackDirection(tr: c_int, direction: *mut c_int) -> c_int {
+    guard(|| {
+        let t = match get_tr(tr) {
+            Some(t) => t,
+            None => return RTC_ERR_INVALID,
+        };
+        if direction.is_null() {
+            return RTC_ERR_INVALID;
+        }
+        // SAFETY: checked non-null.
+        unsafe { *direction = direction_to_c(t.direction()) };
+        RTC_ERR_SUCCESS
+    })
+}
+
+/// `rtcRequestKeyframe` — send an RTCP PLI for the track's media SSRC.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtcRequestKeyframe(tr: c_int) -> c_int {
+    guard(|| {
+        let t = match get_tr(tr) {
+            Some(t) => t,
+            None => return RTC_ERR_INVALID,
+        };
+        match t.request_keyframe() {
+            Ok(_) => RTC_ERR_SUCCESS,
+            Err(_) => RTC_ERR_FAILURE,
+        }
+    })
+}
+
+/// `rtcRequestBitrate` — no runtime REMB sender on `Track` yet. Validate the
+/// handle and report not-available.
+//
+// TODO(#20/#21): wire to a REMB sender once the media-handler chain lands.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtcRequestBitrate(tr: c_int, _bitrate: c_uint) -> c_int {
+    if get_tr(tr).is_none() {
         RTC_ERR_INVALID
     } else {
         RTC_ERR_NOT_AVAIL
     }
 }
 
-/// `rtcAddTrack` — stub.
-// TODO(#22): wire once PeerConnection::add_track lands.
+/// `rtcChainRtcpReceivingSession` — the runtime `Track` has no media-handler
+/// chain yet. Validate the handle; report not-available.
+//
+// TODO(#20/#21): chain a RtcpReceivingSession onto Track::incoming.
 #[unsafe(no_mangle)]
-pub extern "C" fn rtcAddTrack(pc: c_int, _media_description_sdp: *const c_char) -> c_int {
-    if get_pc(pc).is_none() {
+pub extern "C" fn rtcChainRtcpReceivingSession(tr: c_int) -> c_int {
+    if get_tr(tr).is_none() {
         RTC_ERR_INVALID
     } else {
         RTC_ERR_NOT_AVAIL
     }
 }
 
-/// `rtcAddTrackEx` — stub.
-// TODO(#22): wire once PeerConnection::add_track lands.
+/// `rtcChainRtcpSrReporter` — see [`rtcChainRtcpReceivingSession`].
 #[unsafe(no_mangle)]
-pub extern "C" fn rtcAddTrackEx(pc: c_int, _init: *const RtcTrackInit) -> c_int {
-    if get_pc(pc).is_none() {
+pub extern "C" fn rtcChainRtcpSrReporter(tr: c_int) -> c_int {
+    if get_tr(tr).is_none() {
         RTC_ERR_INVALID
     } else {
         RTC_ERR_NOT_AVAIL
     }
 }
 
-/// `rtcDeleteTrack` — stub.
-// TODO(#22): wire once tracks are registry-managed.
+/// `rtcChainRtcpNackResponder` — see [`rtcChainRtcpReceivingSession`].
 #[unsafe(no_mangle)]
-pub extern "C" fn rtcDeleteTrack(_tr: c_int) -> c_int {
-    RTC_ERR_NOT_AVAIL
+pub extern "C" fn rtcChainRtcpNackResponder(tr: c_int, _max_stored_packets: c_uint) -> c_int {
+    if get_tr(tr).is_none() {
+        RTC_ERR_INVALID
+    } else {
+        RTC_ERR_NOT_AVAIL
+    }
 }
 
-/// `rtcGetTrackDescription` — stub.
-// TODO(#22)
+/// `rtcChainPliHandler` — see [`rtcChainRtcpReceivingSession`].
 #[unsafe(no_mangle)]
-pub extern "C" fn rtcGetTrackDescription(_tr: c_int, _buffer: *mut c_char, _size: c_int) -> c_int {
-    RTC_ERR_NOT_AVAIL
+pub extern "C" fn rtcChainPliHandler(tr: c_int, _cb: Option<RtcPliHandlerCallbackFunc>) -> c_int {
+    if get_tr(tr).is_none() {
+        RTC_ERR_INVALID
+    } else {
+        RTC_ERR_NOT_AVAIL
+    }
 }
 
-/// `rtcGetTrackMid` — stub.
-// TODO(#22)
-#[unsafe(no_mangle)]
-pub extern "C" fn rtcGetTrackMid(_tr: c_int, _buffer: *mut c_char, _size: c_int) -> c_int {
-    RTC_ERR_NOT_AVAIL
-}
-
-/// `rtcGetTrackDirection` — stub.
-// TODO(#22)
-#[unsafe(no_mangle)]
-pub extern "C" fn rtcGetTrackDirection(_tr: c_int, _direction: *mut c_int) -> c_int {
-    RTC_ERR_NOT_AVAIL
-}
-
-/// `rtcRequestKeyframe` — stub.
-// TODO(#22)
-#[unsafe(no_mangle)]
-pub extern "C" fn rtcRequestKeyframe(_tr: c_int) -> c_int {
-    RTC_ERR_NOT_AVAIL
-}
-
-/// `rtcRequestBitrate` — stub.
-// TODO(#22)
-#[unsafe(no_mangle)]
-pub extern "C" fn rtcRequestBitrate(_tr: c_int, _bitrate: c_uint) -> c_int {
-    RTC_ERR_NOT_AVAIL
-}
-
-/// `rtcChainRtcpReceivingSession` — stub.
-// TODO(#22): requires Track registered on a PeerConnection.
-#[unsafe(no_mangle)]
-pub extern "C" fn rtcChainRtcpReceivingSession(_tr: c_int) -> c_int {
-    RTC_ERR_NOT_AVAIL
-}
-
-/// `rtcChainRtcpSrReporter` — stub.
-// TODO(#22)
-#[unsafe(no_mangle)]
-pub extern "C" fn rtcChainRtcpSrReporter(_tr: c_int) -> c_int {
-    RTC_ERR_NOT_AVAIL
-}
-
-/// `rtcChainRtcpNackResponder` — stub.
-// TODO(#22)
-#[unsafe(no_mangle)]
-pub extern "C" fn rtcChainRtcpNackResponder(_tr: c_int, _max_stored_packets: c_uint) -> c_int {
-    RTC_ERR_NOT_AVAIL
-}
-
-/// `rtcChainPliHandler` — stub.
-// TODO(#22)
-#[unsafe(no_mangle)]
-pub extern "C" fn rtcChainPliHandler(_tr: c_int, _cb: Option<RtcPliHandlerCallbackFunc>) -> c_int {
-    RTC_ERR_NOT_AVAIL
-}
-
-/// `rtcChainRembHandler` — stub.
-// TODO(#22)
+/// `rtcChainRembHandler` — see [`rtcChainRtcpReceivingSession`].
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcChainRembHandler(
-    _tr: c_int,
+    tr: c_int,
     _cb: Option<RtcRembHandlerCallbackFunc>,
 ) -> c_int {
-    RTC_ERR_NOT_AVAIL
+    if get_tr(tr).is_none() {
+        RTC_ERR_INVALID
+    } else {
+        RTC_ERR_NOT_AVAIL
+    }
 }
 
-/// `rtcChainPacingHandler` — stub.
-// TODO(#22)
+/// `rtcChainPacingHandler` — see [`rtcChainRtcpReceivingSession`].
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcChainPacingHandler(
-    _tr: c_int,
+    tr: c_int,
     _bits_per_second: c_double,
     _send_interval_ms: c_int,
 ) -> c_int {
-    RTC_ERR_NOT_AVAIL
+    if get_tr(tr).is_none() {
+        RTC_ERR_INVALID
+    } else {
+        RTC_ERR_NOT_AVAIL
+    }
 }
 
-/// `rtcTransformSecondsToTimestamp` — stub (needs a track's RTP config).
-// TODO(#22)
+/// `rtcTransformSecondsToTimestamp` — convert seconds to an RTP timestamp using
+/// the track's clock rate.
+///
+/// # Safety
+/// `timestamp`, if non-null, must point to a valid `uint32_t`.
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcTransformSecondsToTimestamp(
-    _id: c_int,
-    _seconds: c_double,
-    _timestamp: *mut u32,
+    id: c_int,
+    seconds: c_double,
+    timestamp: *mut u32,
 ) -> c_int {
-    RTC_ERR_NOT_AVAIL
+    guard(|| {
+        let t = match get_tr(id) {
+            Some(t) => t,
+            None => return RTC_ERR_INVALID,
+        };
+        if timestamp.is_null() {
+            return RTC_ERR_INVALID;
+        }
+        let ts = (seconds * f64::from(t.clock_rate())).round() as i64 as u32;
+        // SAFETY: checked non-null.
+        unsafe { *timestamp = ts };
+        RTC_ERR_SUCCESS
+    })
 }
 
-/// `rtcTransformTimestampToSeconds` — stub (needs a track's RTP config).
-// TODO(#22)
+/// `rtcTransformTimestampToSeconds` — convert an RTP timestamp to seconds using
+/// the track's clock rate.
+///
+/// # Safety
+/// `seconds`, if non-null, must point to a valid `double`.
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcTransformTimestampToSeconds(
-    _id: c_int,
-    _timestamp: u32,
-    _seconds: *mut c_double,
+    id: c_int,
+    timestamp: u32,
+    seconds: *mut c_double,
 ) -> c_int {
-    RTC_ERR_NOT_AVAIL
+    guard(|| {
+        let t = match get_tr(id) {
+            Some(t) => t,
+            None => return RTC_ERR_INVALID,
+        };
+        if seconds.is_null() {
+            return RTC_ERR_INVALID;
+        }
+        let secs = f64::from(timestamp) / f64::from(t.clock_rate());
+        // SAFETY: checked non-null.
+        unsafe { *seconds = secs };
+        RTC_ERR_SUCCESS
+    })
 }
 
 // ===========================================================================
@@ -1742,12 +2169,14 @@ pub extern "C" fn rtcCleanup() {
                 let _ = p.close();
             }
             RtcObject::Dc(d) => d.close(),
-            RtcObject::Tr(_) => {}
+            RtcObject::Tr(t) => t.close(),
         }
     }
     USER_POINTERS.lock().clear();
     PC_SLOTS.lock().clear();
     DC_SLOTS.lock().clear();
+    TRACK_SLOTS.lock().clear();
+    TRACK_OWNERS.lock().clear();
     crate::cleanup();
 }
 
@@ -1930,20 +2359,87 @@ mod tests {
         rtcDeletePeerConnection(pc);
     }
 
+    /// The Track C-API is now backed by the runtime: add/accessors/callbacks/
+    /// keyframe/transform work; the media-handler *chain* functions remain
+    /// honestly NOT_AVAIL (no runtime MediaHandlerChain on Track yet). WebSocket
+    /// is not ported.
     #[test]
-    fn track_and_websocket_stubs_report_not_avail() {
+    fn track_capi_is_backed_and_chain_handlers_not_avail() {
         let bind = CString::new("127.0.0.1").unwrap();
         let cfg = loopback_config(&bind);
         let pc = rtcCreatePeerConnection(&cfg);
 
-        assert_eq!(
-            rtcAddTrack(pc, CString::new("m=video 9 ...").unwrap().as_ptr()),
-            RTC_ERR_NOT_AVAIL
-        );
-        assert_eq!(rtcSetTrackCallback(pc, None), RTC_ERR_NOT_AVAIL);
-        assert_eq!(rtcDeleteTrack(123), RTC_ERR_NOT_AVAIL);
-        assert_eq!(rtcChainRtcpReceivingSession(123), RTC_ERR_NOT_AVAIL);
+        // rtcSetTrackCallback now installs the on_track hook (success).
+        assert_eq!(rtcSetTrackCallback(pc, None), RTC_ERR_SUCCESS);
 
+        // rtcAddTrackEx returns a real track handle.
+        let mid = CString::new("video0").unwrap();
+        let init = RtcTrackInit {
+            direction: 1, // RTC_DIRECTION_SENDONLY
+            codec: 0,     // RTC_CODEC_H264
+            payloadType: 96,
+            ssrc: 0x1234_5678,
+            mid: mid.as_ptr(),
+            name: std::ptr::null(),
+            msid: std::ptr::null(),
+            trackId: std::ptr::null(),
+            profile: std::ptr::null(),
+        };
+        let tr = rtcAddTrackEx(pc, &init);
+        assert!(tr > 0, "rtcAddTrackEx should return a track handle");
+
+        // mid round-trips.
+        let needed = rtcGetTrackMid(tr, std::ptr::null_mut(), 0);
+        let mut buf = vec![0i8; needed as usize];
+        assert_eq!(rtcGetTrackMid(tr, buf.as_mut_ptr(), needed), needed);
+        let got = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap();
+        assert_eq!(got, "video0");
+
+        // direction reads back as SENDONLY.
+        let mut dir: c_int = -99;
+        assert_eq!(rtcGetTrackDirection(tr, &mut dir), RTC_ERR_SUCCESS);
+        assert_eq!(dir, 1);
+
+        // description SDP is non-empty and carries the m=video line.
+        let dn = rtcGetTrackDescription(tr, std::ptr::null_mut(), 0);
+        let mut dbuf = vec![0i8; dn as usize];
+        assert_eq!(rtcGetTrackDescription(tr, dbuf.as_mut_ptr(), dn), dn);
+        let sdp = unsafe { CStr::from_ptr(dbuf.as_ptr()) }.to_str().unwrap();
+        assert!(sdp.contains("m=video"), "got: {sdp}");
+
+        // rtcAddTrack from raw SDP also returns a handle.
+        let sdp2 = CString::new(
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:audio0\r\na=sendrecv\r\na=rtpmap:111 opus/48000/2\r\n",
+        )
+        .unwrap();
+        let tr2 = rtcAddTrack(pc, sdp2.as_ptr());
+        assert!(tr2 > 0, "rtcAddTrack should return a track handle");
+
+        // Transform helpers use the track clock rate (video: 90 kHz).
+        let mut ts: u32 = 0;
+        assert_eq!(rtcTransformSecondsToTimestamp(tr, 1.0, &mut ts), RTC_ERR_SUCCESS);
+        assert_eq!(ts, 90_000);
+        let mut secs: c_double = 0.0;
+        assert_eq!(
+            rtcTransformTimestampToSeconds(tr, 90_000, &mut secs),
+            RTC_ERR_SUCCESS
+        );
+        assert!((secs - 1.0).abs() < 1e-9);
+
+        // Media-handler chain functions: handle valid, but not available.
+        assert_eq!(rtcChainRtcpReceivingSession(tr), RTC_ERR_NOT_AVAIL);
+        assert_eq!(rtcChainRtcpSrReporter(tr), RTC_ERR_NOT_AVAIL);
+        assert_eq!(rtcRequestBitrate(tr, 100_000), RTC_ERR_NOT_AVAIL);
+        // Invalid handle on a chain function reports INVALID.
+        assert_eq!(rtcChainRtcpReceivingSession(999_999), RTC_ERR_INVALID);
+        // Deleting an unknown track is INVALID.
+        assert_eq!(rtcDeleteTrack(999_999), RTC_ERR_INVALID);
+
+        // Real delete succeeds.
+        assert_eq!(rtcDeleteTrack(tr), RTC_ERR_SUCCESS);
+        assert_eq!(rtcDeleteTrack(tr2), RTC_ERR_SUCCESS);
+
+        // WebSocket remains unported.
         let url = CString::new("ws://localhost").unwrap();
         assert_eq!(rtcCreateWebSocket(url.as_ptr()), RTC_ERR_NOT_AVAIL);
 
