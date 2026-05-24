@@ -20,6 +20,7 @@ mod error;
 mod ice_transport;
 mod reliability;
 mod sctp_transport;
+mod usrsctp_sys;
 
 pub use candidate::{Candidate, CandidateType, Family, ParseError as CandidateParseError, TransportType};
 pub use certificate::{Certificate, CertificateError};
