@@ -1596,11 +1596,13 @@ pub extern "C" fn rtcReceiveMessage(id: c_int, _buffer: *mut c_char, _size: *mut
 //
 // Tracks are now registry-backed (`RtcObject::Tr`) and wired to the runtime's
 // `PeerConnection::add_track` / `on_track`. The media-handler *chain* functions
-// (RTCP receiving session, SR reporter, NACK responder, PLI/REMB/pacing) have
-// no runtime backing on `Track` yet — the runtime's `Track::incoming` does not
-// run a `MediaHandlerChain` (that is follow-up #20/#21) — so they validate the
-// handle and report `RTC_ERR_NOT_AVAIL`. The handle plumbing, callbacks,
-// add/delete, accessors and keyframe/transform helpers are fully implemented.
+// (RTCP receiving session, SR reporter, NACK responder, PLI/REMB/pacing) are
+// backed by the runtime `Track`'s `MediaHandlerChain` (#28): each appends the
+// corresponding handler, after which inbound RTP routes through the chain's
+// incoming path and outbound through its outgoing path. `rtcRequestBitrate`
+// still reports `RTC_ERR_NOT_AVAIL` (no standalone REMB sender on the Track).
+// The handle plumbing, callbacks, add/delete, accessors, keyframe and
+// transform helpers are fully implemented.
 
 /// Per-handle storage for the track-level callbacks so we can rebuild the
 /// TrackCallbacks set on every setter call (mirrors [`DcCallbackSlots`]).
@@ -1970,74 +1972,129 @@ pub extern "C" fn rtcRequestBitrate(tr: c_int, _bitrate: c_uint) -> c_int {
     }
 }
 
-/// `rtcChainRtcpReceivingSession` — the runtime `Track` has no media-handler
-/// chain yet. Validate the handle; report not-available.
-//
-// TODO(#20/#21): chain a RtcpReceivingSession onto Track::incoming.
+/// `rtcChainRtcpReceivingSession` — append an [`crate::RtcpReceivingSession`] to
+/// the track's runtime media-handler chain. The session learns the inbound SSRC
+/// and replies to SR with RR (and REMB once a bitrate is requested), and emits
+/// PLI on keyframe requests. Backed by the runtime `Track` chain.
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcChainRtcpReceivingSession(tr: c_int) -> c_int {
-    if get_tr(tr).is_none() {
-        RTC_ERR_INVALID
-    } else {
-        RTC_ERR_NOT_AVAIL
-    }
+    guard(|| {
+        let t = match get_tr(tr) {
+            Some(t) => t,
+            None => return RTC_ERR_INVALID,
+        };
+        t.chain_media_handler(Box::new(crate::RtcpReceivingSession::new()));
+        RTC_ERR_SUCCESS
+    })
 }
 
-/// `rtcChainRtcpSrReporter` — see [`rtcChainRtcpReceivingSession`].
+/// `rtcChainRtcpSrReporter` — append an [`crate::RtcpSrReporter`] to the track's
+/// chain, generating outgoing Sender Reports from the outbound RTP stream for
+/// the track's media SSRC. Uses the C++ default 1 s report cadence.
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcChainRtcpSrReporter(tr: c_int) -> c_int {
-    if get_tr(tr).is_none() {
-        RTC_ERR_INVALID
-    } else {
-        RTC_ERR_NOT_AVAIL
-    }
+    guard(|| {
+        let t = match get_tr(tr) {
+            Some(t) => t,
+            None => return RTC_ERR_INVALID,
+        };
+        let ssrc = t.media_ssrc();
+        t.chain_media_handler(Box::new(crate::RtcpSrReporter::new(ssrc, 1000)));
+        RTC_ERR_SUCCESS
+    })
 }
 
-/// `rtcChainRtcpNackResponder` — see [`rtcChainRtcpReceivingSession`].
+/// `rtcChainRtcpNackResponder` — append an [`crate::RtcpNackResponder`] buffering
+/// up to `max_stored_packets` outbound RTP packets and retransmitting them on
+/// incoming NACK. `0` selects the libdatachannel default (512).
 #[unsafe(no_mangle)]
-pub extern "C" fn rtcChainRtcpNackResponder(tr: c_int, _max_stored_packets: c_uint) -> c_int {
-    if get_tr(tr).is_none() {
-        RTC_ERR_INVALID
-    } else {
-        RTC_ERR_NOT_AVAIL
-    }
+pub extern "C" fn rtcChainRtcpNackResponder(tr: c_int, max_stored_packets: c_uint) -> c_int {
+    guard(|| {
+        let t = match get_tr(tr) {
+            Some(t) => t,
+            None => return RTC_ERR_INVALID,
+        };
+        let max = if max_stored_packets == 0 {
+            crate::RtcpNackResponder::DEFAULT_MAX_SIZE
+        } else {
+            max_stored_packets as usize
+        };
+        t.chain_media_handler(Box::new(crate::RtcpNackResponder::new(max)));
+        RTC_ERR_SUCCESS
+    })
 }
 
-/// `rtcChainPliHandler` — see [`rtcChainRtcpReceivingSession`].
+/// `rtcChainPliHandler` — append a [`crate::PliHandler`] invoking the C callback
+/// `cb(tr, ptr)` whenever an incoming PLI/FIR is observed.
 #[unsafe(no_mangle)]
-pub extern "C" fn rtcChainPliHandler(tr: c_int, _cb: Option<RtcPliHandlerCallbackFunc>) -> c_int {
-    if get_tr(tr).is_none() {
-        RTC_ERR_INVALID
-    } else {
-        RTC_ERR_NOT_AVAIL
-    }
+pub extern "C" fn rtcChainPliHandler(tr: c_int, cb: Option<RtcPliHandlerCallbackFunc>) -> c_int {
+    guard(|| {
+        let t = match get_tr(tr) {
+            Some(t) => t,
+            None => return RTC_ERR_INVALID,
+        };
+        let cb = match cb {
+            Some(c) => c,
+            None => return RTC_ERR_INVALID,
+        };
+        let handler = crate::PliHandler::new(move || {
+            let ptr = user_pointer(tr);
+            dispatch(move || cb(tr, ptr));
+        });
+        t.chain_media_handler(Box::new(handler));
+        RTC_ERR_SUCCESS
+    })
 }
 
-/// `rtcChainRembHandler` — see [`rtcChainRtcpReceivingSession`].
+/// `rtcChainRembHandler` — append a [`crate::RembHandler`] invoking the C
+/// callback `cb(tr, bitrate, ptr)` for each incoming REMB.
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcChainRembHandler(
     tr: c_int,
-    _cb: Option<RtcRembHandlerCallbackFunc>,
+    cb: Option<RtcRembHandlerCallbackFunc>,
 ) -> c_int {
-    if get_tr(tr).is_none() {
-        RTC_ERR_INVALID
-    } else {
-        RTC_ERR_NOT_AVAIL
-    }
+    guard(|| {
+        let t = match get_tr(tr) {
+            Some(t) => t,
+            None => return RTC_ERR_INVALID,
+        };
+        let cb = match cb {
+            Some(c) => c,
+            None => return RTC_ERR_INVALID,
+        };
+        let handler = crate::RembHandler::new(move |bitrate: u64| {
+            let ptr = user_pointer(tr);
+            let br = bitrate as c_uint;
+            dispatch(move || cb(tr, br, ptr));
+        });
+        t.chain_media_handler(Box::new(handler));
+        RTC_ERR_SUCCESS
+    })
 }
 
-/// `rtcChainPacingHandler` — see [`rtcChainRtcpReceivingSession`].
+/// `rtcChainPacingHandler` — append a [`crate::PacingHandler`] pacing outbound
+/// RTP to `bits_per_second` on a `send_interval_ms` cadence. The handler buffers
+/// outbound packets; the Rust port releases them via its `tick` from the media
+/// loop (see [`crate::PacingHandler`]).
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcChainPacingHandler(
     tr: c_int,
-    _bits_per_second: c_double,
-    _send_interval_ms: c_int,
+    bits_per_second: c_double,
+    send_interval_ms: c_int,
 ) -> c_int {
-    if get_tr(tr).is_none() {
-        RTC_ERR_INVALID
-    } else {
-        RTC_ERR_NOT_AVAIL
-    }
+    guard(|| {
+        let t = match get_tr(tr) {
+            Some(t) => t,
+            None => return RTC_ERR_INVALID,
+        };
+        let interval = if send_interval_ms <= 0 {
+            1
+        } else {
+            send_interval_ms as u64
+        };
+        t.chain_media_handler(Box::new(crate::PacingHandler::new(bits_per_second, interval)));
+        RTC_ERR_SUCCESS
+    })
 }
 
 /// `rtcTransformSecondsToTimestamp` — convert seconds to an RTP timestamp using
@@ -2426,9 +2483,13 @@ mod tests {
         );
         assert!((secs - 1.0).abs() < 1e-9);
 
-        // Media-handler chain functions: handle valid, but not available.
-        assert_eq!(rtcChainRtcpReceivingSession(tr), RTC_ERR_NOT_AVAIL);
-        assert_eq!(rtcChainRtcpSrReporter(tr), RTC_ERR_NOT_AVAIL);
+        // Media-handler chain functions are now backed by the runtime Track
+        // chain: appending handlers succeeds on a valid handle.
+        assert_eq!(rtcChainRtcpReceivingSession(tr), RTC_ERR_SUCCESS);
+        assert_eq!(rtcChainRtcpSrReporter(tr), RTC_ERR_SUCCESS);
+        assert_eq!(rtcChainRtcpNackResponder(tr, 0), RTC_ERR_SUCCESS);
+        assert_eq!(rtcChainPacingHandler(tr, 800_000.0, 5), RTC_ERR_SUCCESS);
+        // rtcRequestBitrate has no runtime REMB sender on the Track yet.
         assert_eq!(rtcRequestBitrate(tr, 100_000), RTC_ERR_NOT_AVAIL);
         // Invalid handle on a chain function reports INVALID.
         assert_eq!(rtcChainRtcpReceivingSession(999_999), RTC_ERR_INVALID);

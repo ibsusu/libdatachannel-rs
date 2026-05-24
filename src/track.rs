@@ -25,6 +25,7 @@ use parking_lot::Mutex;
 use thiserror::Error;
 
 use crate::description::Direction;
+use crate::media_handler::{MediaHandler, MediaHandlerChain, Message, MessageType};
 use crate::rtp::is_rtcp;
 use crate::rtp_packetizer::{RtpPacketizationConfig, RtpPacketizer, VIDEO_CLOCK_RATE};
 use crate::srtp_transport::SrtpTransport;
@@ -349,6 +350,11 @@ impl Default for TrackCallbacks {
 struct Inner {
     media: Media,
     srtp: Option<Arc<SrtpTransport>>,
+    /// Runtime media-handler chain (RTCP receiving session, SR reporter, NACK
+    /// responder, PLI/REMB/pacing). Empty by default, in which case the direct
+    /// RTP path is used (preserving the #27 round-trip). Mirrors the
+    /// `setMediaHandler`/`chainMediaHandler` chain on `rtc::Track`.
+    chain: MediaHandlerChain,
 }
 
 /// A media track bound to an SDP media section. Cheap to share via `Arc<Self>`.
@@ -389,7 +395,11 @@ impl Track {
             init.codec.default_clock_rate(),
         );
         Arc::new(Track {
-            inner: Mutex::new(Inner { media, srtp: None }),
+            inner: Mutex::new(Inner {
+                media,
+                srtp: None,
+                chain: MediaHandlerChain::new(),
+            }),
             callbacks: Mutex::new(callbacks),
             packetizer: RtpPacketizer::new(config),
             direction: init.direction,
@@ -487,6 +497,32 @@ impl Track {
         Ok(())
     }
 
+    /// Append a [`MediaHandler`] to this track's runtime chain. Mirrors
+    /// `rtc::Track::chainMediaHandler` (`addToChain`): the handler runs after the
+    /// already-installed ones on the outgoing path and before them on the
+    /// incoming path (the chain applies the directional ordering). Once any
+    /// handler is installed, inbound RTP is routed through the chain's incoming
+    /// path and outbound through its outgoing path; with an empty chain the
+    /// direct path of #27 is used unchanged.
+    pub fn chain_media_handler(&self, handler: Box<dyn MediaHandler>) {
+        self.inner.lock().chain.add(handler);
+    }
+
+    /// Number of handlers currently in the runtime chain.
+    #[must_use]
+    pub fn media_handler_count(&self) -> usize {
+        self.inner.lock().chain.len()
+    }
+
+    /// Send the messages a handler queued back to the peer through the bound
+    /// SRTP transport (RR/REMB/PLI replies, NACK retransmits, paced packets).
+    /// Best-effort: send errors are dropped (the track may have closed).
+    fn flush_chain_replies(srtp: &Arc<SrtpTransport>, replies: Vec<Message>) {
+        for reply in replies {
+            let _ = srtp.send_media(reply.data);
+        }
+    }
+
     /// Send a **media payload** by packetizing it into RTP and protecting it
     /// through the bound SRTP transport. Returns the number of RTP packets sent.
     ///
@@ -500,6 +536,19 @@ impl Track {
         if matches!(self.direction, Direction::RecvOnly | Direction::Inactive) {
             return Err(TrackError::BadDirection);
         }
+
+        let packets = self.packetizer.outgoing(payload.to_vec());
+        let n = packets.len();
+        self.send_outgoing_rtp(packets)?;
+        Ok(n)
+    }
+
+    /// Run pre-packetized RTP packets through the outgoing media-handler chain
+    /// (if any) and protect each surviving packet through the bound SRTP
+    /// transport, also flushing any messages a handler queued (e.g. paced
+    /// packets a [`PacingHandler`](crate::media_handler::PacingHandler) is
+    /// holding could be released via its `tick`; SR reports from a reporter).
+    fn send_outgoing_rtp(&self, packets: Vec<Vec<u8>>) -> Result<(), TrackError> {
         let srtp = self
             .inner
             .lock()
@@ -507,12 +556,21 @@ impl Track {
             .clone()
             .ok_or(TrackError::NotOpen)?;
 
-        let packets = self.packetizer.outgoing(payload.to_vec());
-        let n = packets.len();
-        for pkt in packets {
-            srtp.send_media(pkt)?;
+        // Fast path: no chain installed -> send directly (preserves #27).
+        if self.inner.lock().chain.is_empty() {
+            for pkt in packets {
+                srtp.send_media(pkt)?;
+            }
+            return Ok(());
         }
-        Ok(n)
+
+        let mut messages: Vec<Message> = packets.into_iter().map(Message::classify).collect();
+        let replies = self.inner.lock().chain.outgoing(&mut messages);
+        for msg in messages {
+            srtp.send_media(msg.data)?;
+        }
+        Self::flush_chain_replies(&srtp, replies);
+        Ok(())
     }
 
     /// Send a pre-formed RTP **or RTCP** packet as-is (no packetization),
@@ -527,21 +585,16 @@ impl Track {
         if !is_control && matches!(self.direction, Direction::RecvOnly | Direction::Inactive) {
             return Err(TrackError::BadDirection);
         }
-        let srtp = self
-            .inner
-            .lock()
-            .srtp
-            .clone()
-            .ok_or(TrackError::NotOpen)?;
-        srtp.send_media(packet.to_vec())?;
-        Ok(())
+        self.send_outgoing_rtp(vec![packet.to_vec()])
     }
 
     /// Deliver an inbound (already SRTP-unprotected) RTP/RTCP packet to this
-    /// track. Fires `on_message` with the raw packet and, for media RTP,
-    /// `on_frame` with the depacketized payload. Mirrors `impl::Track::incoming`
-    /// (minus the media-handler chain, which is #20/#21). Drops media on a
-    /// send-only / inactive track.
+    /// track. Routes the packet through the runtime media-handler chain's
+    /// incoming path (if any handler is installed), flushing any control replies
+    /// the chain queued (RR/REMB/NACK retransmits) back through SRTP, then fires
+    /// `on_message` with each surviving packet and, for media RTP, `on_frame`
+    /// with the depacketized payload + RTP timestamp + payload type. Mirrors
+    /// `impl::Track::incoming`. Drops media on a send-only / inactive track.
     pub fn incoming(&self, packet: &[u8]) {
         if self.closed.load(Ordering::SeqCst) {
             return;
@@ -553,6 +606,46 @@ impl Track {
             return; // bad direction for media
         }
 
+        // Run the chain (if any). The chain may consume control packets (e.g. an
+        // RtcpReceivingSession swallows incoming SR/RR), rewrite media, and queue
+        // replies to send back to the peer. With an empty chain the single
+        // packet passes through unchanged, preserving the #27 direct path.
+        let (surviving, replies, srtp) = {
+            let mut g = self.inner.lock();
+            if g.chain.is_empty() {
+                drop(g);
+                self.deliver_inbound(packet, control);
+                return;
+            }
+            let mut messages = vec![Message::classify(packet.to_vec())];
+            let replies = g.chain.incoming(&mut messages);
+            (messages, replies, g.srtp.clone())
+        };
+
+        if let Some(srtp) = srtp {
+            Self::flush_chain_replies(&srtp, replies);
+        }
+
+        let (on_message, on_frame) = {
+            let g = self.callbacks.lock();
+            (g.on_message.clone(), g.on_frame.clone())
+        };
+        let clock_rate = self.packetizer.config().clock_rate;
+        for msg in &surviving {
+            (on_message)(&msg.data);
+            if msg.kind == MessageType::Binary {
+                let depacketizer = crate::rtp_packetizer::RtpDepacketizer::new(clock_rate);
+                if let Some(frame) = depacketizer.depacketize(&msg.data) {
+                    (on_frame)(&frame.payload, frame.timestamp, frame.payload_type);
+                }
+            }
+        }
+    }
+
+    /// The direct (chain-less) inbound delivery: fire `on_message`, and for media
+    /// RTP also `on_frame` with the depacketized payload + real RTP timestamp +
+    /// payload type parsed from the header. This is the #27 path, factored out.
+    fn deliver_inbound(&self, packet: &[u8], control: bool) {
         let (on_message, on_frame) = {
             let g = self.callbacks.lock();
             (g.on_message.clone(), g.on_frame.clone())
@@ -901,5 +994,163 @@ mod tests {
             track_a.close();
             track_b.close();
         });
+    }
+
+    // ---- runtime media-handler chain (#28) -------------------------------
+
+    use crate::media_handler::{MediaHandler, Message, Sender as MhSender};
+    use crate::rtp::RtcpSr;
+
+    /// A handler that records its label into a shared trace on each direction,
+    /// so we can assert the chain ordering the Track drives.
+    struct Tracer {
+        label: char,
+        trace: Arc<Mutex<String>>,
+    }
+    impl MediaHandler for Tracer {
+        fn incoming(&mut self, _m: &mut Vec<Message>, _s: &mut MhSender) {
+            self.trace.lock().push(self.label);
+        }
+        fn outgoing(&mut self, _m: &mut Vec<Message>, _s: &mut MhSender) {
+            self.trace.lock().push(self.label);
+        }
+    }
+
+    fn rtp_pkt(ssrc: u32, seq: u16, ts: u32, pt: u8, payload: &[u8]) -> Vec<u8> {
+        let header = RtpHeader {
+            version: 2,
+            payload_type: pt,
+            sequence_number: seq,
+            timestamp: ts,
+            ssrc,
+            ..RtpHeader::default()
+        };
+        let mut data = header.serialize();
+        data.extend_from_slice(payload);
+        data
+    }
+
+    #[test]
+    fn track_chain_incoming_reverses_outgoing_forward() {
+        let track = Track::new(video_init(), TrackCallbacks::default());
+        let trace = Arc::new(Mutex::new(String::new()));
+        for label in ['A', 'B', 'C'] {
+            track.chain_media_handler(Box::new(Tracer {
+                label,
+                trace: trace.clone(),
+            }));
+        }
+        assert_eq!(track.media_handler_count(), 3);
+
+        // The integrated outbound path (`send`/`send_rtp`) locks the SRTP
+        // transport before running the chain, so a chain-only ordering check is
+        // done by driving the same chain directly; the end-to-end SRTP path is
+        // covered by `track_send_srtp_loopback_to_peer_on_frame`.
+        let mut msgs = vec![Message::binary(rtp_pkt(0x0BAD_F00D, 1, 100, 96, b"x"))];
+        let _ = track.inner.lock().chain.outgoing(&mut msgs);
+        assert_eq!(*trace.lock(), "ABC", "outgoing runs head -> tail");
+
+        trace.lock().clear();
+        // Incoming through the public Track path (no SRTP transport required:
+        // a Tracer queues no replies, so the flush is a no-op).
+        track.incoming(&rtp_pkt(0x0BAD_F00D, 2, 200, 96, b"y"));
+        assert_eq!(*trace.lock(), "CBA", "incoming runs tail -> head");
+    }
+
+    /// End-to-end through `Track::incoming`: an `RtcpReceivingSession` in the
+    /// chain learns the inbound media SSRC and, on an incoming Sender Report,
+    /// consumes it (the SR is not surfaced to `on_message`). Media RTP still
+    /// surfaces via `on_frame`. Exercises the integrated incoming chain.
+    #[test]
+    fn track_chain_rtcp_receiving_session_consumes_sr() {
+        use std::sync::atomic::AtomicUsize;
+
+        let frames = Arc::new(Mutex::new(Vec::<(Vec<u8>, u32, u8)>::new()));
+        let msgs = Arc::new(AtomicUsize::new(0));
+        let frames_cb = frames.clone();
+        let msgs_cb = msgs.clone();
+        let track = Track::new(
+            video_init(),
+            TrackCallbacks {
+                on_message: Arc::new(move |_| {
+                    msgs_cb.fetch_add(1, Ordering::SeqCst);
+                }),
+                on_frame: Arc::new(move |p, ts, pt| {
+                    frames_cb.lock().push((p.to_vec(), ts, pt));
+                }),
+                ..TrackCallbacks::default()
+            },
+        );
+        track.chain_media_handler(Box::new(crate::RtcpReceivingSession::new()));
+
+        // A media RTP packet flows through and surfaces on_frame with real
+        // timestamp + payload type parsed from the header.
+        track.incoming(&rtp_pkt(0x55, 1000, 90_000, 96, b"frame-bytes"));
+        {
+            let f = frames.lock();
+            assert_eq!(f.len(), 1, "media RTP surfaced as a frame");
+            assert_eq!(f[0].0, b"frame-bytes");
+            assert_eq!(f[0].1, 90_000, "real RTP timestamp surfaced");
+            assert_eq!(f[0].2, 96, "real payload type surfaced");
+        }
+        assert_eq!(msgs.load(Ordering::SeqCst), 1, "one media message surfaced");
+
+        // An incoming Sender Report is consumed by the session (not forwarded).
+        let sr = RtcpSr {
+            sender_ssrc: 0x55,
+            ntp_timestamp: 0x1122_3344_5566_7788,
+            rtp_timestamp: 91_800,
+            packet_count: 10,
+            octet_count: 500,
+            report_blocks: vec![],
+        };
+        track.incoming(&sr.serialize());
+        assert_eq!(frames.lock().len(), 1, "SR is not a media frame");
+        assert_eq!(
+            msgs.load(Ordering::SeqCst),
+            1,
+            "SR consumed by the session, not surfaced to on_message"
+        );
+    }
+
+    /// FrameInfo (RTP timestamp + payload type) surfaces correctly through the
+    /// chained incoming path for several distinct timestamps / payload types.
+    #[test]
+    fn track_chain_surfaces_frame_timestamp_and_payload_type() {
+        let frames = Arc::new(Mutex::new(Vec::<(u32, u8)>::new()));
+        let frames_cb = frames.clone();
+        let track = Track::new(
+            video_init(),
+            TrackCallbacks {
+                on_frame: Arc::new(move |_, ts, pt| frames_cb.lock().push((ts, pt))),
+                ..TrackCallbacks::default()
+            },
+        );
+        // Install a pass-through tracer-free chain via an RtcpReceivingSession
+        // (forwards media unchanged) so the chained path is exercised.
+        track.chain_media_handler(Box::new(crate::RtcpReceivingSession::new()));
+
+        track.incoming(&rtp_pkt(0x77, 1, 12_345, 96, b"a"));
+        track.incoming(&rtp_pkt(0x77, 2, 54_321, 96, b"bb"));
+        let f = frames.lock();
+        assert_eq!(f.as_slice(), &[(12_345, 96), (54_321, 96)]);
+    }
+
+    /// A `PacingHandler` in the chain buffers outbound RTP (the outgoing path
+    /// clears the message vector), so nothing is sent immediately. Drives the
+    /// outgoing chain through the Track without needing SRTP by inspecting the
+    /// chain after a direct `outgoing` call (the integrated outbound path uses
+    /// the same chain).
+    #[test]
+    fn track_chain_pacing_buffers_outgoing() {
+        let track = Track::new(video_init(), TrackCallbacks::default());
+        track.chain_media_handler(Box::new(crate::PacingHandler::new(8000.0, 100)));
+
+        let mut msgs: Vec<Message> = (0u16..5)
+            .map(|i| Message::binary(rtp_pkt(0x0BAD_F00D, i, 0, 96, &[0u8; 38])))
+            .collect();
+        let extra = track.inner.lock().chain.outgoing(&mut msgs);
+        assert!(msgs.is_empty(), "pacing buffers all outbound packets");
+        assert!(extra.is_empty(), "nothing released immediately");
     }
 }

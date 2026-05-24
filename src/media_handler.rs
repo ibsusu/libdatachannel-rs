@@ -143,7 +143,11 @@ impl Sender {
 ///
 /// Each method has a default no-op so a handler implements only the direction it
 /// cares about (matching the C++ virtuals).
-pub trait MediaHandler {
+///
+/// Handlers are stored behind a [`Track`](crate::Track)'s `Arc<Self>` +
+/// `Mutex<Inner>`, which the SRTP receive callback drives from a Tokio runtime
+/// thread, so the trait requires [`Send`].
+pub trait MediaHandler: Send {
     /// Transform messages coming **from** the peer. May filter/rewrite the
     /// vector in place and may queue control replies via `sender`.
     fn incoming(&mut self, _messages: &mut Vec<Message>, _sender: &mut Sender) {}
@@ -623,12 +627,12 @@ impl MediaHandler for RtcpSrReporter {
 /// Detects incoming PLI (and FIR) feedback and invokes a callback so the
 /// application can produce a keyframe. Ports `rtc::PliHandler`.
 pub struct PliHandler {
-    on_pli: Box<dyn FnMut()>,
+    on_pli: Box<dyn FnMut() + Send>,
 }
 
 impl PliHandler {
     /// Create a handler invoking `on_pli` whenever a PLI/FIR is received.
-    pub fn new(on_pli: impl FnMut() + 'static) -> Self {
+    pub fn new(on_pli: impl FnMut() + Send + 'static) -> Self {
         PliHandler {
             on_pli: Box::new(on_pli),
         }
@@ -657,12 +661,12 @@ impl MediaHandler for PliHandler {
 /// Detects incoming REMB feedback and invokes a callback with the estimated
 /// bitrate. Ports `rtc::RembHandler`.
 pub struct RembHandler {
-    on_remb: Box<dyn FnMut(u64)>,
+    on_remb: Box<dyn FnMut(u64) + Send>,
 }
 
 impl RembHandler {
     /// Create a handler invoking `on_remb` with the bitrate of each REMB received.
-    pub fn new(on_remb: impl FnMut(u64) + 'static) -> Self {
+    pub fn new(on_remb: impl FnMut(u64) + Send + 'static) -> Self {
         RembHandler {
             on_remb: Box::new(on_remb),
         }
@@ -905,23 +909,24 @@ mod tests {
     // ---- chain ordering ---------------------------------------------------
 
     /// A handler that appends its label to a shared trace in both directions.
+    /// Handlers must be `Send`, so the trace is an `Arc<Mutex<_>>`.
     struct Tracer {
         label: char,
-        trace: std::rc::Rc<std::cell::RefCell<String>>,
+        trace: std::sync::Arc<std::sync::Mutex<String>>,
     }
 
     impl MediaHandler for Tracer {
         fn incoming(&mut self, _m: &mut Vec<Message>, _s: &mut Sender) {
-            self.trace.borrow_mut().push(self.label);
+            self.trace.lock().unwrap().push(self.label);
         }
         fn outgoing(&mut self, _m: &mut Vec<Message>, _s: &mut Sender) {
-            self.trace.borrow_mut().push(self.label);
+            self.trace.lock().unwrap().push(self.label);
         }
     }
 
     #[test]
     fn chain_incoming_reverses_outgoing_forward() {
-        let trace = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let trace = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let mut chain = MediaHandlerChain::new();
         for label in ['A', 'B', 'C'] {
             chain.add(Box::new(Tracer {
@@ -932,11 +937,11 @@ mod tests {
 
         let mut msgs = Vec::new();
         let _ = chain.outgoing(&mut msgs);
-        assert_eq!(*trace.borrow(), "ABC", "outgoing runs head -> tail");
+        assert_eq!(*trace.lock().unwrap(), "ABC", "outgoing runs head -> tail");
 
-        trace.borrow_mut().clear();
+        trace.lock().unwrap().clear();
         let _ = chain.incoming(&mut msgs);
-        assert_eq!(*trace.borrow(), "CBA", "incoming runs tail -> head");
+        assert_eq!(*trace.lock().unwrap(), "CBA", "incoming runs tail -> head");
     }
 
     // ---- RtcpSrReporter ---------------------------------------------------
@@ -1051,33 +1056,43 @@ mod tests {
 
     #[test]
     fn pli_handler_fires_on_pli() {
-        let count = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        // Handlers must be `Send` (they live behind a Track's `Arc<Mutex<_>>`),
+        // so the test callback uses an `Arc<Atomic*>` rather than `Rc<Cell<_>>`.
+        let count = Arc::new(AtomicU32::new(0));
         let c = count.clone();
-        let mut handler = PliHandler::new(move || c.set(c.get() + 1));
+        let mut handler = PliHandler::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
 
         let pli = RtcpPli { media_ssrc: 42 };
         let mut msgs = vec![Message::control(pli.serialize().to_vec())];
         handler.incoming(&mut msgs, &mut Sender::new());
-        assert_eq!(count.get(), 1);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
 
         // A REMB must NOT trigger the PLI callback.
         let remb = RtcpRemb { sender_ssrc: 1, bitrate: 1000, ssrcs: vec![1] };
         let mut msgs2 = vec![Message::control(remb.serialize())];
         handler.incoming(&mut msgs2, &mut Sender::new());
-        assert_eq!(count.get(), 1);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn remb_handler_reports_bitrate() {
-        let got = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        let got = Arc::new(AtomicU64::new(0));
         let g = got.clone();
-        let mut handler = RembHandler::new(move |br| g.set(br));
+        let mut handler = RembHandler::new(move |br| {
+            g.store(br, Ordering::SeqCst);
+        });
 
         let remb = RtcpRemb { sender_ssrc: 9, bitrate: 1_200_000, ssrcs: vec![9] };
         let expected = RtcpRemb::decode_bitrate(RtcpRemb::encode_bitrate(1, 1_200_000));
         let mut msgs = vec![Message::control(remb.serialize())];
         handler.incoming(&mut msgs, &mut Sender::new());
-        assert_eq!(got.get(), expected);
+        assert_eq!(got.load(Ordering::SeqCst), expected);
     }
 
     // ---- RtcpNackResponder ------------------------------------------------
