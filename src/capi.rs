@@ -596,10 +596,10 @@ unsafe impl Sync for PcCallbackSlots {}
 static PC_SLOTS: Lazy<Mutex<HashMap<c_int, PcCallbackSlots>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// `rtcSetLocalDescriptionCallback`. The runtime has no dedicated
-/// local-description hook, so we emulate one: the closure installed for the
-/// local-candidate path also fires this callback once a local description is
-/// available (see [`install_pc_callbacks`]).
+/// `rtcSetLocalDescriptionCallback`. Backed by the runtime's real
+/// [`PeerConnectionCallbacks::on_local_description`], which fires once per
+/// negotiation with a credential-complete local description (see
+/// [`install_pc_callbacks`]).
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcSetLocalDescriptionCallback(
     pc: c_int,
@@ -624,10 +624,6 @@ fn install_pc_callbacks(pc: c_int) -> c_int {
         let slots = PC_SLOTS.lock().get(&pc).cloned().unwrap_or_default();
         let mut cbs = PeerConnectionCallbacks::default();
 
-        // The runtime fires on_local_candidate for trickle but has no dedicated
-        // local-description hook; we emulate the description callback below by
-        // chaining it onto the local-candidate path (a candidate implies a
-        // local description exists).
         let ld_cb = slots.local_description;
         let lc_cb = slots.local_candidate;
         let sc_cb = slots.state_change;
@@ -678,30 +674,17 @@ fn install_pc_callbacks(pc: c_int) -> c_int {
             });
         }
 
-        // Local description callback: the runtime has no dedicated hook, so we
-        // chain it onto the local-candidate path. It fires once, the first time
-        // a local description is available (a candidate implies one exists),
-        // matching the single description event a caller expects.
+        // Local description callback: backed by the runtime's real
+        // `on_local_description`, which fires exactly once per negotiation with
+        // a credential-complete SDP (ice-ufrag/ice-pwd folded in). Marshal the
+        // SDP + type to the C callback through the usual dispatch/user-pointer
+        // mechanism.
         if let Some(cb) = ld_cb {
-            // Wrap the (possibly already-set) local_candidate closure so the
-            // description callback also fires when a candidate is produced.
-            let prev = cbs.on_local_candidate.clone();
-            let pc_ld = pc_obj.clone();
-            let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            cbs.on_local_candidate = Arc::new(move |c| {
-                (prev)(c);
-                if fired.swap(true, Ordering::SeqCst) {
-                    return;
-                }
-                if let Some(desc) = pc_ld.local_description() {
-                    let ptr = user_pointer(pc);
-                    let sdp = std::ffi::CString::new(desc.to_sdp()).unwrap_or_default();
-                    let typ = std::ffi::CString::new(desc.type_string()).unwrap_or_default();
-                    dispatch(move || cb(pc, sdp.as_ptr(), typ.as_ptr(), ptr));
-                } else {
-                    // No description yet; allow a later candidate to fire it.
-                    fired.store(false, Ordering::SeqCst);
-                }
+            cbs.on_local_description = Arc::new(move |desc| {
+                let ptr = user_pointer(pc);
+                let sdp = std::ffi::CString::new(desc.to_sdp()).unwrap_or_default();
+                let typ = std::ffi::CString::new(desc.type_string()).unwrap_or_default();
+                dispatch(move || cb(pc, sdp.as_ptr(), typ.as_ptr(), ptr));
             });
         }
 

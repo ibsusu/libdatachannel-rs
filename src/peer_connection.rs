@@ -192,6 +192,17 @@ pub struct PeerConnectionCallbacks {
     pub on_gathering_state_change: Arc<dyn Fn(GatheringState) + Send + Sync>,
     /// Fires on every [`SignalingState`] transition.
     pub on_signaling_state_change: Arc<dyn Fn(SignalingState) + Send + Sync>,
+    /// Fires exactly once per negotiation with the local [`Description`] once
+    /// it carries ICE credentials (`a=ice-ufrag` / `a=ice-pwd`).
+    ///
+    /// Mirrors libdatachannel's `onLocalDescription`: a single, complete local
+    /// description is surfaced for signaling, independently of (and typically
+    /// before) the per-candidate trickle. In this port libjuice mints the
+    /// ufrag/pwd asynchronously on its driver task, so this fires from the
+    /// same path that folds the credentials into the stored description — at
+    /// the first moment the description provably has them — rather than from
+    /// `set_local_description` (where they may not be minted yet).
+    pub on_local_description: Arc<dyn Fn(Description) + Send + Sync>,
     /// Fires for each local ICE candidate the agent surfaces (trickle).
     pub on_local_candidate: Arc<dyn Fn(Candidate) + Send + Sync>,
     /// Fires when the remote peer opens a data channel, delivering a real
@@ -207,6 +218,7 @@ impl Default for PeerConnectionCallbacks {
             on_state_change: Arc::new(|_| {}),
             on_gathering_state_change: Arc::new(|_| {}),
             on_signaling_state_change: Arc::new(|_| {}),
+            on_local_description: Arc::new(|_| {}),
             on_local_candidate: Arc::new(|_| {}),
             on_data_channel: Arc::new(|_| {}),
         }
@@ -249,6 +261,15 @@ struct Inner {
     /// ice-ufrag/pwd once libjuice mints them (they aren't available
     /// synchronously when `set_local_description` returns).
     pending_local_type: Mutex<Option<DescriptionType>>,
+
+    /// Single-shot guard for [`PeerConnectionCallbacks::on_local_description`].
+    /// Set once the credential-complete local description has been surfaced so
+    /// the callback fires exactly once per negotiation, even though the
+    /// refresh path runs from both the candidate and gathering-state handlers.
+    /// Reset when a fresh local description is assembled
+    /// (`set_local_description` / `create_offer`) so a re-negotiation fires
+    /// again.
+    local_description_signalled: AtomicBool,
 
     // --- state ---
     state: Mutex<PeerConnectionState>,
@@ -319,6 +340,7 @@ impl PeerConnection {
             local_description: Mutex::new(None),
             remote_description: Mutex::new(None),
             pending_local_type: Mutex::new(None),
+            local_description_signalled: AtomicBool::new(false),
             state: Mutex::new(PeerConnectionState::New),
             gathering_state: Mutex::new(GatheringState::New),
             signaling_state: Mutex::new(SignalingState::Stable),
@@ -518,6 +540,13 @@ impl PeerConnection {
         // Remember the type so the gathering callbacks can refresh the
         // stored description with ufrag/pwd once libjuice mints them.
         *self.inner.pending_local_type.lock() = Some(typ);
+
+        // Arm the single-shot on_local_description signal for this
+        // negotiation; it fires from `refresh_local_description` the moment the
+        // credential-complete description is available.
+        self.inner
+            .local_description_signalled
+            .store(false, Ordering::SeqCst);
 
         let desc = self.build_local_description(&ice, typ)?;
 
@@ -779,7 +808,45 @@ impl PeerConnection {
         desc.set_application(app);
         desc.hint_type(typ);
         *self.inner.local_description.lock() = Some(desc.clone());
+
+        // libdatachannel surfaces one complete local description for
+        // signaling. `ice.get_local_description` only returns `Ok` once
+        // libjuice has published the description with its minted ufrag/pwd, so
+        // reaching here means the credentials are present. Fire
+        // `on_local_description` exactly once per negotiation (the guard is
+        // re-armed when a fresh local description is assembled).
+        self.fire_local_description_once(&desc);
+
         Some(desc)
+    }
+
+    /// Surface a credential-complete local description via
+    /// [`PeerConnectionCallbacks::on_local_description`], at most once per
+    /// negotiation. The caller must have verified the description carries ICE
+    /// credentials (every call site refreshes from libjuice's published
+    /// description, which only exists once ufrag/pwd are minted). We
+    /// nonetheless assert the credentials are present to keep the single-shot
+    /// contract honest.
+    fn fire_local_description_once(&self, desc: &Description) {
+        debug_assert!(
+            !desc.ice_ufrag().is_empty() && !desc.ice_pwd().is_empty(),
+            "on_local_description must only fire with ICE credentials present"
+        );
+        if desc.ice_ufrag().is_empty() || desc.ice_pwd().is_empty() {
+            return;
+        }
+        if self
+            .inner
+            .local_description_signalled
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        let cb = {
+            let g = self.inner.callbacks.lock();
+            Arc::clone(&g.on_local_description)
+        };
+        (cb)(desc.clone());
     }
 
     /// Pin the remote fingerprint (parsed from the stored remote
@@ -1365,6 +1432,71 @@ mod tests {
             pc.set_local_description(DescriptionType::Offer).expect("set local");
             assert_eq!(pc.signaling_state(), SignalingState::HaveLocalOffer);
             assert!(pc.local_description().is_some());
+        });
+    }
+
+    /// The real `on_local_description` callback (task #26) must fire exactly
+    /// once per negotiation, and the SDP it delivers must already carry the
+    /// ICE credentials (`a=ice-ufrag:` / `a=ice-pwd:`) that libjuice mints
+    /// asynchronously — i.e. it never surfaces the credential-less skeleton.
+    /// Mirrors the C-API contract that `rtcSetLocalDescriptionCallback` now
+    /// backs.
+    #[test]
+    fn on_local_description_fires_once_with_ice_credentials() {
+        rt().block_on(async {
+            // Count fires and capture the SDP delivered to the callback.
+            let count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+            let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+            let count_cb = count.clone();
+            let captured_cb = captured.clone();
+            let cbs = PeerConnectionCallbacks {
+                on_local_description: Arc::new(move |d| {
+                    *count_cb.lock() += 1;
+                    *captured_cb.lock() = Some(d.to_sdp());
+                }),
+                ..PeerConnectionCallbacks::default()
+            };
+
+            let pc = PeerConnection::new(loopback_config(), cbs).expect("construct");
+            // Registering a channel makes the offer carry the data path; not
+            // strictly required for credentials but matches real usage.
+            let _dc = pc.create_data_channel("chat");
+
+            pc.set_local_description(DescriptionType::Offer)
+                .expect("set local offer");
+
+            // libjuice mints ufrag/pwd asynchronously; wait for the callback.
+            assert!(
+                wait_for(|| *count.lock() >= 1, 3000).await,
+                "on_local_description never fired"
+            );
+
+            // The SDP delivered to the callback must already carry the ICE
+            // credentials — never the credential-less skeleton.
+            let sdp = captured.lock().clone().expect("captured sdp");
+            assert!(
+                sdp.contains("a=ice-ufrag:"),
+                "local description callback fired without ice-ufrag; got:\n{sdp}"
+            );
+            assert!(
+                sdp.contains("a=ice-pwd:"),
+                "local description callback fired without ice-pwd; got:\n{sdp}"
+            );
+
+            // And `local_description()` read after the callback agrees.
+            let read = pc.local_description().expect("local description").to_sdp();
+            assert!(read.contains("a=ice-ufrag:") && read.contains("a=ice-pwd:"));
+
+            // Give any in-flight gathering/candidate callbacks a moment to run
+            // and confirm the callback stays single-shot for this negotiation.
+            let _ = wait_for(|| pc.gathering_state() == GatheringState::Complete, 3000).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                *count.lock(),
+                1,
+                "on_local_description must fire exactly once per negotiation"
+            );
         });
     }
 
