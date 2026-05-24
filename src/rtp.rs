@@ -33,6 +33,22 @@ pub const RTCP_PT_RR: u8 = 201;
 pub const RTCP_PT_SDES: u8 = 202;
 /// RTCP payload type for Goodbye (BYE).
 pub const RTCP_PT_BYE: u8 = 203;
+/// RTCP payload type for Generic RTP Feedback (RTPFB, RFC 4585).
+pub const RTCP_PT_RTPFB: u8 = 205;
+/// RTCP payload type for Payload-Specific Feedback (PSFB, RFC 4585).
+pub const RTCP_PT_PSFB: u8 = 206;
+
+/// RTPFB feedback message type (FMT) for Generic NACK (RFC 4585 §6.2.1).
+pub const RTCP_FMT_NACK: u8 = 1;
+/// PSFB feedback message type (FMT) for Picture Loss Indication (RFC 4585 §6.3.1).
+pub const RTCP_FMT_PLI: u8 = 1;
+/// PSFB feedback message type (FMT) for Full Intra Request (RFC 5104).
+pub const RTCP_FMT_FIR: u8 = 4;
+/// PSFB feedback message type (FMT) for Application-Layer Feedback, used by REMB.
+pub const RTCP_FMT_AFB: u8 = 15;
+
+/// Size of the RTCP feedback common header (common header + sender + media SSRC).
+pub const RTCP_FB_HEADER_SIZE: usize = RTCP_HEADER_SIZE + 8;
 
 /// Demultiplex RTP vs RTCP by payload type (RFC 5761 §4).
 ///
@@ -559,6 +575,338 @@ impl RtcpRr {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RTCP feedback (RFC 4585 / RFC 5104) — common FB header + PLI / NACK / REMB
+// ---------------------------------------------------------------------------
+
+/// The common RTCP feedback header (RFC 4585 §6.1). Mirrors `rtc::RtcpFbHeader`:
+/// the 4-byte RTCP common header followed by the packet-sender SSRC and the
+/// media-source SSRC.
+///
+/// ```text
+/// |V=2|P|  FMT  |       PT      |            length             |
+/// |              SSRC of packet sender                          |
+/// |              SSRC of media source                           |
+/// ```
+///
+/// The 5-bit `FMT` field lives in [`RtcpHeader::report_count`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RtcpFbHeader {
+    /// The RTCP common header (with `FMT` carried in `report_count`).
+    pub header: RtcpHeader,
+    /// SSRC of the packet sender.
+    pub packet_sender_ssrc: Ssrc,
+    /// SSRC of the media source.
+    pub media_source_ssrc: Ssrc,
+}
+
+impl RtcpFbHeader {
+    /// Serialize the 12-byte feedback header.
+    #[must_use]
+    pub fn serialize(&self) -> [u8; RTCP_FB_HEADER_SIZE] {
+        let mut out = [0u8; RTCP_FB_HEADER_SIZE];
+        out[0..4].copy_from_slice(&self.header.serialize());
+        out[4..8].copy_from_slice(&self.packet_sender_ssrc.to_be_bytes());
+        out[8..12].copy_from_slice(&self.media_source_ssrc.to_be_bytes());
+        out
+    }
+
+    /// Parse the 12-byte feedback header from the front of `data`.
+    #[must_use]
+    pub fn parse(data: &[u8]) -> Option<RtcpFbHeader> {
+        if data.len() < RTCP_FB_HEADER_SIZE {
+            return None;
+        }
+        Some(RtcpFbHeader {
+            header: RtcpHeader::parse(data)?,
+            packet_sender_ssrc: u32::from_be_bytes([data[4], data[5], data[6], data[7]]),
+            media_source_ssrc: u32::from_be_bytes([data[8], data[9], data[10], data[11]]),
+        })
+    }
+}
+
+/// An RTCP Picture Loss Indication (PLI, RFC 4585 §6.3.1). Mirrors `rtc::RtcpPli`:
+/// a bare feedback header with `PT=206`, `FMT=1`. Both SSRC fields carry the
+/// media SSRC, matching `RtcpPli::preparePacket`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RtcpPli {
+    /// SSRC of the media the loss is reported against.
+    pub media_ssrc: Ssrc,
+}
+
+impl RtcpPli {
+    /// On-the-wire size of a PLI (the feedback header alone).
+    pub const SIZE: usize = RTCP_FB_HEADER_SIZE;
+
+    /// Serialize the PLI. `length` = 2 (3 words minus one), per the C++.
+    #[must_use]
+    pub fn serialize(&self) -> [u8; Self::SIZE] {
+        let header = RtcpFbHeader {
+            header: RtcpHeader::prepare(RTCP_PT_PSFB, RTCP_FMT_PLI, 2),
+            packet_sender_ssrc: self.media_ssrc,
+            media_source_ssrc: self.media_ssrc,
+        };
+        header.serialize()
+    }
+
+    /// Parse a PLI from the front of `data`. Returns `None` unless the header is
+    /// a PSFB with `FMT=1`.
+    #[must_use]
+    pub fn parse(data: &[u8]) -> Option<RtcpPli> {
+        let fb = RtcpFbHeader::parse(data)?;
+        if fb.header.payload_type != RTCP_PT_PSFB || fb.header.report_count != RTCP_FMT_PLI {
+            return None;
+        }
+        Some(RtcpPli {
+            media_ssrc: fb.media_source_ssrc,
+        })
+    }
+}
+
+/// An RTCP Receiver Estimated Maximum Bitrate report (REMB, google/draft).
+/// Mirrors `rtc::RtcpRemb`: a PSFB (`PT=206`, `FMT=15`) whose FCI is the ASCII
+/// identifier `"REMB"`, a packed (num-SSRC, exponent, mantissa) bitrate word,
+/// and a list of SSRCs the estimate applies to.
+///
+/// ```text
+/// | FB header (PT=206, FMT=15)                                  |
+/// | 'R' 'E' 'M' 'B'                                             |
+/// | Num SSRC (8) | BR Exp (6) | BR Mantissa (18)                |
+/// | SSRC feedback ...                                           |
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RtcpRemb {
+    /// SSRC of the packet sender (the receiver issuing the estimate).
+    pub sender_ssrc: Ssrc,
+    /// Estimated maximum bitrate, in bits per second.
+    pub bitrate: u64,
+    /// SSRCs the estimate applies to.
+    pub ssrcs: Vec<Ssrc>,
+}
+
+impl RtcpRemb {
+    /// Byte size of a REMB carrying `num_ssrc` SSRCs. Mirrors
+    /// `RtcpRemb::SizeWithSSRCs`: FB header (12) + id (4) + bitrate (4) + SSRCs.
+    #[must_use]
+    pub fn size_with_ssrcs(num_ssrc: usize) -> usize {
+        RTCP_FB_HEADER_SIZE + 4 + 4 + num_ssrc * 4
+    }
+
+    /// Encode a bitrate (bits/s) into the packed REMB word, alongside the SSRC
+    /// count. Mirrors `RtcpRemb::setBitrate`: the mantissa is divided by two
+    /// (incrementing the exponent) until it fits in 18 bits.
+    #[must_use]
+    pub fn encode_bitrate(num_ssrc: u8, bitrate: u64) -> u32 {
+        let mut mantissa = bitrate;
+        let mut exp: u32 = 0;
+        while mantissa > 0x3FFFF {
+            exp += 1;
+            mantissa /= 2;
+        }
+        ((num_ssrc as u32) << 24) | (exp << 18) | (mantissa as u32 & 0x3FFFF)
+    }
+
+    /// Decode the packed REMB word into a bitrate in bits/s. Mirrors
+    /// `RtcpRemb::getBitrate`.
+    #[must_use]
+    pub fn decode_bitrate(word: u32) -> u64 {
+        let exp = ((word << 8) >> 26) as u32; // 6-bit exponent
+        let mantissa = (word & 0x3FFFF) as u64;
+        mantissa * (1u64 << exp)
+    }
+
+    /// Serialize the full REMB packet.
+    #[must_use]
+    pub fn serialize(&self) -> Vec<u8> {
+        let num = self.ssrcs.len();
+        let total = Self::size_with_ssrcs(num);
+        let length_words = (total / 4) as u16 - 1;
+        let fb = RtcpFbHeader {
+            header: RtcpHeader::prepare(RTCP_PT_PSFB, RTCP_FMT_AFB, length_words),
+            packet_sender_ssrc: self.sender_ssrc,
+            media_source_ssrc: 0,
+        };
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(&fb.serialize());
+        out.extend_from_slice(b"REMB");
+        out.extend_from_slice(&Self::encode_bitrate(num as u8, self.bitrate).to_be_bytes());
+        for s in &self.ssrcs {
+            out.extend_from_slice(&s.to_be_bytes());
+        }
+        out
+    }
+
+    /// Parse a REMB packet from the front of `data`. Returns `None` unless this
+    /// is a PSFB with `FMT=15` whose FCI begins with `"REMB"`.
+    #[must_use]
+    pub fn parse(data: &[u8]) -> Option<RtcpRemb> {
+        let fb = RtcpFbHeader::parse(data)?;
+        if fb.header.payload_type != RTCP_PT_PSFB || fb.header.report_count != RTCP_FMT_AFB {
+            return None;
+        }
+        if data.len() < Self::size_with_ssrcs(0) {
+            return None;
+        }
+        if &data[12..16] != b"REMB" {
+            return None;
+        }
+        let word = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
+        let num = (word >> 24) as usize;
+        let mut ssrcs = Vec::with_capacity(num);
+        let mut off = 20;
+        for _ in 0..num {
+            let s = data.get(off..off + 4)?;
+            ssrcs.push(u32::from_be_bytes([s[0], s[1], s[2], s[3]]));
+            off += 4;
+        }
+        Some(RtcpRemb {
+            sender_ssrc: fb.packet_sender_ssrc,
+            bitrate: Self::decode_bitrate(word),
+            ssrcs,
+        })
+    }
+}
+
+/// One Generic NACK FCI field (RFC 4585 §6.2.1). Mirrors `rtc::RtcpNackPart`:
+/// a packet identifier (`PID`, the lowest missing sequence number) and a 16-bit
+/// bitmask (`BLP`) flagging the following 16 sequence numbers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RtcpNackPart {
+    /// Packet identifier — the lowest sequence number being NACKed.
+    pub pid: u16,
+    /// Bitmask of lost packets following `pid` (bit `i` => `pid + 1 + i`).
+    pub blp: u16,
+}
+
+impl RtcpNackPart {
+    /// Expand this FCI field into the explicit list of sequence numbers it
+    /// reports as missing. Mirrors `RtcpNackPart::getSequenceNumbers`.
+    #[must_use]
+    pub fn sequence_numbers(&self) -> Vec<u16> {
+        let mut result = Vec::with_capacity(17);
+        result.push(self.pid);
+        let mut bitmask = self.blp;
+        let mut i = self.pid.wrapping_add(1);
+        while bitmask > 0 {
+            if bitmask & 0x1 != 0 {
+                result.push(i);
+            }
+            i = i.wrapping_add(1);
+            bitmask >>= 1;
+        }
+        result
+    }
+}
+
+/// An RTCP Generic NACK (RFC 4585 §6.2.1). Mirrors `rtc::RtcpNack`: a feedback
+/// header (`PT=205`, `FMT=1`) followed by one or more [`RtcpNackPart`] FCI
+/// fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RtcpNack {
+    /// SSRC of the packet sender (the receiver requesting retransmission).
+    pub sender_ssrc: Ssrc,
+    /// SSRC of the media source whose packets are missing.
+    pub media_ssrc: Ssrc,
+    /// FCI fields enumerating the missing sequence numbers.
+    pub parts: Vec<RtcpNackPart>,
+}
+
+impl RtcpNack {
+    /// Byte size of a NACK with `seq_no_count` FCI fields. Mirrors
+    /// `RtcpNack::Size`: feedback header (12) + 4 per FCI field.
+    #[must_use]
+    pub fn size_with_parts(seq_no_count: usize) -> usize {
+        RTCP_FB_HEADER_SIZE + 4 * seq_no_count
+    }
+
+    /// Build a NACK requesting retransmission of `missing` sequence numbers,
+    /// packing consecutive runs into a single FCI field's BLP bitmask. Mirrors
+    /// the loop driven by `RtcpNack::addMissingPacket`: a new field opens when
+    /// the next missing seq-no is below the active PID or more than 16 past it.
+    #[must_use]
+    pub fn from_missing(sender_ssrc: Ssrc, media_ssrc: Ssrc, missing: &[u16]) -> RtcpNack {
+        let mut parts: Vec<RtcpNackPart> = Vec::new();
+        let mut pid: u16 = 0;
+        for &seq in missing {
+            let need_new = parts.is_empty()
+                || seq < pid
+                || seq > pid.wrapping_add(16);
+            if need_new {
+                parts.push(RtcpNackPart { pid: seq, blp: 0 });
+                pid = seq;
+            } else {
+                let bit = 1u16 << (seq.wrapping_sub(pid).wrapping_sub(1));
+                if let Some(last) = parts.last_mut() {
+                    last.blp |= bit;
+                }
+            }
+        }
+        RtcpNack {
+            sender_ssrc,
+            media_ssrc,
+            parts,
+        }
+    }
+
+    /// Expand all FCI fields into the flat list of missing sequence numbers.
+    #[must_use]
+    pub fn missing_sequence_numbers(&self) -> Vec<u16> {
+        let mut out = Vec::new();
+        for part in &self.parts {
+            out.extend(part.sequence_numbers());
+        }
+        out
+    }
+
+    /// Serialize the full NACK packet.
+    #[must_use]
+    pub fn serialize(&self) -> Vec<u8> {
+        let count = self.parts.len();
+        // length field = 2 + count (per RtcpNack::preparePacket); getSeqNoCount
+        // recovers `count` as length - 2.
+        let length_words = (2 + count) as u16;
+        let fb = RtcpFbHeader {
+            header: RtcpHeader::prepare(RTCP_PT_RTPFB, RTCP_FMT_NACK, length_words),
+            packet_sender_ssrc: self.sender_ssrc,
+            media_source_ssrc: self.media_ssrc,
+        };
+        let mut out = Vec::with_capacity(Self::size_with_parts(count));
+        out.extend_from_slice(&fb.serialize());
+        for part in &self.parts {
+            out.extend_from_slice(&part.pid.to_be_bytes());
+            out.extend_from_slice(&part.blp.to_be_bytes());
+        }
+        out
+    }
+
+    /// Parse a NACK packet from the front of `data`. Returns `None` unless this
+    /// is an RTPFB with `FMT=1`.
+    #[must_use]
+    pub fn parse(data: &[u8]) -> Option<RtcpNack> {
+        let fb = RtcpFbHeader::parse(data)?;
+        if fb.header.payload_type != RTCP_PT_RTPFB || fb.header.report_count != RTCP_FMT_NACK {
+            return None;
+        }
+        // seq-no count = length - 2 (header is 3 words: common + 2 SSRC words).
+        let count = (fb.header.length as usize).saturating_sub(2);
+        let mut parts = Vec::with_capacity(count);
+        let mut off = RTCP_FB_HEADER_SIZE;
+        for _ in 0..count {
+            let f = data.get(off..off + 4)?;
+            parts.push(RtcpNackPart {
+                pid: u16::from_be_bytes([f[0], f[1]]),
+                blp: u16::from_be_bytes([f[2], f[3]]),
+            });
+            off += 4;
+        }
+        Some(RtcpNack {
+            sender_ssrc: fb.packet_sender_ssrc,
+            media_ssrc: fb.media_source_ssrc,
+            parts,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -775,6 +1123,112 @@ mod tests {
         // 24-bit packets_lost must not bleed into fraction_lost.
         assert_eq!(parsed.report_blocks[1].fraction_lost, 128);
         assert_eq!(parsed.report_blocks[1].packets_lost, 0xFFFFFF);
+    }
+
+    #[test]
+    fn rtcp_pli_round_trip_and_layout() {
+        let pli = RtcpPli {
+            media_ssrc: 0x0102_0304,
+        };
+        let bytes = pli.serialize();
+        assert_eq!(bytes.len(), RtcpPli::SIZE);
+        // First byte: V=2 | FMT=1 = 0x81; PT=206; length=2.
+        assert_eq!(bytes[0], 0x81);
+        assert_eq!(bytes[1], RTCP_PT_PSFB);
+        assert_eq!(&bytes[2..4], &[0x00, 0x02]);
+        // Both SSRC words carry the media SSRC.
+        assert_eq!(&bytes[4..8], &[0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(&bytes[8..12], &[0x01, 0x02, 0x03, 0x04]);
+        let parsed = RtcpPli::parse(&bytes).expect("parse pli");
+        assert_eq!(parsed, pli);
+        // A REMB (FMT=15) must not parse as a PLI.
+        let remb = RtcpRemb {
+            sender_ssrc: 1,
+            bitrate: 1000,
+            ssrcs: vec![1],
+        };
+        assert!(RtcpPli::parse(&remb.serialize()).is_none());
+    }
+
+    #[test]
+    fn rtcp_remb_bitrate_encode_decode_round_trip() {
+        // Small bitrate fits in the 18-bit mantissa with exp=0.
+        let word = RtcpRemb::encode_bitrate(1, 100_000);
+        assert_eq!((word >> 24) & 0xFF, 1); // num SSRC
+        assert_eq!((word << 8) >> 26, 0); // exponent
+        assert_eq!(RtcpRemb::decode_bitrate(word), 100_000);
+
+        // Large bitrate forces the exponent up; decode is lossy by 2^exp, so
+        // the round-trip must match the *re-quantized* value, exactly like C++.
+        for &br in &[262_143u64, 262_144, 1_000_000, 5_000_000, 50_000_000] {
+            let w = RtcpRemb::encode_bitrate(2, br);
+            let decoded = RtcpRemb::decode_bitrate(w);
+            let re = RtcpRemb::decode_bitrate(RtcpRemb::encode_bitrate(2, decoded));
+            assert_eq!(decoded, re, "re-encoding a decoded value is stable");
+            assert!(decoded <= br);
+        }
+    }
+
+    #[test]
+    fn rtcp_remb_packet_round_trip() {
+        let remb = RtcpRemb {
+            sender_ssrc: 0xAABB_CCDD,
+            bitrate: 2_500_000,
+            ssrcs: vec![0x1111_1111, 0x2222_2222],
+        };
+        let bytes = remb.serialize();
+        assert_eq!(bytes.len(), RtcpRemb::size_with_ssrcs(2));
+        // The "REMB" identifier sits right after the 12-byte FB header.
+        assert_eq!(&bytes[12..16], b"REMB");
+        // FMT=15, PT=206.
+        assert_eq!(bytes[0] & 0x1F, RTCP_FMT_AFB);
+        assert_eq!(bytes[1], RTCP_PT_PSFB);
+        // media source SSRC is always zero for REMB.
+        assert_eq!(&bytes[8..12], &[0, 0, 0, 0]);
+        let parsed = RtcpRemb::parse(&bytes).expect("parse remb");
+        assert_eq!(parsed.sender_ssrc, remb.sender_ssrc);
+        assert_eq!(parsed.ssrcs, remb.ssrcs);
+        // bitrate round-trips up to the REMB quantization.
+        assert_eq!(parsed.bitrate, RtcpRemb::decode_bitrate(
+            RtcpRemb::encode_bitrate(2, remb.bitrate)));
+    }
+
+    #[test]
+    fn rtcp_nack_fci_pid_and_bitmask_round_trip() {
+        // pid + bitmask covering pid+1, pid+3, pid+16.
+        let part = RtcpNackPart {
+            pid: 1000,
+            blp: 0b1000_0000_0000_0101,
+        };
+        assert_eq!(part.sequence_numbers(), vec![1000, 1001, 1003, 1016]);
+
+        let nack = RtcpNack {
+            sender_ssrc: 0xCAFE_BABE,
+            media_ssrc: 0xDEAD_BEEF,
+            parts: vec![part],
+        };
+        let bytes = nack.serialize();
+        assert_eq!(bytes.len(), RtcpNack::size_with_parts(1));
+        // PT=205, FMT=1.
+        assert_eq!(bytes[0] & 0x1F, RTCP_FMT_NACK);
+        assert_eq!(bytes[1], RTCP_PT_RTPFB);
+        let parsed = RtcpNack::parse(&bytes).expect("parse nack");
+        assert_eq!(parsed, nack);
+    }
+
+    #[test]
+    fn rtcp_nack_from_missing_packs_runs() {
+        // Consecutive-ish run packs into one FCI; a far gap opens a new field.
+        let missing = vec![100u16, 101, 103, 200];
+        let nack = RtcpNack::from_missing(1, 2, &missing);
+        assert_eq!(nack.parts.len(), 2);
+        assert_eq!(nack.parts[0].pid, 100);
+        // 101 -> bit 0, 103 -> bit 2.
+        assert_eq!(nack.parts[0].blp, 0b101);
+        assert_eq!(nack.parts[1].pid, 200);
+        assert_eq!(nack.parts[1].blp, 0);
+        // Expanding the parsed NACK recovers exactly the missing list.
+        assert_eq!(nack.missing_sequence_numbers(), missing);
     }
 
     #[test]
