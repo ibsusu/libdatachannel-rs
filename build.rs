@@ -18,6 +18,98 @@ use std::path::PathBuf;
 fn main() {
     build_usrsctp();
     build_libsrtp2();
+    generate_capi_header();
+}
+
+/// Emit a C header for the `extern "C"` shim in `src/capi.rs` via cbindgen.
+///
+/// The canonical ABI source of truth remains
+/// `native/libdatachannel/include/rtc/rtc.h`; this generated header is a
+/// verification artifact (so the exported Rust surface can be diffed against
+/// the canonical one) and a convenience for downstream C that wants to include
+/// the Rust port directly. It lands in `OUT_DIR` (gitignored) so nothing
+/// generated enters version control. A cbindgen failure must not break the
+/// build — the C deps and the `.a`/`.so` are what node-datachannel links — so
+/// any error is reported as a `cargo:warning` and skipped.
+fn generate_capi_header() {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("src/capi.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("cbindgen.toml").display()
+    );
+
+    let config = cbindgen::Config::from_file(manifest_dir.join("cbindgen.toml"))
+        .unwrap_or_default();
+
+    // cbindgen 0.27 detects `#[no_mangle]` only as a bare word attribute; it
+    // does not recognise edition-2024's `#[unsafe(no_mangle)]` (a list meta),
+    // so it would skip every shim function. The actual library MUST use the
+    // edition-2024 form to compile, so we feed cbindgen a rewritten copy of
+    // `capi.rs` (with `#[unsafe(no_mangle)]` -> `#[no_mangle]`) via `with_src`,
+    // parsing just that file rather than the whole crate (which would also pull
+    // in unrelated module constants).
+    let capi_src = match std::fs::read_to_string(manifest_dir.join("src/capi.rs")) {
+        Ok(s) => {
+            let mut s = s.replace("#[unsafe(no_mangle)]", "#[no_mangle]");
+            // cbindgen renders `Option<FnPtrTypedef>` as an opaque
+            // `struct Option_FnPtrTypedef` instead of seeing through to the
+            // function-pointer typedef. The two have identical ABI (a nullable
+            // `extern "C"` fn pointer is exactly the niche-optimised
+            // `Option<extern "C" fn>`), and C function pointers are already
+            // nullable, so for the *header* we unwrap the Option to the bare
+            // typedef. This only affects the staged copy cbindgen parses; the
+            // real `capi.rs` keeps `Option<_>` for ergonomic NULL handling.
+            for cb in [
+                "RtcLogCallbackFunc",
+                "RtcDescriptionCallbackFunc",
+                "RtcCandidateCallbackFunc",
+                "RtcStateChangeCallbackFunc",
+                "RtcIceStateChangeCallbackFunc",
+                "RtcGatheringStateCallbackFunc",
+                "RtcSignalingStateCallbackFunc",
+                "RtcDataChannelCallbackFunc",
+                "RtcTrackCallbackFunc",
+                "RtcOpenCallbackFunc",
+                "RtcClosedCallbackFunc",
+                "RtcErrorCallbackFunc",
+                "RtcMessageCallbackFunc",
+                "RtcBufferedAmountLowCallbackFunc",
+                "RtcAvailableCallbackFunc",
+                "RtcPliHandlerCallbackFunc",
+                "RtcRembHandlerCallbackFunc",
+            ] {
+                s = s.replace(&format!("Option<{cb}>"), cb);
+            }
+            s
+        }
+        Err(e) => {
+            println!("cargo:warning=cbindgen: could not read capi.rs: {e}");
+            return;
+        }
+    };
+    let shim_copy = out_dir.join("capi_cbindgen.rs");
+    if let Err(e) = std::fs::write(&shim_copy, capi_src) {
+        println!("cargo:warning=cbindgen: could not stage capi.rs: {e}");
+        return;
+    }
+
+    match cbindgen::Builder::new()
+        .with_src(&shim_copy)
+        .with_config(config)
+        .generate()
+    {
+        Ok(bindings) => {
+            bindings.write_to_file(out_dir.join("rtc.h"));
+        }
+        Err(e) => {
+            println!("cargo:warning=cbindgen: skipped rtc.h generation: {e}");
+        }
+    }
 }
 
 fn build_usrsctp() {

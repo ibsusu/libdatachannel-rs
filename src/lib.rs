@@ -12,6 +12,7 @@
 #![allow(dead_code)]
 
 mod candidate;
+mod capi;
 mod certificate;
 pub mod codec;
 mod configuration;
