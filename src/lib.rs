@@ -13,6 +13,7 @@
 
 mod candidate;
 mod certificate;
+pub mod codec;
 mod configuration;
 mod data_channel;
 mod description;
@@ -61,6 +62,14 @@ pub use rtp::{
 };
 pub use rtp_packetizer::{
     DepacketizedFrame, RtpDepacketizer, RtpPacketizationConfig, RtpPacketizer, VIDEO_CLOCK_RATE,
+};
+pub use codec::{
+    av1::{Av1RtpPacketizer, Packetization as Av1Packetization},
+    h264::{H264RtpDepacketizer, H264RtpPacketizer},
+    h265::{H265RtpDepacketizer, H265RtpPacketizer},
+    nal::Separator as NalSeparator,
+    vp8::{Vp8RtpDepacketizer, Vp8RtpPacketizer},
+    Fragmenter, DEFAULT_MAX_FRAGMENT_SIZE,
 };
 pub use track::{
     Codec, Media as TrackMedia, RtpMap, SsrcEntry, Track, TrackCallbacks, TrackError, TrackInit,
