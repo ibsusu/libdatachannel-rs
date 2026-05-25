@@ -69,7 +69,12 @@ pub struct Certificate {
 impl std::fmt::Debug for Certificate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Certificate")
-            .field("fingerprint_sha256", &self.fingerprint(FingerprintAlgorithm::Sha256).map(|f| f.value))
+            .field(
+                "fingerprint_sha256",
+                &self
+                    .fingerprint(FingerprintAlgorithm::Sha256)
+                    .map(|f| f.value),
+            )
             .finish()
     }
 }
@@ -257,10 +262,7 @@ mod tests {
         let rsa = Certificate::generate_rsa("rtc").expect("rsa");
         let f_ec = ec.fingerprint(FingerprintAlgorithm::Sha256).unwrap().value;
         let f_rsa = rsa.fingerprint(FingerprintAlgorithm::Sha256).unwrap().value;
-        assert_ne!(
-            f_ec, f_rsa,
-            "ECDSA and RSA fingerprints collided ({f_ec})"
-        );
+        assert_ne!(f_ec, f_rsa, "ECDSA and RSA fingerprints collided ({f_ec})");
         // Both must still validate as SDP fingerprints.
         assert_eq!(f_ec.len(), 95);
         assert_eq!(f_rsa.len(), 95);

@@ -669,7 +669,11 @@ mod tests {
         )
         .unwrap();
         c.hint_mid("audio");
-        assert_eq!(c.mid(), "video", "hint_mid must not overwrite an existing mid");
+        assert_eq!(
+            c.mid(),
+            "video",
+            "hint_mid must not overwrite an existing mid"
+        );
 
         let mut d: Candidate = "candidate:1 1 UDP 2113937151 192.168.1.10 56789 typ host"
             .parse()
@@ -685,10 +689,7 @@ mod tests {
             .unwrap();
         assert!(c.is_resolved());
         assert_eq!(c.family(), Family::Ipv4);
-        assert_eq!(
-            c.resolved(),
-            Some("192.168.1.10:56789".parse().unwrap())
-        );
+        assert_eq!(c.resolved(), Some("192.168.1.10:56789".parse().unwrap()));
     }
 
     #[test]

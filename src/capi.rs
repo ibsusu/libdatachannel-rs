@@ -32,7 +32,8 @@
 //! integration yet (that lands in a later task). Per task #22's scope, every
 //! Track function and RTCP media-chain function therefore returns
 //! `RTC_ERR_NOT_AVAIL` with a `// TODO(#22)` note rather than faking a result.
-//! WebSocket is not ported and likewise returns `RTC_ERR_NOT_AVAIL`.
+//! The WebSocket client and server C-ABI is fully wired (see the
+//! `rtcCreateWebSocket*` / `rtcCreateWebSocketServer` section).
 
 #![allow(non_snake_case)]
 #![allow(non_upper_case_globals)]
@@ -41,19 +42,21 @@
 // false positive for the whole shim.
 #![allow(unreachable_pub)]
 
-use std::collections::HashMap;
-use std::ffi::{c_char, c_double, c_int, c_void, CStr};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::{CStr, c_char, c_double, c_int, c_void};
 use std::os::raw::c_uint;
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 
 use crate::{
-    CertificateType, Configuration, DataChannel, DataChannelCallbacks, DataChannelInit,
-    Description, IceServer, IceTransportPolicy, PeerConnection, PeerConnectionCallbacks,
-    PeerConnectionState, Reliability, ReliabilityType, Track, Type as DescriptionType,
+    Certificate, CertificateType, Configuration, DataChannel, DataChannelCallbacks,
+    DataChannelInit, Description, IceServer, IceTransportPolicy, PeerConnection,
+    PeerConnectionCallbacks, PeerConnectionState, Reliability, ReliabilityType, Track,
+    Type as DescriptionType, WebSocket, WebSocketConfig, WebSocketServer, WebSocketServerConfig,
+    WsMessage,
 };
 
 // ===========================================================================
@@ -91,6 +94,26 @@ pub enum RtcState {
     Failed = 4,
     /// `RTC_CLOSED`
     Closed = 5,
+}
+
+/// Mirrors `rtcIceState`.
+#[repr(i32)]
+#[derive(Clone, Copy)]
+pub enum RtcIceState {
+    /// `RTC_ICE_NEW`
+    New = 0,
+    /// `RTC_ICE_CHECKING`
+    Checking = 1,
+    /// `RTC_ICE_CONNECTED`
+    Connected = 2,
+    /// `RTC_ICE_COMPLETED`
+    Completed = 3,
+    /// `RTC_ICE_FAILED`
+    Failed = 4,
+    /// `RTC_ICE_DISCONNECTED`
+    Disconnected = 5,
+    /// `RTC_ICE_CLOSED`
+    Closed = 6,
 }
 
 /// Mirrors `rtcGatheringState`.
@@ -182,6 +205,9 @@ pub type RtcAvailableCallbackFunc = extern "C" fn(id: c_int, ptr: *mut c_void);
 pub type RtcPliHandlerCallbackFunc = extern "C" fn(tr: c_int, ptr: *mut c_void);
 /// `rtcRembHandlerCallbackFunc`
 pub type RtcRembHandlerCallbackFunc = extern "C" fn(tr: c_int, bitrate: c_uint, ptr: *mut c_void);
+/// `rtcWebSocketClientCallbackFunc`
+pub type RtcWebSocketClientCallbackFunc =
+    extern "C" fn(wsserver: c_int, ws: c_int, ptr: *mut c_void);
 
 // ===========================================================================
 // #[repr(C)] structs (mirror rtc.h field order + types EXACTLY)
@@ -271,6 +297,49 @@ pub struct RtcTrackInit {
     pub profile: *const c_char,
 }
 
+/// Mirrors `rtcWsConfiguration` (WebSocket client). Field order/types match
+/// `rtc.h` exactly.
+#[repr(C)]
+pub struct RtcWsConfiguration {
+    /// `bool disableTlsVerification`
+    pub disableTlsVerification: bool,
+    /// `const char *proxyServer`
+    pub proxyServer: *const c_char,
+    /// `const char **protocols`
+    pub protocols: *const *const c_char,
+    /// `int protocolsCount`
+    pub protocolsCount: c_int,
+    /// `int connectionTimeoutMs`
+    pub connectionTimeoutMs: c_int,
+    /// `int pingIntervalMs`
+    pub pingIntervalMs: c_int,
+    /// `int maxOutstandingPings`
+    pub maxOutstandingPings: c_int,
+    /// `int maxMessageSize`
+    pub maxMessageSize: c_int,
+}
+
+/// Mirrors `rtcWsServerConfiguration`. Field order/types match `rtc.h` exactly.
+#[repr(C)]
+pub struct RtcWsServerConfiguration {
+    /// `uint16_t port`
+    pub port: u16,
+    /// `bool enableTls`
+    pub enableTls: bool,
+    /// `const char *certificatePemFile`
+    pub certificatePemFile: *const c_char,
+    /// `const char *keyPemFile`
+    pub keyPemFile: *const c_char,
+    /// `const char *keyPemPass`
+    pub keyPemPass: *const c_char,
+    /// `const char *bindAddress`
+    pub bindAddress: *const c_char,
+    /// `int connectionTimeoutMs`
+    pub connectionTimeoutMs: c_int,
+    /// `int maxMessageSize`
+    pub maxMessageSize: c_int,
+}
+
 // ===========================================================================
 // Handle registry
 // ===========================================================================
@@ -283,6 +352,8 @@ enum RtcObject {
     Dc(DataChannel),
     #[allow(dead_code)]
     Tr(Arc<Track>),
+    Ws(Arc<WebSocket>),
+    WsServer(Arc<WebSocketServer>),
 }
 
 /// Monotonic handle counter (`lastId` in capi.cpp). First handle is 1.
@@ -294,8 +365,7 @@ static REGISTRY: Lazy<Mutex<HashMap<c_int, RtcObject>>> = Lazy::new(|| Mutex::ne
 
 /// `handle -> user pointer`. We store the pointer as `usize` (it is opaque to
 /// us and only handed back to C verbatim) so the map stays `Send`/`Sync`.
-static USER_POINTERS: Lazy<Mutex<HashMap<c_int, usize>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static USER_POINTERS: Lazy<Mutex<HashMap<c_int, usize>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Optional global log callback installed by `rtcInitLogger`.
 static LOG_CALLBACK: Lazy<Mutex<Option<RtcLogCallbackFunc>>> = Lazy::new(|| Mutex::new(None));
@@ -360,12 +430,31 @@ fn get_tr(id: c_int) -> Option<Arc<Track>> {
     }
 }
 
+fn get_ws(id: c_int) -> Option<Arc<WebSocket>> {
+    match REGISTRY.lock().get(&id) {
+        Some(RtcObject::Ws(ws)) => Some(Arc::clone(ws)),
+        _ => None,
+    }
+}
+
+fn get_ws_server(id: c_int) -> Option<Arc<WebSocketServer>> {
+    match REGISTRY.lock().get(&id) {
+        Some(RtcObject::WsServer(s)) => Some(Arc::clone(s)),
+        _ => None,
+    }
+}
+
 /// `track handle -> owning pc handle`. Populated when a track is added via
 /// `rtcAddTrack`/`rtcAddTrackEx` or surfaced via the `on_track` callback, so
 /// the media-handler chain / keyframe-request functions can resolve the
 /// PeerConnection backing the track.
-static TRACK_OWNERS: Lazy<Mutex<HashMap<c_int, c_int>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static TRACK_OWNERS: Lazy<Mutex<HashMap<c_int, c_int>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// `data-channel handle -> owning pc handle`. Populated when a channel is
+/// created via `rtcCreateDataChannel*` or surfaced via `on_data_channel`, so
+/// `rtcMaxMessageSize` can resolve the negotiated remote max message size from
+/// the owning PeerConnection (mirroring `DataChannel::maxMessageSize()`).
+static DC_OWNERS: Lazy<Mutex<HashMap<c_int, c_int>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 // ===========================================================================
 // Panic-safe boundary guards + string-buffer convention
@@ -596,6 +685,7 @@ struct PcCallbackSlots {
     local_description: Option<RtcDescriptionCallbackFunc>,
     local_candidate: Option<RtcCandidateCallbackFunc>,
     state_change: Option<RtcStateChangeCallbackFunc>,
+    ice_state_change: Option<RtcIceStateChangeCallbackFunc>,
     gathering_state: Option<RtcGatheringStateCallbackFunc>,
     signaling_state: Option<RtcSignalingStateCallbackFunc>,
     data_channel: Option<RtcDataChannelCallbackFunc>,
@@ -642,6 +732,7 @@ fn install_pc_callbacks(pc: c_int) -> c_int {
         let ld_cb = slots.local_description;
         let lc_cb = slots.local_candidate;
         let sc_cb = slots.state_change;
+        let is_cb = slots.ice_state_change;
         let gs_cb = slots.gathering_state;
         let ss_cb = slots.signaling_state;
         let dc_cb = slots.data_channel;
@@ -651,6 +742,13 @@ fn install_pc_callbacks(pc: c_int) -> c_int {
             cbs.on_state_change = Arc::new(move |s| {
                 let ptr = user_pointer(pc);
                 let st = map_pc_state(s) as c_int;
+                dispatch(move || cb(pc, st, ptr));
+            });
+        }
+        if let Some(cb) = is_cb {
+            cbs.on_ice_state_change = Arc::new(move |s| {
+                let ptr = user_pointer(pc);
+                let st = map_ice_state(s) as c_int;
                 dispatch(move || cb(pc, st, ptr));
             });
         }
@@ -683,9 +781,13 @@ fn install_pc_callbacks(pc: c_int) -> c_int {
         if let Some(cb) = dc_cb {
             cbs.on_data_channel = Arc::new(move |dc| {
                 let id = emplace(RtcObject::Dc(dc));
+                DC_OWNERS.lock().insert(id, pc);
                 // Inherit the pc's user pointer (capi.cpp does this).
                 let ptr = user_pointer(pc);
                 rtcSetUserPointer(id, ptr);
+                // Buffer inbound messages for the pull API until the app attaches
+                // an onMessage handler (parity with upstream's receive queue).
+                install_dc_callbacks(id);
                 dispatch(move || cb(pc, id, ptr));
             });
         }
@@ -732,6 +834,19 @@ fn map_pc_state(s: PeerConnectionState) -> RtcState {
     }
 }
 
+fn map_ice_state(s: crate::ice_transport::State) -> RtcIceState {
+    use crate::ice_transport::State;
+    match s {
+        State::New => RtcIceState::New,
+        State::Checking => RtcIceState::Checking,
+        State::Connected => RtcIceState::Connected,
+        State::Completed => RtcIceState::Completed,
+        State::Failed => RtcIceState::Failed,
+        State::Disconnected => RtcIceState::Disconnected,
+        State::Closed => RtcIceState::Closed,
+    }
+}
+
 fn map_signaling(s: crate::SignalingState) -> RtcSignalingState {
     match s {
         crate::SignalingState::Stable => RtcSignalingState::Stable,
@@ -768,22 +883,19 @@ pub extern "C" fn rtcSetStateChangeCallback(
     install_pc_callbacks(pc)
 }
 
-/// `rtcSetIceStateChangeCallback`. The runtime aggregates ICE state into the
-/// PeerConnection state, so there is no separate ICE-state hook to bind. We
-/// validate the handle and accept the callback, but it will not fire.
-//
-// TODO(#22): wire to a dedicated ICE-state callback once the PeerConnection
-// exposes one (it currently folds ICE state into PeerConnectionState).
+/// `rtcSetIceStateChangeCallback`. Bound to the runtime's per-ICE-transition
+/// hook (`on_ice_state_change`), which surfaces the raw [`crate::ice_transport::State`]
+/// before it is folded into the aggregate PeerConnection state.
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcSetIceStateChangeCallback(
     pc: c_int,
-    _cb: Option<RtcIceStateChangeCallbackFunc>,
+    cb: Option<RtcIceStateChangeCallbackFunc>,
 ) -> c_int {
     if get_pc(pc).is_none() {
-        RTC_ERR_INVALID
-    } else {
-        RTC_ERR_SUCCESS
+        return RTC_ERR_INVALID;
     }
+    PC_SLOTS.lock().entry(pc).or_default().ice_state_change = cb;
+    install_pc_callbacks(pc)
 }
 
 /// `rtcSetGatheringStateChangeCallback`.
@@ -883,7 +995,19 @@ pub extern "C" fn rtcSetRemoteDescription(
             desc.hint_type(DescriptionType::from_string(ts));
         }
         match pc.set_remote_description(desc) {
-            Ok(_) => RTC_ERR_SUCCESS,
+            Ok(_) => {
+                // Upstream auto-negotiation: applying a remote *offer* makes us
+                // the answerer, so we generate the answer immediately (unless
+                // the app opted out). `set_remote_description` leaves signaling
+                // in `HaveRemoteOffer` exactly in that case, so we key off it
+                // rather than re-inspecting the description type.
+                if !pc.disable_auto_negotiation()
+                    && matches!(pc.signaling_state(), crate::SignalingState::HaveRemoteOffer)
+                {
+                    let _ = pc.set_local_description(DescriptionType::Answer);
+                }
+                RTC_ERR_SUCCESS
+            }
             Err(_) => RTC_ERR_FAILURE,
         }
     })
@@ -944,7 +1068,9 @@ fn pc_string_out(
 /// `rtcGetLocalDescription`.
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcGetLocalDescription(pc: c_int, buffer: *mut c_char, size: c_int) -> c_int {
-    pc_string_out(pc, buffer, size, |pc| pc.local_description().map(|d| d.to_sdp()))
+    pc_string_out(pc, buffer, size, |pc| {
+        pc.local_description().map(|d| d.to_sdp())
+    })
 }
 
 /// `rtcGetRemoteDescription`.
@@ -1007,47 +1133,52 @@ pub extern "C" fn rtcCreateAnswer(pc: c_int, buffer: *mut c_char, size: c_int) -
     })
 }
 
-/// `rtcGetLocalAddress`. The runtime does not expose the selected local
-/// socket address yet.
-//
-// TODO(#22): expose PeerConnection::local_address() in the runtime.
+/// `rtcGetLocalAddress`. Selected local socket address, available once a
+/// candidate pair is nominated. Mirrors `PeerConnection::localAddress()`.
 #[unsafe(no_mangle)]
-pub extern "C" fn rtcGetLocalAddress(pc: c_int, _buffer: *mut c_char, _size: c_int) -> c_int {
-    if get_pc(pc).is_none() {
-        RTC_ERR_INVALID
-    } else {
-        RTC_ERR_NOT_AVAIL
-    }
+pub extern "C" fn rtcGetLocalAddress(pc: c_int, buffer: *mut c_char, size: c_int) -> c_int {
+    pc_string_out(pc, buffer, size, |pc| pc.local_address())
 }
 
-/// `rtcGetRemoteAddress`. Not exposed by the runtime yet.
-//
-// TODO(#22): expose PeerConnection::remote_address() in the runtime.
+/// `rtcGetRemoteAddress`. Selected remote socket address, available once a
+/// candidate pair is nominated. Mirrors `PeerConnection::remoteAddress()`.
 #[unsafe(no_mangle)]
-pub extern "C" fn rtcGetRemoteAddress(pc: c_int, _buffer: *mut c_char, _size: c_int) -> c_int {
-    if get_pc(pc).is_none() {
-        RTC_ERR_INVALID
-    } else {
-        RTC_ERR_NOT_AVAIL
-    }
+pub extern "C" fn rtcGetRemoteAddress(pc: c_int, buffer: *mut c_char, size: c_int) -> c_int {
+    pc_string_out(pc, buffer, size, |pc| pc.remote_address())
 }
 
-/// `rtcGetSelectedCandidatePair`. Not exposed by the runtime yet.
-//
-// TODO(#22): expose PeerConnection::get_selected_candidate_pair() in the runtime.
+/// `rtcGetSelectedCandidatePair`. Writes the selected local/remote candidates
+/// (SDP form) into the two buffers. Returns the larger of the two needed sizes,
+/// or `RTC_ERR_NOT_AVAIL` if no pair has been nominated. Mirrors
+/// `rtcGetSelectedCandidatePair` / `PeerConnection::getSelectedCandidatePair()`.
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcGetSelectedCandidatePair(
     pc: c_int,
-    _local: *mut c_char,
-    _local_size: c_int,
-    _remote: *mut c_char,
-    _remote_size: c_int,
+    local: *mut c_char,
+    local_size: c_int,
+    remote: *mut c_char,
+    remote_size: c_int,
 ) -> c_int {
-    if get_pc(pc).is_none() {
-        RTC_ERR_INVALID
-    } else {
-        RTC_ERR_NOT_AVAIL
-    }
+    guard(|| {
+        let pc = match get_pc(pc) {
+            Some(p) => p,
+            None => return RTC_ERR_INVALID,
+        };
+        match pc.selected_candidate_pair() {
+            Some((local_cand, remote_cand)) => {
+                let local_ret = copy_string(&local_cand.to_sdp(), local, local_size);
+                if local_ret < 0 {
+                    return local_ret;
+                }
+                let remote_ret = copy_string(&remote_cand.to_sdp(), remote, remote_size);
+                if remote_ret < 0 {
+                    return remote_ret;
+                }
+                local_ret.max(remote_ret)
+            }
+            None => RTC_ERR_NOT_AVAIL,
+        }
+    })
 }
 
 /// `rtcIsNegotiationNeeded`. The runtime has no negotiation-needed flag; we
@@ -1063,33 +1194,48 @@ pub extern "C" fn rtcIsNegotiationNeeded(pc: c_int) -> bool {
     false
 }
 
-/// `rtcGetMaxDataChannelStream`. Not exposed by the runtime yet.
-//
-// TODO(#22): expose PeerConnection::max_data_channel_id() in the runtime.
+/// `rtcGetMaxDataChannelStream`. Highest usable SCTP stream id for data
+/// channels. Mirrors `PeerConnection::maxDataChannelId()`.
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcGetMaxDataChannelStream(pc: c_int) -> c_int {
-    if get_pc(pc).is_none() {
-        RTC_ERR_INVALID
-    } else {
-        RTC_ERR_NOT_AVAIL
-    }
+    guard(|| match get_pc(pc) {
+        Some(pc) => c_int::from(pc.max_data_channel_stream()),
+        None => RTC_ERR_INVALID,
+    })
 }
 
-/// `rtcGetRemoteMaxMessageSize`. Not exposed by the runtime yet.
-//
-// TODO(#22): expose PeerConnection::remote_max_message_size() in the runtime.
+/// `rtcGetRemoteMaxMessageSize`. The smaller of the remote peer's advertised
+/// `max-message-size` and our local maximum (see
+/// [`PeerConnection::remote_max_message_size`]). Saturates to `c_int::MAX` for
+/// an unbounded (RFC 8841 zero) remote limit.
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcGetRemoteMaxMessageSize(pc: c_int) -> c_int {
-    if get_pc(pc).is_none() {
-        RTC_ERR_INVALID
-    } else {
-        RTC_ERR_NOT_AVAIL
-    }
+    guard(|| match get_pc(pc) {
+        Some(pc) => pc.remote_max_message_size().min(c_int::MAX as usize) as c_int,
+        None => RTC_ERR_INVALID,
+    })
 }
 
 // ===========================================================================
 // DataChannel
 // ===========================================================================
+
+/// Mirror `rtc::PeerConnection`'s automatic negotiation: when auto-negotiation
+/// is enabled and signaling is `Stable`, adding the first data channel or track
+/// generates a local offer (firing the local-description callback). Upstream
+/// defers this to the event loop and coalesces multiple additions into one
+/// offer; we fire synchronously, so the offer reflects whatever is registered
+/// at the moment the first item is added (sufficient for the common single
+/// pre-connection channel, and for tracks/channels added one before connecting).
+/// A non-`Stable` state means an offer is already in flight, so we skip.
+fn auto_negotiate_offer(pc: &PeerConnection) {
+    if pc.disable_auto_negotiation() {
+        return;
+    }
+    if matches!(pc.signaling_state(), crate::SignalingState::Stable) {
+        let _ = pc.set_local_description(DescriptionType::Offer);
+    }
+}
 
 /// `rtcSetDataChannelCallback`.
 #[unsafe(no_mangle)]
@@ -1159,9 +1305,18 @@ pub extern "C" fn rtcCreateDataChannelEx(
 
         let dc = pc_obj.create_data_channel_ext(label_s, dci, DataChannelCallbacks::default());
         let id = emplace(RtcObject::Dc(dc));
+        DC_OWNERS.lock().insert(id, pc);
         // Inherit the pc's user pointer (capi.cpp does this).
         let ptr = user_pointer(pc);
         rtcSetUserPointer(id, ptr);
+        // Install the default (no-callback) handler set so inbound messages are
+        // buffered for the pull API from creation, exactly as upstream queues
+        // before an onMessage handler is attached.
+        install_dc_callbacks(id);
+        // Upstream kicks negotiation once a channel is registered (unless the
+        // app opted out). The channel is now in the description, so the offer
+        // carries the application m-line.
+        auto_negotiate_offer(&pc_obj);
         id
     })
 }
@@ -1175,6 +1330,10 @@ pub extern "C" fn rtcDeleteDataChannel(dc: c_int) -> c_int {
             Some(RtcObject::Dc(d)) => {
                 d.close();
                 USER_POINTERS.lock().remove(&dc);
+                DC_SLOTS.lock().remove(&dc);
+                DC_RECV.lock().remove(&dc);
+                DC_OPEN_FIRED.lock().remove(&dc);
+                DC_OWNERS.lock().remove(&dc);
                 RTC_ERR_SUCCESS
             }
             Some(other) => {
@@ -1273,6 +1432,44 @@ unsafe impl Sync for DcCallbackSlots {}
 static DC_SLOTS: Lazy<Mutex<HashMap<c_int, DcCallbackSlots>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// Per-DataChannel inbound message queue for the pull API
+/// (`rtcReceiveMessage`). The runtime is push-based; when no `rtcMessageCallback`
+/// is registered we install an enqueue closure that buffers inbound messages
+/// here, mirroring libdatachannel where an unset `onMessage` leaves messages in
+/// the channel's receive queue. Each entry is `(payload, is_binary)`; for text
+/// the payload holds the UTF-8 bytes WITHOUT a trailing NUL.
+static DC_RECV: Lazy<Mutex<HashMap<c_int, VecDeque<(Vec<u8>, bool)>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// DataChannel ids whose open callback has already been delivered to the
+/// application. Ports the exactly-once half of upstream's
+/// `synchronized_stored_callback`: the open event reaches the app a single
+/// time regardless of how often the callback set is rebuilt (`rtcSet*Callback`
+/// re-runs `install_dc_callbacks`) and regardless of whether it arrives via the
+/// runtime's open transition (`mark_open`) or via a replay onto an
+/// already-open channel. Membership is gated by `HashSet::insert` returning
+/// `true` only on first insert.
+static DC_OPEN_FIRED: Lazy<Mutex<HashSet<c_int>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+
+/// Marshal one inbound DataChannel message to a C `rtcMessageCallback`, applying
+/// rtc.h's size convention: binary → non-negative byte count; text → a
+/// NUL-terminated string with NEGATIVE size `-(len + 1)`. `dispatch` runs the
+/// call synchronously, so the raw pointers into `data`/the temporary `CString`
+/// stay valid for the duration of the C call.
+fn deliver_c_message(id: c_int, cb: RtcMessageCallbackFunc, data: &[u8], binary: bool) {
+    let ptr = user_pointer(id);
+    if binary {
+        let len = data.len() as c_int;
+        let p = data.as_ptr() as *const c_char;
+        dispatch(move || cb(id, p, len, ptr));
+    } else {
+        let cstr = std::ffi::CString::new(data).unwrap_or_default();
+        let neg = -((cstr.as_bytes().len() + 1) as c_int);
+        let p = cstr.as_ptr();
+        dispatch(move || cb(id, p, neg, ptr));
+    }
+}
+
 /// Rebuild and install the DataChannelCallbacks set for `id` from its slots.
 fn install_dc_callbacks(id: c_int) -> c_int {
     guard(|| {
@@ -1283,11 +1480,21 @@ fn install_dc_callbacks(id: c_int) -> c_int {
         let slots = DC_SLOTS.lock().get(&id).cloned().unwrap_or_default();
         let mut cbs = DataChannelCallbacks::default();
 
-        if let Some(cb) = slots.open {
-            cbs.on_open = Arc::new(move || {
-                let ptr = user_pointer(id);
-                dispatch(move || cb(id, ptr));
-            });
+        // Build the open dispatcher behind a per-id exactly-once guard so the
+        // app's `openCallback` fires a single time however this is reached: the
+        // runtime's open transition firing `cbs.on_open`, or the replay below
+        // re-invoking it on an already-open channel. Mirrors upstream's
+        // `synchronized_stored_callback`.
+        let open_dispatcher: Option<Arc<dyn Fn() + Send + Sync>> = slots.open.map(|cb| {
+            Arc::new(move || {
+                if DC_OPEN_FIRED.lock().insert(id) {
+                    let ptr = user_pointer(id);
+                    dispatch(move || cb(id, ptr));
+                }
+            }) as Arc<dyn Fn() + Send + Sync>
+        });
+        if let Some(ref d) = open_dispatcher {
+            cbs.on_open = Arc::clone(d);
         }
         if let Some(cb) = slots.closed {
             cbs.on_closed = Arc::new(move || {
@@ -1296,26 +1503,29 @@ fn install_dc_callbacks(id: c_int) -> c_int {
             });
         }
         if let Some(cb) = slots.message {
+            // A handler is attached: forward any messages that queued while none
+            // was set (parity with upstream, which flushes the receive backlog
+            // when onMessage is assigned), then dispatch live.
+            let backlog: Vec<(Vec<u8>, bool)> = DC_RECV
+                .lock()
+                .get_mut(&id)
+                .map(|q| q.drain(..).collect())
+                .unwrap_or_default();
+            for (data, binary) in backlog {
+                deliver_c_message(id, cb, &data, binary);
+            }
             cbs.on_message = Arc::new(move |data, binary| {
-                let ptr = user_pointer(id);
-                if binary {
-                    // Binary: size is the byte count (non-negative). Data is not
-                    // NUL-terminated; pass the raw pointer + length.
-                    let len = data.len() as c_int;
-                    let p = data.as_ptr() as *const c_char;
-                    // We must keep `data` alive across the call; it is borrowed
-                    // for the duration of this closure body, so the pointer is
-                    // valid here.
-                    dispatch(move || cb(id, p, len, ptr));
-                } else {
-                    // Text: rtc.h convention is a NUL-terminated string with a
-                    // NEGATIVE size of -(len+1). Build a CString to guarantee
-                    // the terminator.
-                    let cstr = std::ffi::CString::new(data).unwrap_or_default();
-                    let neg = -((cstr.as_bytes().len() + 1) as c_int);
-                    let p = cstr.as_ptr();
-                    dispatch(move || cb(id, p, neg, ptr));
-                }
+                deliver_c_message(id, cb, data, binary);
+            });
+        } else {
+            // No handler: buffer inbound messages for the pull API
+            // (`rtcReceiveMessage`), as upstream's unset onMessage does.
+            cbs.on_message = Arc::new(move |data: &[u8], binary: bool| {
+                DC_RECV
+                    .lock()
+                    .entry(id)
+                    .or_default()
+                    .push_back((data.to_vec(), binary));
             });
         }
         if let Some(cb) = slots.buffered_low {
@@ -1327,6 +1537,143 @@ fn install_dc_callbacks(id: c_int) -> c_int {
         // `error` has no runtime backing on DataChannel; stored but never fired.
 
         dc.set_callbacks(cbs);
+
+        // Replay a missed open: an incoming channel is marked open *before* it
+        // is surfaced via `on_data_channel`, so the app's `rtcSetOpenCallback`
+        // (registered inside its dataChannelCallback) arrives after the open
+        // transition already fired the default no-op. Deliver the open now. The
+        // dispatcher's `DC_OPEN_FIRED` guard keeps this idempotent with the
+        // runtime's own firing.
+        if dc.is_open() {
+            if let Some(d) = open_dispatcher {
+                d();
+            }
+        }
+        RTC_ERR_SUCCESS
+    })
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket callback plumbing (shares the generic-channel id space)
+// ---------------------------------------------------------------------------
+
+/// Per-WebSocket-handle storage for the channel-level callbacks, so the runtime
+/// callback set can be rebuilt on every `rtcSet*Callback` (mirrors
+/// [`DcCallbackSlots`]). Unlike DataChannel, the runtime WebSocket *does* have
+/// an error hook, so `error` is live here.
+#[derive(Default, Clone)]
+struct WsCallbackSlots {
+    open: Option<RtcOpenCallbackFunc>,
+    closed: Option<RtcClosedCallbackFunc>,
+    error: Option<RtcErrorCallbackFunc>,
+    message: Option<RtcMessageCallbackFunc>,
+}
+
+// SAFETY: bare `extern "C" fn` pointers are Send/Sync (code addresses).
+unsafe impl Send for WsCallbackSlots {}
+unsafe impl Sync for WsCallbackSlots {}
+
+static WS_SLOTS: Lazy<Mutex<HashMap<c_int, WsCallbackSlots>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Per-WebSocket inbound message backlog (and pull-API queue), matching
+/// [`DC_RECV`]. Messages that arrive before a `rtcMessageCallback` is set are
+/// buffered here and flushed by [`install_ws_callbacks`] when one attaches.
+/// Each entry is `(payload, is_binary)`; text payloads hold UTF-8 bytes with no
+/// trailing NUL.
+static WS_RECV: Lazy<Mutex<HashMap<c_int, VecDeque<(Vec<u8>, bool)>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// WebSocket ids whose open callback has already been delivered, mirroring
+/// [`DC_OPEN_FIRED`]: a server-accepted socket is already `Open` when surfaced
+/// to the app, so `rtcSetOpenCallback` (registered inside the client callback)
+/// arrives after the runtime's open transition already fired against no
+/// callback. The replay in [`install_ws_callbacks`] delivers it once, gated by
+/// this set.
+static WS_OPEN_FIRED: Lazy<Mutex<HashSet<c_int>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+
+/// Convert a runtime [`WsMessage`] into the `(bytes, is_binary)` shape the
+/// generic [`deliver_c_message`] marshaller expects.
+fn ws_message_parts(msg: WsMessage) -> (Vec<u8>, bool) {
+    match msg {
+        WsMessage::Text(b) => (b, false),
+        WsMessage::Binary(b) => (b, true),
+    }
+}
+
+/// Rebuild and install the runtime callback set for WebSocket `id` from its
+/// slots. Mirrors [`install_dc_callbacks`]: exactly-once open (with replay onto
+/// an already-open socket), live-or-buffered message delivery, and panic-safe
+/// dispatch of each C callback.
+fn install_ws_callbacks(id: c_int) -> c_int {
+    guard(|| {
+        let ws = match get_ws(id) {
+            Some(w) => w,
+            None => return RTC_ERR_INVALID,
+        };
+        let slots = WS_SLOTS.lock().get(&id).cloned().unwrap_or_default();
+
+        // Exactly-once open dispatcher (see DC_OPEN_FIRED / install_dc_callbacks).
+        let open_dispatcher: Option<Arc<dyn Fn() + Send + Sync>> = slots.open.map(|cb| {
+            Arc::new(move || {
+                if WS_OPEN_FIRED.lock().insert(id) {
+                    let ptr = user_pointer(id);
+                    dispatch(move || cb(id, ptr));
+                }
+            }) as Arc<dyn Fn() + Send + Sync>
+        });
+        if let Some(ref d) = open_dispatcher {
+            let d = Arc::clone(d);
+            ws.set_on_open(move || d());
+        }
+
+        if let Some(cb) = slots.closed {
+            ws.set_on_closed(move || {
+                let ptr = user_pointer(id);
+                dispatch(move || cb(id, ptr));
+            });
+        }
+
+        if let Some(cb) = slots.error {
+            ws.set_on_error(move |err: String| {
+                let ptr = user_pointer(id);
+                let cstr = std::ffi::CString::new(err).unwrap_or_default();
+                let p = cstr.as_ptr();
+                dispatch(move || cb(id, p, ptr));
+            });
+        }
+
+        if let Some(cb) = slots.message {
+            // Flush messages buffered before a handler attached, then go live
+            // (parity with install_dc_callbacks).
+            let backlog: Vec<(Vec<u8>, bool)> = WS_RECV
+                .lock()
+                .get_mut(&id)
+                .map(|q| q.drain(..).collect())
+                .unwrap_or_default();
+            for (data, binary) in backlog {
+                deliver_c_message(id, cb, &data, binary);
+            }
+            ws.set_on_message(move |msg: WsMessage| {
+                let (data, binary) = ws_message_parts(msg);
+                deliver_c_message(id, cb, &data, binary);
+            });
+        } else {
+            // No handler yet: buffer inbound messages for the backlog / pull API.
+            ws.set_on_message(move |msg: WsMessage| {
+                let (data, binary) = ws_message_parts(msg);
+                WS_RECV.lock().entry(id).or_default().push_back((data, binary));
+            });
+        }
+
+        // Replay a missed open onto an already-open socket (server-accepted, or
+        // a client that connected before its callback was registered). The
+        // WS_OPEN_FIRED guard keeps this idempotent with the runtime's firing.
+        if ws.is_open() {
+            if let Some(d) = open_dispatcher {
+                d();
+            }
+        }
         RTC_ERR_SUCCESS
     })
 }
@@ -1338,6 +1685,10 @@ pub extern "C" fn rtcSetOpenCallback(id: c_int, cb: Option<RtcOpenCallbackFunc>)
     if get_tr(id).is_some() {
         TRACK_SLOTS.lock().entry(id).or_default().open = cb;
         return install_track_callbacks(id);
+    }
+    if get_ws(id).is_some() {
+        WS_SLOTS.lock().entry(id).or_default().open = cb;
+        return install_ws_callbacks(id);
     }
     if get_dc(id).is_none() {
         return RTC_ERR_INVALID;
@@ -1352,6 +1703,10 @@ pub extern "C" fn rtcSetClosedCallback(id: c_int, cb: Option<RtcClosedCallbackFu
     if get_tr(id).is_some() {
         TRACK_SLOTS.lock().entry(id).or_default().closed = cb;
         return install_track_callbacks(id);
+    }
+    if get_ws(id).is_some() {
+        WS_SLOTS.lock().entry(id).or_default().closed = cb;
+        return install_ws_callbacks(id);
     }
     if get_dc(id).is_none() {
         return RTC_ERR_INVALID;
@@ -1371,6 +1726,10 @@ pub extern "C" fn rtcSetErrorCallback(id: c_int, cb: Option<RtcErrorCallbackFunc
         TRACK_SLOTS.lock().entry(id).or_default().error = cb;
         return RTC_ERR_SUCCESS;
     }
+    if get_ws(id).is_some() {
+        WS_SLOTS.lock().entry(id).or_default().error = cb;
+        return install_ws_callbacks(id);
+    }
     if get_dc(id).is_none() {
         return RTC_ERR_INVALID;
     }
@@ -1384,6 +1743,10 @@ pub extern "C" fn rtcSetMessageCallback(id: c_int, cb: Option<RtcMessageCallback
     if get_tr(id).is_some() {
         TRACK_SLOTS.lock().entry(id).or_default().message = cb;
         return install_track_callbacks(id);
+    }
+    if get_ws(id).is_some() {
+        WS_SLOTS.lock().entry(id).or_default().message = cb;
+        return install_ws_callbacks(id);
     }
     if get_dc(id).is_none() {
         return RTC_ERR_INVALID;
@@ -1413,6 +1776,32 @@ pub extern "C" fn rtcSendMessage(id: c_int, data: *const c_char, size: c_int) ->
                 unsafe { std::slice::from_raw_parts(data as *const u8, size as usize) }
             };
             return match tr.send_rtp(bytes) {
+                Ok(_) => RTC_ERR_SUCCESS,
+                Err(_) => RTC_ERR_FAILURE,
+            };
+        }
+        // WebSocket: `size >= 0` is binary; `size < 0` is a NUL-terminated text
+        // string (rtc.h's shared send convention).
+        if let Some(ws) = get_ws(id) {
+            if data.is_null() && size != 0 {
+                return RTC_ERR_INVALID;
+            }
+            let res = if size >= 0 {
+                let bytes: &[u8] = if size == 0 || data.is_null() {
+                    &[]
+                } else {
+                    // SAFETY: caller guarantees `data` has `size` bytes.
+                    unsafe { std::slice::from_raw_parts(data as *const u8, size as usize) }
+                };
+                ws.send_binary(bytes)
+            } else {
+                let s = match unsafe { cstr_opt(data) } {
+                    Some(Some(s)) => s,
+                    _ => return RTC_ERR_INVALID,
+                };
+                ws.send_text(s.as_bytes())
+            };
+            return match res {
                 Ok(_) => RTC_ERR_SUCCESS,
                 Err(_) => RTC_ERR_FAILURE,
             };
@@ -1455,6 +1844,10 @@ pub extern "C" fn rtcClose(id: c_int) -> c_int {
             tr.close();
             return RTC_ERR_SUCCESS;
         }
+        if let Some(ws) = get_ws(id) {
+            ws.close();
+            return RTC_ERR_SUCCESS;
+        }
         match get_dc(id) {
             Some(d) => {
                 d.close();
@@ -1471,6 +1864,12 @@ pub extern "C" fn rtcDelete(id: c_int) -> c_int {
     if get_tr(id).is_some() {
         return rtcDeleteTrack(id);
     }
+    if get_ws(id).is_some() {
+        return rtcDeleteWebSocket(id);
+    }
+    if get_ws_server(id).is_some() {
+        return rtcDeleteWebSocketServer(id);
+    }
     rtcDeleteDataChannel(id)
 }
 
@@ -1481,60 +1880,74 @@ pub extern "C" fn rtcIsOpen(id: c_int) -> bool {
         if let Some(tr) = get_tr(id) {
             return tr.is_open();
         }
+        if let Some(ws) = get_ws(id) {
+            return ws.is_open();
+        }
         get_dc(id).map(|d| d.is_open()).unwrap_or(false)
     })
 }
 
-/// `rtcIsClosed`. The runtime channels expose openness; we derive "closed" as
-/// "registered but not open". An open handle is definitely not closed; an
-/// unknown handle reports closed.
+/// `rtcIsClosed`. Reports the channel's actual closed state — distinct from
+/// "not open", since a still-connecting channel is neither. An unknown handle
+/// reports `false`: upstream wraps `getChannel(id)->isClosed()` in `wrap(...)`,
+/// which catches the not-found exception and yields a negative error, so
+/// `rtcIsClosed` returns false for an unknown id (capi.cpp:820).
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcIsClosed(id: c_int) -> bool {
     guard_bool(|| {
         if let Some(tr) = get_tr(id) {
             return tr.is_closed();
         }
+        if let Some(ws) = get_ws(id) {
+            return ws.is_closed();
+        }
         match get_dc(id) {
-            Some(d) => !d.is_open(),
-            None => true,
+            Some(d) => d.is_closed(),
+            None => false,
         }
     })
 }
 
-/// `rtcMaxMessageSize`. The runtime does not expose a per-channel max message
-/// size; report the WebRTC default (256 KiB) as the C++ would after
-/// negotiation defaults.
-//
-// TODO(#22): expose DataChannel::max_message_size() in the runtime.
+/// `rtcMaxMessageSize`. The largest message that may be sent on this channel:
+/// `DataChannel::maxMessageSize()` defers to the owning peer's
+/// `remoteMaxMessageSize()` (min of the remote-advertised and local maxima),
+/// falling back to the 64 KiB remote default when the channel has no resolvable
+/// owner yet. Saturates to `c_int::MAX` for an unbounded remote limit.
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcMaxMessageSize(id: c_int) -> c_int {
     guard(|| {
         if get_dc(id).is_none() {
-            RTC_ERR_INVALID
-        } else {
-            262_144 // 256 KiB, libdatachannel's LOCAL_MAX_MESSAGE_SIZE default
+            return RTC_ERR_INVALID;
         }
+        let size = match DC_OWNERS.lock().get(&id).copied().and_then(get_pc) {
+            Some(pc) => pc.remote_max_message_size(),
+            None => 65536, // DEFAULT_REMOTE_MAX_MESSAGE_SIZE
+        };
+        size.min(c_int::MAX as usize) as c_int
     })
 }
 
-/// `rtcGetBufferedAmount`. The runtime does not track buffered amount yet.
-//
-// TODO(#22): expose DataChannel::buffered_amount() in the runtime.
+/// `rtcGetBufferedAmount`. Bytes queued for sending but not yet accepted by
+/// the SCTP transport (waiting behind usrsctp backpressure).
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcGetBufferedAmount(id: c_int) -> c_int {
-    guard(|| if get_dc(id).is_none() { RTC_ERR_INVALID } else { 0 })
+    guard(|| match get_dc(id) {
+        Some(dc) => dc.buffered_amount().min(c_int::MAX as usize) as c_int,
+        None => RTC_ERR_INVALID,
+    })
 }
 
-/// `rtcSetBufferedAmountLowThreshold`. The runtime does not expose a threshold
-/// setter; accept and ignore for ABI completeness.
-//
-// TODO(#22): expose DataChannel::set_buffered_amount_low_threshold().
+/// `rtcSetBufferedAmountLowThreshold`. Sets the low-water threshold at which
+/// the buffered-amount-low callback fires (default 0). A negative value is
+/// clamped to 0.
 #[unsafe(no_mangle)]
-pub extern "C" fn rtcSetBufferedAmountLowThreshold(id: c_int, _amount: c_int) -> c_int {
-    if get_dc(id).is_none() {
-        RTC_ERR_INVALID
-    } else {
-        RTC_ERR_SUCCESS
+pub extern "C" fn rtcSetBufferedAmountLowThreshold(id: c_int, amount: c_int) -> c_int {
+    match get_dc(id) {
+        Some(dc) => {
+            dc.set_buffered_amount_low_threshold(amount.max(0) as usize);
+            RTC_ERR_SUCCESS
+        }
+        None => RTC_ERR_INVALID,
     }
 }
 
@@ -1551,13 +1964,22 @@ pub extern "C" fn rtcSetBufferedAmountLowCallback(
     install_dc_callbacks(id)
 }
 
-/// `rtcGetAvailableAmount`. The runtime is push-based (`on_message`), so there
-/// is no receive queue to report an available amount for.
-//
-// TODO(#22): expose a receive queue if a poll-based API is wanted.
+/// `rtcGetAvailableAmount` — total bytes of inbound messages waiting in the
+/// pull-API receive queue (i.e. messages that arrived while no `rtcMessageCallback`
+/// was set). Zero when a handler is attached, since those are dispatched live.
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcGetAvailableAmount(id: c_int) -> c_int {
-    guard(|| if get_dc(id).is_none() { RTC_ERR_INVALID } else { 0 })
+    guard(|| {
+        if get_dc(id).is_none() {
+            return RTC_ERR_INVALID;
+        }
+        let total: usize = DC_RECV
+            .lock()
+            .get(&id)
+            .map(|q| q.iter().map(|(d, _)| d.len()).sum())
+            .unwrap_or(0);
+        total as c_int
+    })
 }
 
 /// `rtcSetAvailableCallback`. No poll-based receive queue exists in the
@@ -1576,18 +1998,77 @@ pub extern "C" fn rtcSetAvailableCallback(
     }
 }
 
-/// `rtcReceiveMessage`. The runtime delivers messages via the push-based
-/// `on_message` callback, not a poll-based queue, so there is nothing to
-/// dequeue here.
-//
-// TODO(#22): expose DataChannel::peek()/receive() if a poll API is wanted.
+/// `rtcReceiveMessage` — dequeue the next inbound message from the pull-API
+/// receive queue. Faithful port of upstream's `rtcReceiveMessage` (capi.cpp):
+///
+/// * `*size` carries the buffer capacity on input (upstream takes its abs).
+/// * With `buffer == NULL` the front message is *peeked*: `*size` is set to its
+///   size (negative `-(len+1)` for text, positive `len` for binary) and the
+///   message is left queued. Returns `RTC_ERR_SUCCESS`.
+/// * With a real `buffer` too small to hold the message, `*size` is set to the
+///   required size (same sign rule) and `RTC_ERR_TOO_SMALL` is returned without
+///   dequeuing.
+/// * Otherwise the message is copied out (text gets a trailing NUL), `*size` is
+///   set as above, the message is dequeued, and `RTC_ERR_SUCCESS` is returned.
+/// * An empty queue yields `RTC_ERR_NOT_AVAIL`.
+///
+/// # Safety
+/// `size` must be non-null; `buffer`, if non-null, must point to at least
+/// `abs(*size)` bytes.
 #[unsafe(no_mangle)]
-pub extern "C" fn rtcReceiveMessage(id: c_int, _buffer: *mut c_char, _size: *mut c_int) -> c_int {
-    if get_dc(id).is_none() {
-        RTC_ERR_INVALID
-    } else {
-        RTC_ERR_NOT_AVAIL
-    }
+pub extern "C" fn rtcReceiveMessage(id: c_int, buffer: *mut c_char, size: *mut c_int) -> c_int {
+    guard(|| {
+        if get_dc(id).is_none() {
+            return RTC_ERR_INVALID;
+        }
+        if size.is_null() {
+            return RTC_ERR_INVALID;
+        }
+        // Input capacity (upstream: `*size = std::abs(*size)`).
+        let cap = unsafe { (*size).unsigned_abs() } as usize;
+
+        let mut guard_q = DC_RECV.lock();
+        let queue = match guard_q.get_mut(&id) {
+            Some(q) if !q.is_empty() => q,
+            _ => return RTC_ERR_NOT_AVAIL,
+        };
+
+        // Inspect the front message without removing it yet.
+        let front = queue.front().expect("queue non-empty checked above");
+        let data = &front.0;
+        let binary = front.1;
+        let msg_len = data.len();
+
+        // Required size and the value to report in `*size`, with rtc.h's sign
+        // rule: binary is positive `len`; text is negative `-(len + 1)` (the
+        // magnitude counts the NUL terminator).
+        let (needed, report): (usize, c_int) = if binary {
+            (msg_len, msg_len as c_int)
+        } else {
+            (msg_len + 1, -((msg_len + 1) as c_int))
+        };
+
+        if buffer.is_null() {
+            // Peek: report size, leave the message queued.
+            unsafe { *size = report };
+            return RTC_ERR_SUCCESS;
+        }
+        if cap < needed {
+            // Caller's buffer is too small: report the required size, keep it.
+            unsafe { *size = report };
+            return RTC_ERR_TOO_SMALL;
+        }
+        // Copy out, NUL-terminating text.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr() as *const c_char, buffer, msg_len);
+            if !binary {
+                *buffer.add(msg_len) = 0;
+            }
+            *size = report;
+        }
+        queue.pop_front();
+        RTC_ERR_SUCCESS
+    })
 }
 
 // ===========================================================================
@@ -1746,6 +2227,11 @@ pub extern "C" fn rtcAddTrack(pc: c_int, media_description_sdp: *const c_char) -
         TRACK_OWNERS.lock().insert(id, pc);
         let ptr = user_pointer(pc);
         rtcSetUserPointer(id, ptr);
+        // NB: unlike createDataChannel, upstream's addTrack does NOT trigger
+        // auto-negotiation — it only creates the track object. The application
+        // drives renegotiation explicitly via rtcSetLocalDescription. (Faithful
+        // to peerconnection.cpp: addTrack omits the setLocalDescription path
+        // that createDataChannel runs.)
         id
     })
 }
@@ -1766,6 +2252,14 @@ fn track_init_from_sdp(sdp: &str) -> Option<crate::TrackInit> {
         if let Some(rest) = line.strip_prefix("m=") {
             // m=<kind> <port> <proto> <fmt...>
             kind = rest.split_whitespace().next().unwrap_or("");
+        } else if kind.is_empty() && !line.is_empty() && !line.starts_with("a=") {
+            // Upstream `rtcAddTrack` passes the m-line content WITHOUT the "m="
+            // prefix (e.g. "video 9 UDP/TLS/RTP/SAVPF"); treat the first such
+            // line as the media line.
+            let first = line.split_whitespace().next().unwrap_or("");
+            if first == "audio" || first == "video" || first == "application" {
+                kind = first;
+            }
         } else if let Some(v) = line.strip_prefix("a=mid:") {
             mid = v.trim().to_string();
         } else if line == "a=sendonly" {
@@ -1847,11 +2341,7 @@ pub extern "C" fn rtcAddTrackEx(pc: c_int, init: *const RtcTrackInit) -> c_int {
         };
         let pt = if i.payloadType < 0 || i.payloadType > 127 {
             // Pick a sane default payload type per codec kind.
-            if codec.is_video() {
-                96
-            } else {
-                111
-            }
+            if codec.is_video() { 96 } else { 111 }
         } else {
             i.payloadType as u8
         };
@@ -1874,6 +2364,7 @@ pub extern "C" fn rtcAddTrackEx(pc: c_int, init: *const RtcTrackInit) -> c_int {
         TRACK_OWNERS.lock().insert(id, pc);
         let ptr = user_pointer(pc);
         rtcSetUserPointer(id, ptr);
+        // See rtcAddTrack: addTrack does not auto-negotiate upstream.
         id
     })
 }
@@ -2055,10 +2546,7 @@ pub extern "C" fn rtcChainPliHandler(tr: c_int, cb: Option<RtcPliHandlerCallback
 /// `rtcChainRembHandler` — append a [`crate::RembHandler`] invoking the C
 /// callback `cb(tr, bitrate, ptr)` for each incoming REMB.
 #[unsafe(no_mangle)]
-pub extern "C" fn rtcChainRembHandler(
-    tr: c_int,
-    cb: Option<RtcRembHandlerCallbackFunc>,
-) -> c_int {
+pub extern "C" fn rtcChainRembHandler(tr: c_int, cb: Option<RtcRembHandlerCallbackFunc>) -> c_int {
     guard(|| {
         let t = match get_tr(tr) {
             Some(t) => t,
@@ -2098,7 +2586,10 @@ pub extern "C" fn rtcChainPacingHandler(
         } else {
             send_interval_ms as u64
         };
-        t.chain_media_handler(Box::new(crate::PacingHandler::new(bits_per_second, interval)));
+        t.chain_media_handler(Box::new(crate::PacingHandler::new(
+            bits_per_second,
+            interval,
+        )));
         RTC_ERR_SUCCESS
     })
 }
@@ -2156,41 +2647,239 @@ pub extern "C" fn rtcTransformTimestampToSeconds(
 }
 
 // ===========================================================================
-// WebSocket — NOT ported (return RTC_ERR_NOT_AVAIL)
+// WebSocket (client + server) — shares the generic-channel id space
 // ===========================================================================
 
-/// `rtcCreateWebSocket` — WebSocket is not ported.
-#[unsafe(no_mangle)]
-pub extern "C" fn rtcCreateWebSocket(_url: *const c_char) -> c_int {
-    RTC_ERR_NOT_AVAIL
+/// Open a WebSocket against `url` with `config`, register it in the handle
+/// space, and install its callback plumbing. Returns the new handle, or a
+/// negative error code. Shared by `rtcCreateWebSocket`/`rtcCreateWebSocketEx`.
+fn open_and_register_ws(url: *const c_char, config: WebSocketConfig) -> c_int {
+    let url = match unsafe { cstr_opt(url) } {
+        Some(Some(s)) => s.to_owned(),
+        _ => return RTC_ERR_INVALID,
+    };
+    let mut ws = WebSocket::new(config);
+    if ws.open(&url).is_err() {
+        return RTC_ERR_FAILURE;
+    }
+    let id = emplace(RtcObject::Ws(Arc::new(ws)));
+    install_ws_callbacks(id);
+    id
 }
 
-/// `rtcCreateWebSocketEx` — WebSocket is not ported.
+/// `rtcCreateWebSocket` — open a client WebSocket with default configuration.
 #[unsafe(no_mangle)]
-pub extern "C" fn rtcCreateWebSocketEx(_url: *const c_char, _config: *const c_void) -> c_int {
-    RTC_ERR_NOT_AVAIL
+pub extern "C" fn rtcCreateWebSocket(url: *const c_char) -> c_int {
+    guard(|| open_and_register_ws(url, WebSocketConfig::default()))
 }
 
-/// `rtcDeleteWebSocket` — WebSocket is not ported.
+/// `rtcCreateWebSocketEx` — open a client WebSocket with explicit configuration.
+///
+/// # Safety
+/// `config`, if non-null, must point to a valid `rtcWsConfiguration`.
 #[unsafe(no_mangle)]
-pub extern "C" fn rtcDeleteWebSocket(_ws: c_int) -> c_int {
-    RTC_ERR_NOT_AVAIL
+pub extern "C" fn rtcCreateWebSocketEx(
+    url: *const c_char,
+    config: *const RtcWsConfiguration,
+) -> c_int {
+    guard(|| {
+        let mut cfg = WebSocketConfig::default();
+        if !config.is_null() {
+            // SAFETY: caller guarantees a non-null `config` is valid.
+            let c = unsafe { &*config };
+            cfg.disable_tls_verification = c.disableTlsVerification;
+            if c.maxMessageSize > 0 {
+                cfg.max_message_size = Some(c.maxMessageSize as usize);
+            }
+            if c.maxOutstandingPings > 0 {
+                cfg.max_outstanding_pings = Some(c.maxOutstandingPings as u32);
+            }
+            if !c.protocols.is_null() && c.protocolsCount > 0 {
+                let mut protos = Vec::with_capacity(c.protocolsCount as usize);
+                for i in 0..c.protocolsCount as isize {
+                    // SAFETY: `protocols` points to `protocolsCount` C strings.
+                    let p = unsafe { *c.protocols.offset(i) };
+                    if let Some(Some(s)) = unsafe { cstr_opt(p) } {
+                        protos.push(s.to_owned());
+                    }
+                }
+                cfg.protocols = protos;
+            }
+        }
+        open_and_register_ws(url, cfg)
+    })
 }
 
-/// `rtcGetWebSocketRemoteAddress` — WebSocket is not ported.
+/// `rtcDeleteWebSocket` — close and unregister a client WebSocket handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtcDeleteWebSocket(ws: c_int) -> c_int {
+    guard(|| {
+        let obj = REGISTRY.lock().remove(&ws);
+        match obj {
+            Some(RtcObject::Ws(w)) => {
+                w.close();
+                USER_POINTERS.lock().remove(&ws);
+                WS_SLOTS.lock().remove(&ws);
+                WS_RECV.lock().remove(&ws);
+                WS_OPEN_FIRED.lock().remove(&ws);
+                RTC_ERR_SUCCESS
+            }
+            Some(other) => {
+                REGISTRY.lock().insert(ws, other);
+                RTC_ERR_INVALID
+            }
+            None => RTC_ERR_INVALID,
+        }
+    })
+}
+
+/// `rtcGetWebSocketRemoteAddress` — peer address of an accepted socket.
+/// `RTC_ERR_NOT_AVAIL` when no remote address is known (e.g. a client socket).
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcGetWebSocketRemoteAddress(
-    _ws: c_int,
-    _buffer: *mut c_char,
-    _size: c_int,
+    ws: c_int,
+    buffer: *mut c_char,
+    size: c_int,
 ) -> c_int {
-    RTC_ERR_NOT_AVAIL
+    guard(|| match get_ws(ws) {
+        Some(w) => match w.remote_address() {
+            Some(addr) => copy_string(addr, buffer, size),
+            None => RTC_ERR_NOT_AVAIL,
+        },
+        None => RTC_ERR_INVALID,
+    })
 }
 
-/// `rtcGetWebSocketPath` — WebSocket is not ported.
+/// `rtcGetWebSocketPath` — request path of an accepted socket.
+/// `RTC_ERR_NOT_AVAIL` when no path is known.
 #[unsafe(no_mangle)]
-pub extern "C" fn rtcGetWebSocketPath(_ws: c_int, _buffer: *mut c_char, _size: c_int) -> c_int {
-    RTC_ERR_NOT_AVAIL
+pub extern "C" fn rtcGetWebSocketPath(ws: c_int, buffer: *mut c_char, size: c_int) -> c_int {
+    guard(|| match get_ws(ws) {
+        Some(w) => match w.path() {
+            Some(path) => copy_string(path, buffer, size),
+            None => RTC_ERR_NOT_AVAIL,
+        },
+        None => RTC_ERR_INVALID,
+    })
+}
+
+/// `rtcCreateWebSocketServer` — start a listening WebSocket server. Each
+/// accepted client is registered in the generic-channel id space and surfaced
+/// to `cb`. When `enableTls` is set without cert/key files, a self-signed
+/// certificate is generated, matching upstream.
+///
+/// # Safety
+/// `config` must point to a valid `rtcWsServerConfiguration`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtcCreateWebSocketServer(
+    config: *const RtcWsServerConfiguration,
+    cb: Option<RtcWebSocketClientCallbackFunc>,
+) -> c_int {
+    guard(|| {
+        if config.is_null() {
+            return RTC_ERR_INVALID;
+        }
+        let cb = match cb {
+            Some(cb) => cb,
+            None => return RTC_ERR_INVALID,
+        };
+        // SAFETY: caller guarantees `config` is valid.
+        let c = unsafe { &*config };
+        let mut scfg = WebSocketServerConfig {
+            port: c.port,
+            enable_tls: c.enableTls,
+            ..Default::default()
+        };
+        if c.maxMessageSize > 0 {
+            scfg.max_message_size = Some(c.maxMessageSize as usize);
+        }
+        if let Some(Some(s)) = unsafe { cstr_opt(c.bindAddress) } {
+            scfg.bind_address = Some(s.to_owned());
+        }
+        if c.enableTls {
+            let cert_file = unsafe { cstr_opt(c.certificatePemFile) };
+            let key_file = unsafe { cstr_opt(c.keyPemFile) };
+            match (cert_file, key_file) {
+                // Both PEM file paths supplied: load them.
+                (Some(Some(cf)), Some(Some(kf))) => {
+                    let cert = match std::fs::read_to_string(cf) {
+                        Ok(s) => s,
+                        Err(_) => return RTC_ERR_INVALID,
+                    };
+                    let key = match std::fs::read_to_string(kf) {
+                        Ok(s) => s,
+                        Err(_) => return RTC_ERR_INVALID,
+                    };
+                    scfg.certificate_pem = Some(cert);
+                    scfg.key_pem = Some(key);
+                }
+                // Otherwise autogenerate a self-signed certificate.
+                _ => {
+                    let cert = match Certificate::generate_default() {
+                        Ok(c) => c,
+                        Err(_) => return RTC_ERR_FAILURE,
+                    };
+                    let cert_pem = match cert.x509().to_pem().ok().and_then(|b| String::from_utf8(b).ok())
+                    {
+                        Some(s) => s,
+                        None => return RTC_ERR_FAILURE,
+                    };
+                    let key_pem = match cert
+                        .pkey()
+                        .private_key_to_pem_pkcs8()
+                        .ok()
+                        .and_then(|b| String::from_utf8(b).ok())
+                    {
+                        Some(s) => s,
+                        None => return RTC_ERR_FAILURE,
+                    };
+                    scfg.certificate_pem = Some(cert_pem);
+                    scfg.key_pem = Some(key_pem);
+                }
+            }
+        }
+        let server = match WebSocketServer::new(scfg) {
+            Ok(s) => Arc::new(s),
+            Err(_) => return RTC_ERR_FAILURE,
+        };
+        let server_id = emplace(RtcObject::WsServer(Arc::clone(&server)));
+        server.set_on_client(move |ws| {
+            let ws_id = emplace(RtcObject::Ws(Arc::new(ws)));
+            install_ws_callbacks(ws_id);
+            let ptr = user_pointer(server_id);
+            dispatch(move || cb(server_id, ws_id, ptr));
+        });
+        server_id
+    })
+}
+
+/// `rtcDeleteWebSocketServer` — stop and unregister a server handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtcDeleteWebSocketServer(wsserver: c_int) -> c_int {
+    guard(|| {
+        let obj = REGISTRY.lock().remove(&wsserver);
+        match obj {
+            Some(RtcObject::WsServer(s)) => {
+                s.stop();
+                USER_POINTERS.lock().remove(&wsserver);
+                RTC_ERR_SUCCESS
+            }
+            Some(other) => {
+                REGISTRY.lock().insert(wsserver, other);
+                RTC_ERR_INVALID
+            }
+            None => RTC_ERR_INVALID,
+        }
+    })
+}
+
+/// `rtcGetWebSocketServerPort` — the (possibly auto-selected) listening port.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtcGetWebSocketServerPort(wsserver: c_int) -> c_int {
+    guard(|| match get_ws_server(wsserver) {
+        Some(s) => s.port() as c_int,
+        None => RTC_ERR_INVALID,
+    })
 }
 
 // ===========================================================================
@@ -2233,13 +2922,21 @@ pub extern "C" fn rtcCleanup() {
             }
             RtcObject::Dc(d) => d.close(),
             RtcObject::Tr(t) => t.close(),
+            RtcObject::Ws(w) => w.close(),
+            RtcObject::WsServer(s) => s.stop(),
         }
     }
     USER_POINTERS.lock().clear();
     PC_SLOTS.lock().clear();
     DC_SLOTS.lock().clear();
+    DC_RECV.lock().clear();
+    DC_OPEN_FIRED.lock().clear();
+    DC_OWNERS.lock().clear();
     TRACK_SLOTS.lock().clear();
     TRACK_OWNERS.lock().clear();
+    WS_SLOTS.lock().clear();
+    WS_RECV.lock().clear();
+    WS_OPEN_FIRED.lock().clear();
     crate::cleanup();
 }
 
@@ -2306,7 +3003,10 @@ mod tests {
         assert_eq!(rtcClosePeerConnection(999_999), RTC_ERR_INVALID);
         assert_eq!(rtcGetDataChannelStream(999_999), RTC_ERR_INVALID);
         assert!(!rtcIsOpen(999_999));
-        assert!(rtcIsClosed(999_999)); // unknown => closed
+        // Upstream wraps getChannel(id)->isClosed(); an unknown id throws and
+        // wrap() returns an error, so rtcIsClosed reports false (capi.cpp:820),
+        // matching capi_connectivity.cpp's rtcIsClosed(666) == false assertion.
+        assert!(!rtcIsClosed(999_999));
     }
 
     #[test]
@@ -2321,7 +3021,10 @@ mod tests {
         let a = rtcCreatePeerConnection(&cfg);
         let cfg2 = loopback_config(&bind);
         let b = rtcCreatePeerConnection(&cfg2);
-        assert!(a > 0 && b > 0 && a != b, "handles must be distinct: {a}, {b}");
+        assert!(
+            a > 0 && b > 0 && a != b,
+            "handles must be distinct: {a}, {b}"
+        );
         let dc = rtcCreateDataChannel(a, CString::new("x").unwrap().as_ptr());
         assert!(dc > 0 && dc != a && dc != b, "dc shares the id space");
         // Targeted teardown only: `rtcCleanup()` would drain the process-global
@@ -2480,7 +3183,10 @@ mod tests {
 
         // Transform helpers use the track clock rate (video: 90 kHz).
         let mut ts: u32 = 0;
-        assert_eq!(rtcTransformSecondsToTimestamp(tr, 1.0, &mut ts), RTC_ERR_SUCCESS);
+        assert_eq!(
+            rtcTransformSecondsToTimestamp(tr, 1.0, &mut ts),
+            RTC_ERR_SUCCESS
+        );
         assert_eq!(ts, 90_000);
         let mut secs: c_double = 0.0;
         assert_eq!(
@@ -2509,9 +3215,13 @@ mod tests {
         assert_eq!(rtcDeleteTrack(tr), RTC_ERR_SUCCESS);
         assert_eq!(rtcDeleteTrack(tr2), RTC_ERR_SUCCESS);
 
-        // WebSocket remains unported.
-        let url = CString::new("ws://localhost").unwrap();
-        assert_eq!(rtcCreateWebSocket(url.as_ptr()), RTC_ERR_NOT_AVAIL);
+        // WebSocket client/server are now wired (full loopback is exercised by
+        // the capi_websocketserver conformance test). Here we just check the
+        // handle-validation edges, which are deterministic without a network.
+        assert_eq!(rtcCreateWebSocket(std::ptr::null()), RTC_ERR_INVALID);
+        assert_eq!(rtcDeleteWebSocket(999_999), RTC_ERR_INVALID);
+        assert_eq!(rtcDeleteWebSocketServer(999_999), RTC_ERR_INVALID);
+        assert_eq!(rtcGetWebSocketServerPort(999_999), RTC_ERR_INVALID);
 
         rtcDeletePeerConnection(pc);
     }
@@ -2554,13 +3264,23 @@ mod tests {
                 c.b_connected.fetch_add(1, Ordering::SeqCst);
             }
         }
-        extern "C" fn on_cand_a(_pc: c_int, cand: *const c_char, mid: *const c_char, ptr: *mut c_void) {
+        extern "C" fn on_cand_a(
+            _pc: c_int,
+            cand: *const c_char,
+            mid: *const c_char,
+            ptr: *mut c_void,
+        ) {
             let c = unsafe { &*(ptr as *const Ctx) };
             let cand = unsafe { CStr::from_ptr(cand) }.to_owned();
             let mid = unsafe { CStr::from_ptr(mid) }.to_owned();
             c.a_cands.lock().push((cand, mid));
         }
-        extern "C" fn on_cand_b(_pc: c_int, cand: *const c_char, mid: *const c_char, ptr: *mut c_void) {
+        extern "C" fn on_cand_b(
+            _pc: c_int,
+            cand: *const c_char,
+            mid: *const c_char,
+            ptr: *mut c_void,
+        ) {
             let c = unsafe { &*(ptr as *const Ctx) };
             let cand = unsafe { CStr::from_ptr(cand) }.to_owned();
             let mid = unsafe { CStr::from_ptr(mid) }.to_owned();
@@ -2589,18 +3309,36 @@ mod tests {
             rtcSetUserPointer(pc_a, ctx_ptr as *mut c_void);
             rtcSetUserPointer(pc_b, ctx_ptr as *mut c_void);
 
-            assert_eq!(rtcSetStateChangeCallback(pc_a, Some(on_state_a)), RTC_ERR_SUCCESS);
-            assert_eq!(rtcSetStateChangeCallback(pc_b, Some(on_state_b)), RTC_ERR_SUCCESS);
-            assert_eq!(rtcSetLocalCandidateCallback(pc_a, Some(on_cand_a)), RTC_ERR_SUCCESS);
-            assert_eq!(rtcSetLocalCandidateCallback(pc_b, Some(on_cand_b)), RTC_ERR_SUCCESS);
-            assert_eq!(rtcSetDataChannelCallback(pc_b, Some(on_dc_b)), RTC_ERR_SUCCESS);
+            assert_eq!(
+                rtcSetStateChangeCallback(pc_a, Some(on_state_a)),
+                RTC_ERR_SUCCESS
+            );
+            assert_eq!(
+                rtcSetStateChangeCallback(pc_b, Some(on_state_b)),
+                RTC_ERR_SUCCESS
+            );
+            assert_eq!(
+                rtcSetLocalCandidateCallback(pc_a, Some(on_cand_a)),
+                RTC_ERR_SUCCESS
+            );
+            assert_eq!(
+                rtcSetLocalCandidateCallback(pc_b, Some(on_cand_b)),
+                RTC_ERR_SUCCESS
+            );
+            assert_eq!(
+                rtcSetDataChannelCallback(pc_b, Some(on_dc_b)),
+                RTC_ERR_SUCCESS
+            );
 
             // A creates the channel.
             let dc_a = rtcCreateDataChannel(pc_a, CString::new("chat").unwrap().as_ptr());
             assert!(dc_a > 0);
 
             // Offer/answer via the C API.
-            assert_eq!(rtcSetLocalDescription(pc_a, std::ptr::null()), RTC_ERR_SUCCESS);
+            assert_eq!(
+                rtcSetLocalDescription(pc_a, std::ptr::null()),
+                RTC_ERR_SUCCESS
+            );
 
             // Wait for A's gathering to complete (candidates collected).
             assert!(
@@ -2619,7 +3357,10 @@ mod tests {
             let needed = rtcGetLocalDescription(pc_a, std::ptr::null_mut(), 0);
             assert!(needed > 0, "A has no local description: {needed}");
             let mut buf = vec![0i8; needed as usize];
-            assert_eq!(rtcGetLocalDescription(pc_a, buf.as_mut_ptr(), needed), needed);
+            assert_eq!(
+                rtcGetLocalDescription(pc_a, buf.as_mut_ptr(), needed),
+                needed
+            );
             let offer = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_owned();
 
             let typ_offer = CString::new("offer").unwrap();
@@ -2644,7 +3385,10 @@ mod tests {
             );
             let needed = rtcGetLocalDescription(pc_b, std::ptr::null_mut(), 0);
             let mut buf = vec![0i8; needed as usize];
-            assert_eq!(rtcGetLocalDescription(pc_b, buf.as_mut_ptr(), needed), needed);
+            assert_eq!(
+                rtcGetLocalDescription(pc_b, buf.as_mut_ptr(), needed),
+                needed
+            );
             let answer = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_owned();
             let typ_answer = CString::new("answer").unwrap();
             assert_eq!(
@@ -2696,7 +3440,11 @@ mod tests {
             // A → B message.
             let payload = b"hello-c-api";
             assert_eq!(
-                rtcSendMessage(dc_a, payload.as_ptr() as *const c_char, payload.len() as c_int),
+                rtcSendMessage(
+                    dc_a,
+                    payload.as_ptr() as *const c_char,
+                    payload.len() as c_int
+                ),
                 RTC_ERR_SUCCESS
             );
             assert!(

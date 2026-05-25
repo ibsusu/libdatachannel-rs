@@ -432,10 +432,7 @@ impl Configuration {
 
     /// Append an ICE server by URL. The configuration is **not** mutated
     /// on parse failure.
-    pub fn add_ice_server(
-        &mut self,
-        url: impl Into<String>,
-    ) -> Result<(), IceServerParseError> {
+    pub fn add_ice_server(&mut self, url: impl Into<String>) -> Result<(), IceServerParseError> {
         let url = url.into();
         let parsed = IceServer::parse(&url)?;
         self.ice_servers.push(parsed);
@@ -764,7 +761,10 @@ mod tests {
 
     #[test]
     fn parse_empty_returns_error() {
-        assert_eq!(IceServer::parse("").unwrap_err(), IceServerParseError::Empty);
+        assert_eq!(
+            IceServer::parse("").unwrap_err(),
+            IceServerParseError::Empty
+        );
         assert_eq!(
             IceServer::parse("   ").unwrap_err(),
             IceServerParseError::Empty

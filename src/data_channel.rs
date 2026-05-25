@@ -49,7 +49,7 @@
 //! Control(50) routes to DCEP handling instead of the application.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 use thiserror::Error;
@@ -171,7 +171,9 @@ pub(crate) enum DcepMessage {
 /// message). Returns [`DataChannelError::Malformed`] on truncated or
 /// unrecognised input.
 pub(crate) fn decode_control(data: &[u8]) -> Result<DcepMessage, DataChannelError> {
-    let first = *data.first().ok_or(DataChannelError::Malformed("empty control message"))?;
+    let first = *data
+        .first()
+        .ok_or(DataChannelError::Malformed("empty control message"))?;
     match first {
         MESSAGE_ACK => Ok(DcepMessage::Ack),
         MESSAGE_OPEN => Ok(DcepMessage::Open(decode_open(data)?)),
@@ -359,6 +361,15 @@ pub(crate) struct DataChannelInner {
     /// User data queued before the channel opened (libdatachannel buffers).
     /// Each entry is `(data, is_binary)`.
     send_queue: Mutex<Vec<(Vec<u8>, bool)>>,
+    /// Mirror of the SCTP transport's per-stream buffered byte count for this
+    /// channel's stream (bytes accepted by `send` but not yet handed to
+    /// usrsctp). Updated by [`trigger_buffered_amount`](Self::trigger_buffered_amount)
+    /// whenever the transport reports a change. Mirrors `Channel::bufferedAmount`.
+    buffered_amount: AtomicUsize,
+    /// Low-water threshold (default 0): `on_buffered_amount_low` fires when the
+    /// buffered amount transitions from above this value to at-or-below it.
+    /// Mirrors `Channel::bufferedAmountLowThreshold`.
+    buffered_amount_low_threshold: AtomicUsize,
     callbacks: Mutex<DataChannelCallbacks>,
 }
 
@@ -382,6 +393,8 @@ impl DataChannel {
                 closed: AtomicBool::new(false),
                 sctp: Mutex::new(None),
                 send_queue: Mutex::new(Vec::new()),
+                buffered_amount: AtomicUsize::new(0),
+                buffered_amount_low_threshold: AtomicUsize::new(0),
                 callbacks: Mutex::new(callbacks),
             }),
         }
@@ -402,6 +415,8 @@ impl DataChannel {
                 closed: AtomicBool::new(false),
                 sctp: Mutex::new(None),
                 send_queue: Mutex::new(Vec::new()),
+                buffered_amount: AtomicUsize::new(0),
+                buffered_amount_low_threshold: AtomicUsize::new(0),
                 callbacks: Mutex::new(DataChannelCallbacks::default()),
             }),
         }
@@ -443,6 +458,13 @@ impl DataChannel {
     /// True once the DCEP handshake completed and user data can flow.
     pub fn is_open(&self) -> bool {
         self.inner.open.load(Ordering::SeqCst) && !self.inner.closed.load(Ordering::SeqCst)
+    }
+
+    /// True once the channel has entered the closed state. Distinct from
+    /// "not open": a still-connecting channel is neither open nor closed,
+    /// matching upstream `Channel::isClosed()`.
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::SeqCst)
     }
 
     /// True for a channel created from an inbound OPEN.
@@ -531,7 +553,11 @@ impl DataChannel {
             .lock()
             .clone()
             .ok_or(DataChannelError::NotOpen)?;
-        let body = encode_open(&self.inner.label, &self.inner.protocol, &self.inner.reliability);
+        let body = encode_open(
+            &self.inner.label,
+            &self.inner.protocol,
+            &self.inner.reliability,
+        );
         let msg = SctpMessage {
             stream: self.inner.stream.load(Ordering::SeqCst),
             ppid: PayloadProtocolId::Control,
@@ -593,11 +619,35 @@ impl DataChannel {
         (cb)(data, binary);
     }
 
-    /// Fire the buffered-amount-low hook (driven by the SCTP transport's
-    /// per-stream low-water callback).
-    pub(crate) fn fire_buffered_amount_low(&self) {
-        let cb = Arc::clone(&self.inner.callbacks.lock().on_buffered_amount_low);
-        (cb)();
+    /// Bytes queued for sending but not yet accepted by the SCTP transport
+    /// (i.e. waiting behind usrsctp backpressure). Mirrors
+    /// `rtc::DataChannel::bufferedAmount`.
+    pub fn buffered_amount(&self) -> usize {
+        self.inner.buffered_amount.load(Ordering::SeqCst)
+    }
+
+    /// Set the low-water threshold for [`on_buffered_amount_low`]. When the
+    /// buffered amount drops from above this value to at-or-below it, the
+    /// callback fires. Defaults to 0. Mirrors
+    /// `rtc::DataChannel::setBufferedAmountLowThreshold`.
+    pub fn set_buffered_amount_low_threshold(&self, amount: usize) {
+        self.inner
+            .buffered_amount_low_threshold
+            .store(amount, Ordering::SeqCst);
+    }
+
+    /// Record a new buffered-amount value reported by the SCTP transport for
+    /// this channel's stream, and fire `on_buffered_amount_low` on the
+    /// high→low transition. Port of `Channel::triggerBufferedAmount`: the
+    /// callback fires only when the previous amount was *above* the threshold
+    /// and the new amount is *at or below* it (edge-triggered, not level).
+    pub(crate) fn trigger_buffered_amount(&self, amount: usize) {
+        let previous = self.inner.buffered_amount.swap(amount, Ordering::SeqCst);
+        let threshold = self.inner.buffered_amount_low_threshold.load(Ordering::SeqCst);
+        if previous > threshold && amount <= threshold {
+            let cb = Arc::clone(&self.inner.callbacks.lock().on_buffered_amount_low);
+            (cb)();
+        }
     }
 
     /// Close the channel (idempotent), firing `on_closed` on the first
@@ -650,7 +700,10 @@ mod tests {
         let mut rel = Reliability::unreliable_retransmits(7);
         rel.unordered = true;
         let encoded = encode_open("v", "", &rel);
-        assert_eq!(encoded[1], CHANNEL_PARTIAL_RELIABLE_REXMIT | CHANNEL_UNORDERED);
+        assert_eq!(
+            encoded[1],
+            CHANNEL_PARTIAL_RELIABLE_REXMIT | CHANNEL_UNORDERED
+        );
 
         let decoded = decode_open(&encoded).expect("decode");
         assert_eq!(decoded.label, "v");
@@ -802,5 +855,62 @@ mod tests {
         assert_eq!(dc.protocol(), "p");
         assert_eq!(dc.stream(), 3);
         assert!(dc.is_incoming());
+    }
+
+    /// Build an outgoing channel whose `on_buffered_amount_low` bumps a shared
+    /// counter, returning both so tests can drive `trigger_buffered_amount`
+    /// and observe firings.
+    fn dc_with_low_counter() -> (DataChannel, Arc<AtomicUsize>) {
+        let fired = Arc::new(AtomicUsize::new(0));
+        let f = Arc::clone(&fired);
+        let callbacks = DataChannelCallbacks {
+            on_buffered_amount_low: Arc::new(move || {
+                f.fetch_add(1, Ordering::SeqCst);
+            }),
+            ..DataChannelCallbacks::default()
+        };
+        let dc = DataChannel::new_outgoing("chat".into(), 0, DataChannelInit::default(), callbacks);
+        (dc, fired)
+    }
+
+    #[test]
+    fn buffered_amount_mirrors_last_reported_value() {
+        let (dc, _) = dc_with_low_counter();
+        assert_eq!(dc.buffered_amount(), 0);
+        dc.trigger_buffered_amount(4096);
+        assert_eq!(dc.buffered_amount(), 4096);
+        dc.trigger_buffered_amount(100);
+        assert_eq!(dc.buffered_amount(), 100);
+    }
+
+    #[test]
+    fn buffered_amount_low_fires_only_on_high_to_low_transition() {
+        let (dc, fired) = dc_with_low_counter();
+        // Default threshold is 0; the callback fires when crossing from
+        // above 0 down to 0 (edge-triggered).
+        dc.trigger_buffered_amount(8192); // 0 -> 8192: rising, no fire
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
+        dc.trigger_buffered_amount(4096); // 8192 -> 4096: still above, no fire
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
+        dc.trigger_buffered_amount(0); // 4096 -> 0: crosses threshold, fires
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        // Already at/below threshold: a repeat 0 must not re-fire.
+        dc.trigger_buffered_amount(0);
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn buffered_amount_low_respects_custom_threshold() {
+        let (dc, fired) = dc_with_low_counter();
+        dc.set_buffered_amount_low_threshold(1024);
+        dc.trigger_buffered_amount(4096); // above threshold
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
+        dc.trigger_buffered_amount(1024); // 4096 -> 1024 (== threshold): fires
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        // Rise back above, then drop to just at/below to fire again.
+        dc.trigger_buffered_amount(2048); // rising past threshold
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        dc.trigger_buffered_amount(512); // 2048 -> 512 (< threshold): fires
+        assert_eq!(fired.load(Ordering::SeqCst), 2);
     }
 }

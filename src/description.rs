@@ -828,7 +828,11 @@ impl Description {
             .iter()
             .map(|m| m.payload_type.to_string())
             .collect();
-        out.push_str(&format!("m={} 9 UDP/TLS/RTP/SAVPF {}", media.kind, pts.join(" ")));
+        out.push_str(&format!(
+            "m={} 9 UDP/TLS/RTP/SAVPF {}",
+            media.kind,
+            pts.join(" ")
+        ));
         out.push_str(eol);
         out.push_str("c=IN IP4 0.0.0.0");
         out.push_str(eol);
@@ -1097,8 +1101,7 @@ fn parse_into(d: &mut Description, sdp: &str) -> Result<(), DescriptionParseErro
                     // Session-level only stored if we don't have one yet
                     // (matches the C++ parser).
                     if d.ice_options.is_empty() {
-                        d.ice_options =
-                            value.split(',').map(|s| s.trim().to_string()).collect();
+                        d.ice_options = value.split(',').map(|s| s.trim().to_string()).collect();
                     }
                     continue;
                 }
@@ -1543,7 +1546,10 @@ t=0 0\r\n\
 a=group:BUNDLE 0 1 2\r\n\
 a=msid-semantic:WMS *\r\n";
         let d = Description::parse(sdp).unwrap();
-        assert_eq!(d.bundle_mids(), &["0".to_string(), "1".to_string(), "2".to_string()]);
+        assert_eq!(
+            d.bundle_mids(),
+            &["0".to_string(), "1".to_string(), "2".to_string()]
+        );
     }
 
     #[test]
@@ -1625,11 +1631,17 @@ a=fmtp:111 minptime=10;useinbandfec=1\r\n";
         assert_eq!(m.rtp_maps()[0].format, "opus");
         assert_eq!(m.rtp_maps()[0].clock_rate, 48000);
         assert_eq!(m.rtp_maps()[0].enc_params.as_deref(), Some("2"));
-        assert_eq!(m.rtp_maps()[0].fmtps, vec!["minptime=10;useinbandfec=1".to_string()]);
+        assert_eq!(
+            m.rtp_maps()[0].fmtps,
+            vec!["minptime=10;useinbandfec=1".to_string()]
+        );
 
         let out = d.to_sdp();
         // The audio block regenerates canonically.
-        assert!(out.contains("m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"), "audio m= missing in output");
+        assert!(
+            out.contains("m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"),
+            "audio m= missing in output"
+        );
         assert!(out.contains("a=mid:audio\r\n"));
         assert!(out.contains("a=rtpmap:111 opus/48000/2\r\n"));
         assert!(out.contains("a=fmtp:111 minptime=10;useinbandfec=1\r\n"));
@@ -1766,7 +1778,11 @@ a=sctp-port:not-a-port\r\n";
         d.hint_type(Type::Offer);
         assert_eq!(d.type_(), Type::Offer);
         d.hint_type(Type::Answer);
-        assert_eq!(d.type_(), Type::Offer, "hint_type must not overwrite a set type");
+        assert_eq!(
+            d.type_(),
+            Type::Offer,
+            "hint_type must not overwrite a set type"
+        );
     }
 
     #[test]

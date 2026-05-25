@@ -64,29 +64,28 @@ use parking_lot::Mutex;
 use thiserror::Error;
 use tracing::warn;
 
+use crate::candidate::Candidate;
 use crate::certificate::{Certificate, CertificateError};
 use crate::configuration::Configuration;
+use crate::data_channel::{
+    DataChannel, DataChannelCallbacks, DataChannelInit, DcepMessage, StreamIdAllocator,
+    decode_control,
+};
+use crate::description::MediaSection;
 use crate::description::{
     Application, Description, DescriptionParseError, Fingerprint, FingerprintAlgorithm, Role,
     Type as DescriptionType,
 };
-use crate::dtls_transport::{
-    DtlsState, DtlsTransport, DtlsTransportCallbacks, DtlsTransportError,
-};
+use crate::dtls_transport::{DtlsState, DtlsTransport, DtlsTransportCallbacks, DtlsTransportError};
 use crate::ice_transport::{
     GatheringState as IceGatheringState, IceTransport, IceTransportCallbacks, IceTransportError,
     State as IceState,
 };
+use crate::media_handler::{MediaHandler, Message, Sender as MediaSender};
+use crate::rtp::RtpHeader;
 use crate::sctp_transport::{
     PayloadProtocolId, SctpMessage, SctpState, SctpTransport, SctpTransportCallbacks,
 };
-use crate::candidate::Candidate;
-use crate::data_channel::{
-    decode_control, DataChannel, DataChannelCallbacks, DataChannelInit, DcepMessage,
-    StreamIdAllocator,
-};
-use crate::description::MediaSection;
-use crate::rtp::RtpHeader;
 use crate::srtp_transport::{SrtpTransport, SrtpTransportCallbacks};
 use crate::track::{Track, TrackCallbacks, TrackInit};
 
@@ -194,6 +193,10 @@ pub struct PeerConnectionCallbacks {
     pub on_state_change: Arc<dyn Fn(PeerConnectionState) + Send + Sync>,
     /// Fires on every [`GatheringState`] transition.
     pub on_gathering_state_change: Arc<dyn Fn(GatheringState) + Send + Sync>,
+    /// Fires on every ICE transport state transition (the underlying
+    /// [`IceState`], before it is folded into the aggregate
+    /// [`PeerConnectionState`]). Mirrors libdatachannel's `onIceStateChange`.
+    pub on_ice_state_change: Arc<dyn Fn(IceState) + Send + Sync>,
     /// Fires on every [`SignalingState`] transition.
     pub on_signaling_state_change: Arc<dyn Fn(SignalingState) + Send + Sync>,
     /// Fires exactly once per negotiation with the local [`Description`] once
@@ -227,6 +230,7 @@ impl Default for PeerConnectionCallbacks {
         PeerConnectionCallbacks {
             on_state_change: Arc::new(|_| {}),
             on_gathering_state_change: Arc::new(|_| {}),
+            on_ice_state_change: Arc::new(|_| {}),
             on_signaling_state_change: Arc::new(|_| {}),
             on_local_description: Arc::new(|_| {}),
             on_local_candidate: Arc::new(|_| {}),
@@ -315,6 +319,14 @@ struct Inner {
     /// inbound RTP can be routed to the right track.
     tracks: Mutex<std::collections::HashMap<String, TrackEntry>>,
 
+    /// The PeerConnection-global media handler, set via
+    /// [`PeerConnection::set_media_handler`]. Mirrors `mMediaHandler` in
+    /// `impl::PeerConnection`: a single handler (which may itself be a chain
+    /// head) applied to all inbound/outbound media, distinct from the
+    /// per-[`Track`] chain. `None` until set; cleared on
+    /// [`close`](PeerConnection::close).
+    media_handler: Mutex<Option<Box<dyn MediaHandler>>>,
+
     /// True once we are the offerer (so we know to advertise actpass and
     /// know whether the local m-line should exist for SCTP).
     closed: AtomicBool,
@@ -384,6 +396,7 @@ impl PeerConnection {
             stream_allocator: Mutex::new(None),
             pending_local_channels: Mutex::new(Vec::new()),
             tracks: Mutex::new(std::collections::HashMap::new()),
+            media_handler: Mutex::new(None),
             closed: AtomicBool::new(false),
         });
         Ok(PeerConnection { inner })
@@ -406,6 +419,17 @@ impl PeerConnection {
         *self.inner.signaling_state.lock()
     }
 
+    /// Whether automatic (re)negotiation is disabled for this connection.
+    ///
+    /// When `false` (the default), the C-API layer mirrors
+    /// `rtc::PeerConnection` by generating an offer when the first data
+    /// channel/track is added and an answer when a remote offer is applied.
+    /// The Rust API itself always negotiates explicitly via
+    /// [`set_local_description`](Self::set_local_description).
+    pub fn disable_auto_negotiation(&self) -> bool {
+        self.inner.config.disable_auto_negotiation
+    }
+
     /// The local SDP, if a local description has been set.
     pub fn local_description(&self) -> Option<Description> {
         self.inner.local_description.lock().clone()
@@ -416,9 +440,66 @@ impl PeerConnection {
         self.inner.remote_description.lock().clone()
     }
 
+    /// The negotiated maximum size for an outgoing message: the smaller of the
+    /// remote peer's advertised `max-message-size` and our local maximum.
+    /// Mirrors `PeerConnection::remoteMaxMessageSize()`. Per RFC 8841 a remote
+    /// value of 0 means "no limit" (so the local max wins); when the remote SDP
+    /// carries no application section or attribute, the 64 KiB remote default
+    /// applies.
+    pub fn remote_max_message_size(&self) -> usize {
+        const DEFAULT_LOCAL_MAX_MESSAGE_SIZE: usize = 256 * 1024;
+        const DEFAULT_REMOTE_MAX_MESSAGE_SIZE: usize = 65536;
+        let local_max = self
+            .inner
+            .config
+            .max_message_size
+            .unwrap_or(DEFAULT_LOCAL_MAX_MESSAGE_SIZE);
+        let mut remote_max = DEFAULT_REMOTE_MAX_MESSAGE_SIZE;
+        if let Some(desc) = self.inner.remote_description.lock().as_ref() {
+            if let Some(app) = desc.application() {
+                if let Some(max) = app.max_message_size() {
+                    remote_max = if max > 0 { max } else { usize::MAX };
+                }
+            }
+        }
+        remote_max.min(local_max)
+    }
+
     /// The local certificate fingerprint (SHA-256) advertised in the SDP.
     pub fn local_fingerprint(&self) -> Fingerprint {
         self.inner.local_fingerprint.clone()
+    }
+
+    /// The selected local socket address (`"ip port"` form), or `None` if no
+    /// candidate pair has been nominated. Mirrors `PeerConnection::localAddress()`.
+    pub fn local_address(&self) -> Option<String> {
+        let ice = self.inner.ice.lock().as_ref().cloned()?;
+        ice.get_selected_addresses().ok().map(|(local, _)| local)
+    }
+
+    /// The selected remote socket address (`"ip port"` form), or `None` if no
+    /// candidate pair has been nominated. Mirrors `PeerConnection::remoteAddress()`.
+    pub fn remote_address(&self) -> Option<String> {
+        let ice = self.inner.ice.lock().as_ref().cloned()?;
+        ice.get_selected_addresses().ok().map(|(_, remote)| remote)
+    }
+
+    /// The selected `(local, remote)` candidate pair, or `None` if no pair has
+    /// been nominated. Mirrors `PeerConnection::getSelectedCandidatePair()`.
+    pub fn selected_candidate_pair(&self) -> Option<(Candidate, Candidate)> {
+        let ice = self.inner.ice.lock().as_ref().cloned()?;
+        ice.get_selected_pair().ok()
+    }
+
+    /// The highest usable SCTP stream id for data channels. Mirrors
+    /// `PeerConnection::maxDataChannelStream()`: the negotiated stream count
+    /// less one, defaulting to `MAX_SCTP_STREAMS_COUNT - 1` (1023) when the
+    /// association has not negotiated a smaller count.
+    pub fn max_data_channel_stream(&self) -> u16 {
+        match self.inner.sctp.lock().as_ref() {
+            Some(sctp) => sctp.max_stream(),
+            None => crate::sctp_transport::MAX_SCTP_STREAMS_COUNT - 1,
+        }
     }
 
     // -- data channels (DCEP, task #18) ---------------------------------------
@@ -427,7 +508,11 @@ impl PeerConnection {
     /// Equivalent to [`create_data_channel_ext`](Self::create_data_channel_ext)
     /// with a default [`DataChannelInit`] and no callbacks.
     pub fn create_data_channel(&self, label: impl Into<String>) -> DataChannel {
-        self.create_data_channel_ext(label, DataChannelInit::default(), DataChannelCallbacks::default())
+        self.create_data_channel_ext(
+            label,
+            DataChannelInit::default(),
+            DataChannelCallbacks::default(),
+        )
     }
 
     /// Create a locally-initiated data channel.
@@ -496,6 +581,26 @@ impl PeerConnection {
         self.inner.data_channels.lock().values().cloned().collect()
     }
 
+    /// Whether the local description should carry an application (SCTP
+    /// data-channel) m-line. Mirrors upstream `populateLocalDescription`,
+    /// which adds it only when data channels exist (offer) or to reciprocate
+    /// a remote application section (answer). A track-only peer with no data
+    /// channels therefore produces a media-only SDP and never starts SCTP.
+    fn wants_application(&self) -> bool {
+        if !self.inner.data_channels.lock().is_empty()
+            || !self.inner.pending_local_channels.lock().is_empty()
+        {
+            return true;
+        }
+        // Reciprocate / preserve a negotiated application section.
+        self.inner
+            .remote_description
+            .lock()
+            .as_ref()
+            .map(|d| d.has_application())
+            .unwrap_or(false)
+    }
+
     /// Current SCTP association state, or [`SctpState::New`] if SCTP hasn't
     /// been created yet.
     fn sctp_state(&self) -> SctpState {
@@ -556,6 +661,27 @@ impl PeerConnection {
             .values()
             .map(|e| Arc::clone(&e.track))
             .collect()
+    }
+
+    /// Install the PeerConnection-global media handler, mirroring
+    /// `rtc::PeerConnection::setMediaHandler`. This handler runs over all
+    /// inbound media (in [`route_inbound_media`](Self::route_inbound_media))
+    /// before per-track routing, and is distinct from the per-[`Track`] chain
+    /// installed with [`Track::chain_media_handler`]. Replaces any previously
+    /// set handler. Pass a [`MediaHandlerChain`](crate::media_handler::MediaHandlerChain)
+    /// (which itself implements [`MediaHandler`]) to install several at once.
+    pub fn set_media_handler(&self, handler: Box<dyn MediaHandler>) {
+        *self.inner.media_handler.lock() = Some(handler);
+    }
+
+    /// Whether a PeerConnection-global media handler is currently set. Mirrors
+    /// `rtc::PeerConnection::getMediaHandler` (which returns the handler
+    /// `shared_ptr`); since [`MediaHandler`] is not clonable we expose its
+    /// presence rather than handing out the boxed trait object, matching how
+    /// [`Track::media_handler_count`] surfaces its chain.
+    #[must_use]
+    pub fn has_media_handler(&self) -> bool {
+        self.inner.media_handler.lock().is_some()
     }
 
     /// True if any media (audio/video) track has been added locally.
@@ -675,10 +801,7 @@ impl PeerConnection {
     /// answerer receiving an offer), the ICE transport is created here with
     /// role `ActPass` so the remote `setup:actpass` resolves us to `active`
     /// (the DTLS client) per RFC 8842.
-    pub fn set_remote_description(
-        &self,
-        desc: Description,
-    ) -> Result<(), PeerConnectionError> {
+    pub fn set_remote_description(&self, desc: Description) -> Result<(), PeerConnectionError> {
         if self.inner.closed.load(Ordering::SeqCst) {
             return Err(PeerConnectionError::Closed);
         }
@@ -758,7 +881,11 @@ impl PeerConnection {
                 };
                 // Pick the first advertised payload type / codec.
                 let (payload_type, ssrc) = (
-                    media.rtp_maps().first().map(|m| m.payload_type).unwrap_or(0),
+                    media
+                        .rtp_maps()
+                        .first()
+                        .map(|m| m.payload_type)
+                        .unwrap_or(0),
                     media.ssrcs().first().map(|s| s.ssrc).unwrap_or(0),
                 );
                 let codec = media
@@ -770,8 +897,9 @@ impl PeerConnection {
                 // The media section WE advertise in the answer mirrors the
                 // offer's payload type / mid but carries OUR (reciprocal)
                 // direction. Build it from the track's own media description.
-                let local_media =
-                    MediaSection::from_track_media(&Track::new(init.clone(), TrackCallbacks::default()).description());
+                let local_media = MediaSection::from_track_media(
+                    &Track::new(init.clone(), TrackCallbacks::default()).description(),
+                );
                 let track = Track::new(init, TrackCallbacks::default());
                 tracks.insert(
                     mid,
@@ -803,10 +931,7 @@ impl PeerConnection {
     }
 
     /// Trickle a remote ICE candidate received out of band.
-    pub fn add_remote_candidate(
-        &self,
-        candidate: &Candidate,
-    ) -> Result<(), PeerConnectionError> {
+    pub fn add_remote_candidate(&self, candidate: &Candidate) -> Result<(), PeerConnectionError> {
         if self.inner.closed.load(Ordering::SeqCst) {
             return Err(PeerConnectionError::Closed);
         }
@@ -847,6 +972,9 @@ impl PeerConnection {
         for entry in self.inner.tracks.lock().values() {
             entry.track.close();
         }
+        // Drop the PC-global media handler (mirrors `setMediaHandler(nullptr)`
+        // in the C++ `close()`).
+        *self.inner.media_handler.lock() = None;
         // Tear down from the top down (SCTP / SRTP → DTLS → ICE), mirroring
         // the C++ `PeerConnection::close()`.
         if let Some(sctp) = self.inner.sctp.lock().take() {
@@ -882,9 +1010,7 @@ impl PeerConnection {
         let pc_gather = self.clone();
         let callbacks = IceTransportCallbacks {
             on_state_change: Arc::new(move |s| pc.on_ice_state(s)),
-            on_gathering_state_change: Arc::new(move |g| {
-                pc_gather.on_ice_gathering_state(g)
-            }),
+            on_gathering_state_change: Arc::new(move |g| pc_gather.on_ice_gathering_state(g)),
             on_candidate: Arc::new(move |c| {
                 // The driver populates the local credentials before firing
                 // candidate callbacks, so this is the earliest reliable
@@ -931,23 +1057,21 @@ impl PeerConnection {
         };
         // Pin our certificate fingerprint.
         desc.set_fingerprint(self.inner.local_fingerprint.clone());
-        // Ensure an application m-line so SCTP comes up. Reuse the mid ICE
-        // already stamped (defaults to "0"); set the standard SCTP port.
-        let mid = desc
-            .application()
-            .map(|a| a.mid().to_string())
-            .unwrap_or_else(|| "0".to_string());
-        let mut app = Application::new(mid);
-        // Standard data-channel SCTP port (the SCTP transport's
-        // DEFAULT_SCTP_PORT; kept private there, so spell it out here).
-        app.set_sctp_port(5000);
-        app.set_max_message_size(
-            self.inner
-                .config
-                .max_message_size
-                .unwrap_or(256 * 1024),
-        );
-        desc.set_application(app);
+        // Add an application m-line so SCTP comes up — but only when data
+        // channels exist / are negotiated. Reuse the mid ICE already stamped
+        // (defaults to "0"); set the standard SCTP port.
+        if self.wants_application() {
+            let mid = desc
+                .application()
+                .map(|a| a.mid().to_string())
+                .unwrap_or_else(|| "0".to_string());
+            let mut app = Application::new(mid);
+            // Standard data-channel SCTP port (the SCTP transport's
+            // DEFAULT_SCTP_PORT; kept private there, so spell it out here).
+            app.set_sctp_port(5000);
+            app.set_max_message_size(self.inner.config.max_message_size.unwrap_or(256 * 1024));
+            desc.set_application(app);
+        }
         self.apply_local_media(&mut desc);
         desc.hint_type(typ);
         Ok(desc)
@@ -986,14 +1110,16 @@ impl PeerConnection {
         };
         let mut desc = fresh;
         desc.set_fingerprint(self.inner.local_fingerprint.clone());
-        let mid = desc
-            .application()
-            .map(|a| a.mid().to_string())
-            .unwrap_or_else(|| "0".to_string());
-        let mut app = Application::new(mid);
-        app.set_sctp_port(5000);
-        app.set_max_message_size(self.inner.config.max_message_size.unwrap_or(256 * 1024));
-        desc.set_application(app);
+        if self.wants_application() {
+            let mid = desc
+                .application()
+                .map(|a| a.mid().to_string())
+                .unwrap_or_else(|| "0".to_string());
+            let mut app = Application::new(mid);
+            app.set_sctp_port(5000);
+            app.set_max_message_size(self.inner.config.max_message_size.unwrap_or(256 * 1024));
+            desc.set_application(app);
+        }
         self.apply_local_media(&mut desc);
         desc.hint_type(typ);
         *self.inner.local_description.lock() = Some(desc.clone());
@@ -1064,6 +1190,15 @@ impl PeerConnection {
         if self.inner.closed.load(Ordering::SeqCst) {
             return;
         }
+        // Surface the raw ICE state to observers before folding it into the
+        // aggregate PeerConnectionState (mirrors libdatachannel's separate
+        // onIceStateChange hook). Clone the callback out of the lock so we
+        // don't hold the callbacks mutex across the user callback.
+        let ice_cb = {
+            let g = self.inner.callbacks.lock();
+            Arc::clone(&g.on_ice_state_change)
+        };
+        (ice_cb)(s);
         match s {
             IceState::Checking => {
                 self.change_state(PeerConnectionState::Connecting);
@@ -1251,8 +1386,7 @@ impl PeerConnection {
         std::thread::Builder::new()
             .name("pc-open-tracks".into())
             .spawn(move || {
-                let deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
                 loop {
                     let ready = pc
                         .inner
@@ -1269,7 +1403,8 @@ impl PeerConnection {
                         }
                         return;
                     }
-                    if std::time::Instant::now() >= deadline || pc.inner.closed.load(Ordering::SeqCst)
+                    if std::time::Instant::now() >= deadline
+                        || pc.inner.closed.load(Ordering::SeqCst)
                     {
                         return;
                     }
@@ -1288,6 +1423,44 @@ impl PeerConnection {
         if self.inner.closed.load(Ordering::SeqCst) {
             return;
         }
+        // PC-global media handler, mirroring `impl::PeerConnection::forwardMedia`:
+        // run the handler's incoming transform over the packet, flush any
+        // control replies it queues (RR/REMB/PLI/NACK) back through the SRTP
+        // transport, then dispatch the (possibly rewritten) messages to the
+        // per-track routing below. With no handler set, the raw packet is
+        // dispatched unchanged — the prior behaviour.
+        let transformed: Option<Vec<Message>> = {
+            let mut guard = self.inner.media_handler.lock();
+            guard.as_mut().map(|handler| {
+                let mut messages = vec![Message::classify(pkt.to_vec())];
+                let mut sender = MediaSender::new();
+                handler.incoming(&mut messages, &mut sender);
+                let replies = sender.take();
+                if !replies.is_empty() {
+                    if let Some(srtp) = self.inner.srtp.lock().as_ref() {
+                        for reply in replies {
+                            let _ = srtp.send_media(reply.data);
+                        }
+                    }
+                }
+                messages
+            })
+        };
+        if let Some(messages) = transformed {
+            for m in messages {
+                self.dispatch_inbound_media(&m.data);
+            }
+        } else {
+            self.dispatch_inbound_media(pkt);
+        }
+    }
+
+    /// Route a single (SRTP-unprotected, PC-handler-transformed) RTP/RTCP
+    /// packet to the track bound to its SSRC. Split out of
+    /// [`route_inbound_media`](Self::route_inbound_media) so the PC-global
+    /// media handler can rewrite/expand the inbound packet into zero or more
+    /// messages before per-track dispatch.
+    fn dispatch_inbound_media(&self, pkt: &[u8]) {
         // Try SSRC-based routing for RTP.
         if let Some((header, _)) = RtpHeader::parse(pkt) {
             let ssrc = header.ssrc;
@@ -1431,9 +1604,9 @@ impl PeerConnection {
         let sctp_cbs = SctpTransportCallbacks {
             on_state_change: Arc::new(move |s| pc.on_sctp_state(s)),
             on_message: Arc::new(move |m| pc_msg.on_sctp_message(m)),
-            on_buffered_amount_low: Arc::new(move |stream| {
+            on_buffered_amount_low: Arc::new(move |stream, amount| {
                 if let Some(dc) = pc_low.inner.data_channels.lock().get(&stream) {
-                    dc.fire_buffered_amount_low();
+                    dc.trigger_buffered_amount(amount);
                 }
             }),
         };
@@ -1762,16 +1935,65 @@ mod tests {
     }
 
     #[test]
+    fn remote_max_message_size_reflects_remote_sdp() {
+        // A minimal remote offer carrying an application section. The
+        // max-message-size attribute is what `remote_max_message_size` reads.
+        const REMOTE_SDP: &str = "v=0\r\n\
+o=rtc 3767197920 0 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=group:BUNDLE 0\r\n\
+a=msid-semantic:WMS *\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 0F:74:31:25:CB:A2:13:EC:28:6F:6D:2C:61:FF:5D:C2:BC:B9:DB:3D:98:14:8D:1A:BB:EA:33:0C:A4:60:A8:8E\r\n\
+m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=mid:0\r\n\
+a=sendrecv\r\n\
+a=setup:actpass\r\n\
+a=ice-ufrag:ufrag\r\n\
+a=ice-pwd:password1234567890123456\r\n\
+a=fingerprint:sha-256 0F:74:31:25:CB:A2:13:EC:28:6F:6D:2C:61:FF:5D:C2:BC:B9:DB:3D:98:14:8D:1A:BB:EA:33:0C:A4:60:A8:8E\r\n\
+a=sctp-port:5000\r\n\
+a=max-message-size:262144\r\n";
+
+        let pc = PeerConnection::new(loopback_config(), PeerConnectionCallbacks::default())
+            .expect("construct");
+        // No remote description: the 64 KiB remote default, min'd with the
+        // 256 KiB local default → 64 KiB.
+        assert_eq!(pc.remote_max_message_size(), 65536);
+
+        // Remote advertises 256 KiB: min(262144, 262144) = 262144. Inject the
+        // parsed description directly to avoid the full transport handshake.
+        let desc = Description::parse(REMOTE_SDP).expect("parse remote");
+        *pc.inner.remote_description.lock() = Some(desc);
+        assert_eq!(pc.remote_max_message_size(), 262_144);
+
+        // RFC 8841: a remote max-message-size of 0 means "no limit", so the
+        // local maximum (256 KiB) wins.
+        let sdp0 = REMOTE_SDP.replace("a=max-message-size:262144", "a=max-message-size:0");
+        let desc0 = Description::parse(&sdp0).expect("parse remote 0");
+        *pc.inner.remote_description.lock() = Some(desc0);
+        assert_eq!(pc.remote_max_message_size(), 256 * 1024);
+    }
+
+    #[test]
     fn create_offer_emits_application_and_fingerprint() {
         rt().block_on(async {
             let pc = PeerConnection::new(loopback_config(), PeerConnectionCallbacks::default())
                 .expect("construct");
-            // The synchronously-returned offer carries the static bits
+            // The application m-line is gated on having a data channel (mirrors
+            // upstream `populateLocalDescription`), so register one first; the
+            // synchronously-returned offer then carries the static bits
             // (application m-line, actpass setup, fingerprint, sctp-port).
+            let _dc = pc.create_data_channel("chat");
             let offer = pc.create_offer().expect("offer");
             let sdp = offer.to_sdp();
             assert!(sdp.contains("m=application 9 UDP/DTLS/SCTP webrtc-datachannel"));
-            assert!(sdp.contains("a=setup:actpass"), "offer must advertise actpass");
+            assert!(
+                sdp.contains("a=setup:actpass"),
+                "offer must advertise actpass"
+            );
             assert!(sdp.contains("a=fingerprint:sha-256 "));
             assert!(sdp.contains("a=sctp-port:5000"));
 
@@ -1802,7 +2024,8 @@ mod tests {
         rt().block_on(async {
             let pc = PeerConnection::new(loopback_config(), PeerConnectionCallbacks::default())
                 .expect("construct");
-            pc.set_local_description(DescriptionType::Offer).expect("set local");
+            pc.set_local_description(DescriptionType::Offer)
+                .expect("set local");
             assert_eq!(pc.signaling_state(), SignalingState::HaveLocalOffer);
             assert!(pc.local_description().is_some());
         });
@@ -1904,6 +2127,43 @@ mod tests {
         });
     }
 
+    #[test]
+    fn pc_media_handler_set_runs_on_inbound_and_clears_on_close() {
+        // A handler that records how many inbound messages it is handed.
+        struct Counting(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl MediaHandler for Counting {
+            fn incoming(&mut self, messages: &mut Vec<Message>, _sender: &mut MediaSender) {
+                self.0
+                    .fetch_add(messages.len(), std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        rt().block_on(async {
+            let pc = PeerConnection::new(loopback_config(), PeerConnectionCallbacks::default())
+                .expect("construct");
+            assert!(!pc.has_media_handler(), "no handler before set");
+
+            let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            pc.set_media_handler(Box::new(Counting(seen.clone())));
+            assert!(pc.has_media_handler(), "handler present after set");
+
+            // Drive a packet through the inbound media path. The PC-global
+            // handler must see it even with no tracks bound (per-track routing
+            // is then a no-op). Bytes are a minimal RTP-shaped header.
+            let pkt = [0x80u8, 0x60, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+            pc.route_inbound_media(&pkt);
+            assert_eq!(
+                seen.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "PC media handler saw the inbound packet"
+            );
+
+            // close() clears the handler (mirrors setMediaHandler(nullptr)).
+            pc.close().expect("close");
+            assert!(!pc.has_media_handler(), "handler cleared on close");
+        });
+    }
+
     /// The gold-star integration test: two PeerConnections on loopback wire
     /// their `on_local_candidate` to each other, exchange offer/answer
     /// through the PUBLIC API, and both reach `Connected` — i.e. the
@@ -1956,11 +2216,7 @@ mod tests {
             // we read the *refreshed* local description (not the synchronous
             // return value) once gathering completes.
             assert!(
-                wait_for(
-                    || pc_a.gathering_state() == GatheringState::Complete,
-                    3000
-                )
-                .await,
+                wait_for(|| pc_a.gathering_state() == GatheringState::Complete, 3000).await,
                 "A never finished gathering"
             );
             let offer = pc_a.local_description().expect("a local description");
@@ -1971,15 +2227,12 @@ mod tests {
             );
 
             // --- B applies A's offer, then creates + sets its answer ---
-            pc_b.set_remote_description(offer).expect("b set remote offer");
+            pc_b.set_remote_description(offer)
+                .expect("b set remote offer");
             pc_b.set_local_description(DescriptionType::Answer)
                 .expect("b set local answer");
             assert!(
-                wait_for(
-                    || pc_b.gathering_state() == GatheringState::Complete,
-                    3000
-                )
-                .await,
+                wait_for(|| pc_b.gathering_state() == GatheringState::Complete, 3000).await,
                 "B never finished gathering"
             );
             let answer = pc_b.local_description().expect("b local description");
@@ -1990,7 +2243,8 @@ mod tests {
             );
 
             // --- A applies B's answer ---
-            pc_a.set_remote_description(answer).expect("a set remote answer");
+            pc_a.set_remote_description(answer)
+                .expect("a set remote answer");
 
             // --- Trickle candidates both ways via the public API ---
             for c in a_cands.lock().iter() {
@@ -2098,7 +2352,8 @@ mod tests {
             );
             let offer = pc_a.local_description().expect("a local description");
 
-            pc_b.set_remote_description(offer).expect("b set remote offer");
+            pc_b.set_remote_description(offer)
+                .expect("b set remote offer");
             pc_b.set_local_description(DescriptionType::Answer)
                 .expect("b set local answer");
             assert!(
@@ -2106,7 +2361,8 @@ mod tests {
                 "B never finished gathering"
             );
             let answer = pc_b.local_description().expect("b local description");
-            pc_a.set_remote_description(answer).expect("a set remote answer");
+            pc_a.set_remote_description(answer)
+                .expect("a set remote answer");
 
             for c in a_cands.lock().iter() {
                 let _ = pc_b.add_remote_candidate(c);
@@ -2142,8 +2398,16 @@ mod tests {
             // RFC 8832 §6: A is the offerer → DTLS server (passive) → odd id;
             // B is the answerer → DTLS client (active) → even id. A created
             // the channel, so it carries A's (odd) parity on both ends.
-            assert_eq!(dc_b.stream() % 2, 1, "A's channel id must be odd (A is DTLS server)");
-            assert_eq!(dc_a.stream(), dc_b.stream(), "both ends share the stream id");
+            assert_eq!(
+                dc_b.stream() % 2,
+                1,
+                "A's channel id must be odd (A is DTLS server)"
+            );
+            assert_eq!(
+                dc_a.stream(),
+                dc_b.stream(),
+                "both ends share the stream id"
+            );
 
             // A's channel opens once the ACK arrives.
             assert!(
@@ -2198,13 +2462,22 @@ mod tests {
             );
             let offer = pc.local_description().expect("local description");
             let sdp = offer.to_sdp();
-            assert!(sdp.contains("m=video 9 UDP/TLS/RTP/SAVPF 96"), "offer lacks m=video:\n{sdp}");
+            assert!(
+                sdp.contains("m=video 9 UDP/TLS/RTP/SAVPF 96"),
+                "offer lacks m=video:\n{sdp}"
+            );
             assert!(sdp.contains("a=mid:video0"));
             assert!(sdp.contains("a=rtpmap:96 H264/90000"));
-            assert!(sdp.contains("a=ice-ufrag:"), "m-line offer lacks ICE creds:\n{sdp}");
+            assert!(
+                sdp.contains("a=ice-ufrag:"),
+                "m-line offer lacks ICE creds:\n{sdp}"
+            );
             assert!(sdp.contains("a=ice-pwd:"));
             assert!(offer.has_media());
-            assert_eq!(offer.media_by_mid("video0").unwrap().rtp_maps()[0].payload_type, 96);
+            assert_eq!(
+                offer.media_by_mid("video0").unwrap().rtp_maps()[0].payload_type,
+                96
+            );
         });
     }
 
@@ -2275,9 +2548,13 @@ mod tests {
                 "A never finished gathering"
             );
             let offer = pc_a.local_description().expect("a local description");
-            assert!(offer.to_sdp().contains("m=video"), "offer must carry m=video");
+            assert!(
+                offer.to_sdp().contains("m=video"),
+                "offer must carry m=video"
+            );
 
-            pc_b.set_remote_description(offer).expect("b set remote offer");
+            pc_b.set_remote_description(offer)
+                .expect("b set remote offer");
             pc_b.set_local_description(DescriptionType::Answer)
                 .expect("b set local answer");
             assert!(
@@ -2285,8 +2562,12 @@ mod tests {
                 "B never finished gathering"
             );
             let answer = pc_b.local_description().expect("b local description");
-            assert!(answer.to_sdp().contains("m=video"), "answer must echo m=video");
-            pc_a.set_remote_description(answer).expect("a set remote answer");
+            assert!(
+                answer.to_sdp().contains("m=video"),
+                "answer must echo m=video"
+            );
+            pc_a.set_remote_description(answer)
+                .expect("a set remote answer");
 
             // B surfaces the remote track immediately on applying the offer.
             assert!(
