@@ -36,15 +36,16 @@
 //! (simultaneous open) regardless of the DTLS client/server role, so
 //! there is no listen/accept path.
 
-use std::collections::HashSet;
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU8, Ordering},
-    mpsc::{Receiver, Sender},
-    Arc, Mutex as StdMutex, Once,
+    Arc, Mutex as StdMutex, Once, Weak,
+    atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
-use std::thread::JoinHandle;
 
+use crossbeam_channel::{Receiver as WorkReceiver, Sender as WorkSender};
+use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use thiserror::Error;
 use tracing::{trace, warn};
@@ -78,6 +79,11 @@ const SOL_SOCKET_LINUX: i32 = 1; // Linux SOL_SOCKET
 // first setsockopt (SO_LINGER) and dropped the association into Failed.
 const SO_LINGER: i32 = 0x0080; // macOS/BSD SO_LINGER
 const SO_LINGER_LINUX: i32 = 13; // Linux SO_LINGER
+// SO_SNDBUF / SO_RCVBUF carry the host value for the same reason as SO_LINGER.
+const SO_SNDBUF: i32 = 0x1001; // macOS/BSD SO_SNDBUF
+const SO_RCVBUF: i32 = 0x1002; // macOS/BSD SO_RCVBUF
+const SO_SNDBUF_LINUX: i32 = 7; // Linux SO_SNDBUF
+const SO_RCVBUF_LINUX: i32 = 8; // Linux SO_RCVBUF
 
 // IPPROTO_SCTP socket options.
 const SCTP_NODELAY: i32 = 0x04;
@@ -144,7 +150,7 @@ const SCTP_SHUTDOWN_COMP: u16 = 0x0004;
 const SCTP_STREAM_RESET_OUTGOING: u16 = 0x01;
 
 // usrsctp tuning.
-const MAX_SCTP_STREAMS_COUNT: u16 = 1024;
+pub(crate) const MAX_SCTP_STREAMS_COUNT: u16 = 1024;
 const DEFAULT_LOCAL_MAX_MESSAGE_SIZE: usize = 256 * 1024;
 
 // shutdown how.
@@ -179,6 +185,28 @@ fn so_linger() -> i32 {
         SO_LINGER_LINUX
     } else {
         SO_LINGER
+    }
+}
+
+/// Resolve the platform `SO_SNDBUF` option name. Same host-numbering rationale
+/// as [`so_linger`]: 0x1001 on macOS/BSD vs 7 on Linux.
+#[inline]
+fn so_sndbuf() -> i32 {
+    if cfg!(target_os = "linux") || cfg!(target_os = "android") {
+        SO_SNDBUF_LINUX
+    } else {
+        SO_SNDBUF
+    }
+}
+
+/// Resolve the platform `SO_RCVBUF` option name. 0x1002 on macOS/BSD vs 8 on
+/// Linux.
+#[inline]
+fn so_rcvbuf() -> i32 {
+    if cfg!(target_os = "linux") || cfg!(target_os = "android") {
+        SO_RCVBUF_LINUX
+    } else {
+        SO_RCVBUF
     }
 }
 
@@ -242,6 +270,17 @@ fn usrsctp_global_init() {
             sys::usrsctp_sysctl_set_sctp_pr_enable(1); // PR-SCTP (RFC 3758)
             sys::usrsctp_sysctl_set_sctp_ecn_enable(0); // no ECN
             sys::usrsctp_enable_crc32c_offload(); // we CRC outgoing ourselves
+
+            // Throughput tuning, matching C++ SctpTransport::SetSettings.
+            // usrsctp's default send/recv windows are 256 KiB, too small for
+            // realistic RTTs; raise to 1 MiB so cwnd can grow. The cwnd/burst
+            // knobs (RFC 6928 IW10) also matter on low-RTT links where
+            // slow-start otherwise throttles the steady-state rate.
+            sys::usrsctp_sysctl_set_sctp_recvspace(1024 * 1024); // 1 MiB recv window
+            sys::usrsctp_sysctl_set_sctp_sendspace(1024 * 1024); // 1 MiB send window
+            sys::usrsctp_sysctl_set_sctp_max_chunks_on_queue(10 * 1024); // 10K chunks
+            sys::usrsctp_sysctl_set_sctp_initial_cwnd(10); // 10 MTUs (RFC 6928)
+            sys::usrsctp_sysctl_set_sctp_max_burst_default(10); // 10 MTUs
         }
         *INSTANCES.lock().unwrap() = Some(HashSet::new());
     });
@@ -361,10 +400,11 @@ pub struct SctpTransportCallbacks {
     pub on_state_change: Arc<dyn Fn(SctpState) + Send + Sync>,
     /// Fires for each inbound reassembled message.
     pub on_message: Arc<dyn Fn(SctpMessage) + Send + Sync>,
-    /// Fires when the buffered amount on a stream drops below the low
-    /// threshold (used by DataChannel backpressure later). The argument is
-    /// the stream id. Mirrors the C++ `amount_callback`.
-    pub on_buffered_amount_low: Arc<dyn Fn(u16) + Send + Sync>,
+    /// Fires whenever the buffered byte count on a stream changes. The
+    /// arguments are `(stream_id, new_amount)`. The DataChannel layer applies
+    /// the edge-triggered low-water rule. Mirrors the C++ `amount_callback`
+    /// (`mBufferedAmountCallback(streamId, amount)`).
+    pub on_buffered_amount_low: Arc<dyn Fn(u16, usize) + Send + Sync>,
 }
 
 impl Default for SctpTransportCallbacks {
@@ -372,7 +412,7 @@ impl Default for SctpTransportCallbacks {
         SctpTransportCallbacks {
             on_state_change: Arc::new(|_| {}),
             on_message: Arc::new(|_| {}),
-            on_buffered_amount_low: Arc::new(|_| {}),
+            on_buffered_amount_low: Arc::new(|_, _| {}),
         }
     }
 }
@@ -422,14 +462,38 @@ struct Inner {
 // transport through the global instances set, not through this pointer.
 unsafe impl Send for Inner {}
 
-/// Work items handed to the per-transport worker thread.
+/// A message parked in the userspace send queue because usrsctp returned
+/// `EWOULDBLOCK` (its send buffer was full). Retried by
+/// [`SctpTransport::flush`] on `SCTP_SENDER_DRY_EVENT` and ahead of every
+/// subsequent [`send`](SctpTransport::send).
+struct QueuedMessage {
+    msg: SctpMessage,
+    reliability: Reliability,
+}
+
+/// Outbound buffering state, guarding both the userspace send queue and the
+/// per-stream buffered-byte map under a single mutex. Mirrors libdatachannel's
+/// `mSendQueue` + `mBufferedAmount` (both protected by its `mSendMutex`).
+///
+/// The mutex serialises `send` (application thread) against `flush`
+/// (`SCTP_SENDER_DRY_EVENT`, worker thread), preserving strict FIFO send order
+/// and keeping the buffered-amount map consistent.
+#[derive(Default)]
+struct SendState {
+    /// FIFO of messages awaiting usrsctp send-buffer space.
+    queue: VecDeque<QueuedMessage>,
+    /// Per-stream count of bytes queued but not yet accepted by usrsctp.
+    buffered_amount: HashMap<u16, usize>,
+}
+
+/// Work items handed to a shared SCTP worker thread.
 ///
 /// Both `Connect` and `Inbound` ultimately call usrsctp functions that can
 /// synchronously emit outbound SCTP packets through `write_cb` → `dtls.send()`.
 /// `dtls.send()` takes the DTLS inner mutex, and the DTLS state-change /
 /// on_data callbacks fire that very lock held. Running these on the DTLS
 /// callback thread would therefore self-deadlock (parking_lot mutexes are not
-/// reentrant). The worker thread breaks that reentrancy: the DTLS hooks only
+/// reentrant). A pool worker breaks that reentrancy: the DTLS hooks only
 /// enqueue, and the usrsctp work runs after the DTLS lock is released. This
 /// mirrors libdatachannel doing its usrsctp work off its own processing thread.
 enum SctpCommand {
@@ -437,6 +501,81 @@ enum SctpCommand {
     Connect,
     /// Decrypted DTLS record to feed into `usrsctp_conninput`.
     Inbound(Vec<u8>),
+}
+
+/// A unit of usrsctp work routed to a pool worker. Carries a [`Weak`] so a
+/// queued item never keeps its transport alive; the worker upgrades it only
+/// for the duration of processing.
+struct WorkItem {
+    transport: Weak<SctpTransport>,
+    cmd: SctpCommand,
+}
+
+/// Shared pool of SCTP worker threads.
+///
+/// usrsctp is a process-global singleton serializing on its own lock, so the
+/// old one-OS-thread-per-`SctpTransport` model bought no real parallelism — it
+/// only capped a process at ~1k connections (one thread each). This pool fixes
+/// the thread count at a small N and routes each transport to **one** worker
+/// (round-robin affinity, see [`assign`](SctpWorkerPool::assign)). Affinity is
+/// load-bearing: a transport's `Connect` must run before its first `Inbound`,
+/// and `usrsctp_conninput` calls must stay in order — a single owning worker
+/// per association guarantees both (crossbeam channels are FIFO). Work-stealing
+/// would reorder them.
+struct SctpWorkerPool {
+    senders: Vec<WorkSender<WorkItem>>,
+    next: AtomicUsize,
+}
+
+/// Number of shared SCTP worker threads. usrsctp serializes internally, so a
+/// handful is plenty; clamp to keep the dispatch concurrency bounded.
+fn pool_size() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(2, 8)
+}
+
+impl SctpWorkerPool {
+    fn new() -> Self {
+        let n = pool_size();
+        let mut senders = Vec::with_capacity(n);
+        for i in 0..n {
+            let (tx, rx) = crossbeam_channel::unbounded::<WorkItem>();
+            senders.push(tx);
+            std::thread::Builder::new()
+                .name(format!("sctp-pool-{i}"))
+                .spawn(move || pool_worker_loop(rx))
+                .expect("spawn sctp pool worker thread");
+        }
+        SctpWorkerPool {
+            senders,
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    /// Assign a transport to a worker (round-robin). The transport stores the
+    /// returned sender for its lifetime, so all of its work lands on the same
+    /// worker — preserving per-association ordering.
+    fn assign(&self) -> WorkSender<WorkItem> {
+        let i = self.next.fetch_add(1, Ordering::Relaxed) % self.senders.len();
+        self.senders[i].clone()
+    }
+}
+
+/// Process-global SCTP worker pool, spun up on first transport construction.
+/// The worker threads live for the rest of the process — they own only `Weak`
+/// references and idle on `recv` when there is no work.
+static WORKER_POOL: Lazy<SctpWorkerPool> = Lazy::new(SctpWorkerPool::new);
+
+thread_local! {
+    /// The transport pointer a pool worker is *currently* processing, or 0.
+    /// [`SctpTransport::close`] consults this to detect re-entrancy: a user
+    /// callback firing from inside `conninput`/the upcall may call `close` on
+    /// the worker thread itself, which already holds that transport's
+    /// `proc_lock`. Re-acquiring a non-reentrant `parking_lot::Mutex` would
+    /// deadlock, so close skips its barrier in that case.
+    static PROCESSING: Cell<usize> = const { Cell::new(0) };
 }
 
 /// The SCTP transport. Cheap to clone via the surrounding `Arc<Self>`,
@@ -457,19 +596,24 @@ pub struct SctpTransport {
     started: AtomicBool,
     /// Application-installed callbacks.
     callbacks: Mutex<SctpTransportCallbacks>,
+    /// Userspace send queue + per-stream buffered-amount map (the
+    /// backpressure machinery; see [`SendState`]).
+    send_state: Mutex<SendState>,
     /// Local SCTP port (RFC 8831 §6.2: always 5000).
     local_port: u16,
     /// Remote SCTP port (always 5000).
     remote_port: u16,
     /// Maximum inbound/outbound message size.
     max_message_size: usize,
-    /// Sender side of the worker command channel. `connect`/`feed_inbound`
-    /// enqueue here; the worker thread executes the usrsctp calls. `None`
-    /// only transiently during construction. Dropping the sender (in
-    /// `close`/`Drop`) makes the worker's `recv` return `Err` and exit.
-    tx: StdMutex<Option<Sender<SctpCommand>>>,
-    /// Worker thread handle, joined on `close`/`Drop`.
-    worker: StdMutex<Option<JoinHandle<()>>>,
+    /// Sender into this transport's assigned pool worker (round-robin
+    /// affinity, set at construction). `connect`/`feed_inbound` enqueue here.
+    /// Set to `None` by `close` so no further work is queued.
+    tx: StdMutex<Option<WorkSender<WorkItem>>>,
+    /// Held by a pool worker for the duration of each usrsctp call on this
+    /// transport. `close` acquires it as a barrier so the socket is freed only
+    /// after any in-flight worker call completes (replaces the old
+    /// join-the-worker step). See [`PROCESSING`] for the re-entrancy escape.
+    proc_lock: Mutex<()>,
 }
 
 impl std::fmt::Debug for SctpTransport {
@@ -496,13 +640,12 @@ impl SctpTransport {
     /// Returns the handle in [`SctpState::New`]; call
     /// [`connect`](Self::connect) (or let the auto-connect hook fire) to
     /// begin the association.
-    pub fn new(
-        dtls: Arc<DtlsTransport>,
-        callbacks: SctpTransportCallbacks,
-    ) -> Arc<Self> {
+    pub fn new(dtls: Arc<DtlsTransport>, callbacks: SctpTransportCallbacks) -> Arc<Self> {
         usrsctp_global_init();
 
-        let (tx, rx) = std::sync::mpsc::channel::<SctpCommand>();
+        // Route all of this transport's work to one shared pool worker
+        // (round-robin affinity preserves Connect-before-Inbound ordering).
+        let tx = WORKER_POOL.assign();
 
         let transport = Arc::new(SctpTransport {
             dtls: Arc::clone(&dtls),
@@ -515,24 +658,13 @@ impl SctpTransport {
             closed: AtomicBool::new(false),
             started: AtomicBool::new(false),
             callbacks: Mutex::new(callbacks),
+            send_state: Mutex::new(SendState::default()),
             local_port: DEFAULT_SCTP_PORT,
             remote_port: DEFAULT_SCTP_PORT,
             max_message_size: DEFAULT_LOCAL_MAX_MESSAGE_SIZE,
             tx: StdMutex::new(Some(tx)),
-            worker: StdMutex::new(None),
+            proc_lock: Mutex::new(()),
         });
-
-        // Spawn the worker thread. It holds a weak ref so it never keeps the
-        // transport alive; it exits when the command channel's sender is
-        // dropped (close/Drop) or the transport is gone.
-        {
-            let weak = Arc::downgrade(&transport);
-            let handle = std::thread::Builder::new()
-                .name("sctp-worker".into())
-                .spawn(move || worker_loop(weak, rx))
-                .expect("spawn sctp worker thread");
-            *transport.worker.lock().unwrap() = Some(handle);
-        }
 
         // Install our recv shim + auto-connect hook on the DTLS transport.
         // Snapshot the existing DTLS callbacks and chain them so the
@@ -582,15 +714,19 @@ impl SctpTransport {
         transport
     }
 
-    /// Hand a command to the worker thread. Silently drops the command if the
-    /// channel is gone (transport closing/closed), which is the desired
-    /// teardown behavior.
-    fn enqueue(&self, cmd: SctpCommand) {
+    /// Hand a command to this transport's pool worker. Silently drops the
+    /// command if the transport is closing/closed, which is the desired
+    /// teardown behavior. Carries a `Weak` so a queued item never keeps the
+    /// transport alive.
+    fn enqueue(self: &Arc<Self>, cmd: SctpCommand) {
         if self.closed.load(Ordering::SeqCst) {
             return;
         }
         if let Some(tx) = self.tx.lock().unwrap().as_ref() {
-            let _ = tx.send(cmd);
+            let _ = tx.send(WorkItem {
+                transport: Arc::downgrade(self),
+                cmd,
+            });
         }
     }
 
@@ -607,6 +743,13 @@ impl SctpTransport {
     /// Remote SCTP port (always 5000 in WebRTC).
     pub fn remote_port(&self) -> u16 {
         self.remote_port
+    }
+
+    /// Highest usable SCTP stream id (negotiated stream count less one).
+    /// Mirrors `SctpTransport::maxStream()`. We do not yet track a negotiated
+    /// count, so this returns the maximum (`MAX_SCTP_STREAMS_COUNT - 1`).
+    pub fn max_stream(&self) -> u16 {
+        MAX_SCTP_STREAMS_COUNT - 1
     }
 
     /// Raw pointer identity used as the usrsctp `void* addr` / upcall arg
@@ -768,6 +911,15 @@ impl SctpTransport {
             let level: i32 = 0;
             setsockopt(sock, IPPROTO_SCTP, SCTP_FRAGMENT_INTERLEAVE, &level)?;
 
+            // SO_RCVBUF/SO_SNDBUF: the sctp_recvspace/sendspace sysctls already
+            // give new sockets a 1 MiB window; ensure the buffer is at least
+            // large enough for the largest message (matches C++ constructor).
+            let min_buf = self.max_message_size.min(i32::MAX as usize) as i32;
+            let rcv = getsockopt_int(sock, sol_socket(), so_rcvbuf())?.max(min_buf);
+            setsockopt(sock, sol_socket(), so_rcvbuf(), &rcv)?;
+            let snd = getsockopt_int(sock, sol_socket(), so_sndbuf())?.max(min_buf);
+            setsockopt(sock, sol_socket(), so_sndbuf(), &snd)?;
+
             // bind + connect on the same conn address (simultaneous open).
             let mut local = self.sockaddr_conn(self.local_port);
             let ret = sys::usrsctp_bind(
@@ -819,8 +971,16 @@ impl SctpTransport {
 
     /// Send a message on a stream with the given reliability parameters.
     ///
-    /// Builds an `sctp_sendv_spa` from `reliability` (PR-SCTP TTL / RTX /
-    /// NONE plus `SCTP_UNORDERED`) and calls `usrsctp_sendv`.
+    /// Port of `SctpTransport::send`: first drains the userspace send queue,
+    /// then — if it fully drained — tries to hand this message straight to
+    /// usrsctp. If usrsctp's send buffer is full (`EWOULDBLOCK`), or the queue
+    /// could not be fully drained, the message is parked on the queue and its
+    /// bytes are added to the stream's buffered amount; it is retried later by
+    /// [`flush`](Self::flush) on `SCTP_SENDER_DRY_EVENT`. Returns `Ok` whether
+    /// the message was sent or queued (matching the WebRTC contract that
+    /// `send` never blocks and never fails on a full buffer); `Err` is
+    /// reserved for hard failures (not connected, too large, fatal usrsctp
+    /// error).
     pub fn send(
         &self,
         msg: &SctpMessage,
@@ -837,6 +997,36 @@ impl SctpTransport {
             return Err(SctpTransportError::MessageTooLarge(msg.data.len()));
         }
 
+        let mut st = self.send_state.lock();
+        // Flush the queue, and if nothing is pending, try to send directly.
+        if self.try_send_queue(&mut st)? && self.try_send_message(msg, reliability)? {
+            // Sent straight through — nothing buffered, no amount change.
+            return Ok(());
+        }
+        // usrsctp is backpressuring (or the queue is non-empty): park the
+        // message and account for its bytes. Retried on SENDER_DRY.
+        let len = msg.data.len();
+        st.queue.push_back(QueuedMessage {
+            msg: msg.clone(),
+            reliability: *reliability,
+        });
+        self.update_buffered_amount(&mut st, msg.stream, len as isize);
+        Ok(())
+    }
+
+    /// Hand a single message to `usrsctp_sendv`. Returns `Ok(true)` if usrsctp
+    /// accepted it, `Ok(false)` if its send buffer is full (`EWOULDBLOCK` /
+    /// `EAGAIN` — the caller should queue and retry), or `Err` on a fatal
+    /// usrsctp error. Builds the `sctp_sendv_spa` from `reliability`
+    /// (PR-SCTP TTL / RTX / NONE plus `SCTP_UNORDERED`).
+    ///
+    /// Requires `send_state` to be held by the caller (serialises usrsctp
+    /// sends and keeps the queue in strict FIFO order).
+    fn try_send_message(
+        &self,
+        msg: &SctpMessage,
+        reliability: &Reliability,
+    ) -> Result<bool, SctpTransportError> {
         let mut spa: sys::sctp_sendv_spa = unsafe { std::mem::zeroed() };
 
         // sndinfo
@@ -895,9 +1085,75 @@ impl SctpTransport {
             )
         };
         if ret < 0 {
-            return Err(SctpTransportError::Usrsctp("usrsctp_sendv", errno()));
+            let e = errno();
+            if is_wouldblock(e) {
+                return Ok(false);
+            }
+            return Err(SctpTransportError::Usrsctp("usrsctp_sendv", e));
         }
-        Ok(())
+        Ok(true)
+    }
+
+    /// Drain the userspace send queue front-to-back into usrsctp, decrementing
+    /// each message's buffered amount as it is accepted. Stops (returning
+    /// `Ok(false)`) the moment usrsctp backpressures, leaving the rest queued;
+    /// returns `Ok(true)` once the queue is empty. Port of `trySendQueue`.
+    ///
+    /// Requires `send_state` to be held by the caller.
+    fn try_send_queue(&self, st: &mut SendState) -> Result<bool, SctpTransportError> {
+        while !st.queue.is_empty() {
+            // Borrow the front only long enough to attempt the send; the
+            // borrow ends before we mutate the queue below.
+            let sent = {
+                let front = st.queue.front().expect("queue non-empty");
+                self.try_send_message(&front.msg, &front.reliability)?
+            };
+            if !sent {
+                return Ok(false);
+            }
+            let done = st.queue.pop_front().expect("queue non-empty");
+            self.update_buffered_amount(st, done.msg.stream, -(done.msg.data.len() as isize));
+        }
+        Ok(true)
+    }
+
+    /// Retry the queued sends. Invoked from the `SCTP_SENDER_DRY_EVENT`
+    /// handler (worker thread) once usrsctp's send buffer has space again.
+    /// Port of `SctpTransport::flush`.
+    fn flush(&self) {
+        if self.closed.load(Ordering::SeqCst) || !matches!(self.state(), SctpState::Connected) {
+            return;
+        }
+        let mut st = self.send_state.lock();
+        if let Err(e) = self.try_send_queue(&mut st) {
+            warn!("SctpTransport: flush failed: {e}");
+        }
+    }
+
+    /// Apply `delta` to a stream's buffered byte count (clamped at 0, removed
+    /// at 0) and fire `on_buffered_amount_low(stream, new_amount)` so the
+    /// DataChannel layer can apply its edge-triggered low-water rule. Port of
+    /// `updateBufferedAmount` + `triggerBufferedAmount`.
+    ///
+    /// Requires `send_state` to be held by the caller (the callback fires
+    /// synchronously under the lock, mirroring upstream; consumers must not
+    /// re-enter [`send`](Self::send) from `on_buffered_amount_low`).
+    fn update_buffered_amount(&self, st: &mut SendState, stream: u16, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        let current = *st.buffered_amount.get(&stream).unwrap_or(&0);
+        let amount = (current as isize + delta).max(0) as usize;
+        if amount == 0 {
+            st.buffered_amount.remove(&stream);
+        } else {
+            st.buffered_amount.insert(stream, amount);
+        }
+        let cb = {
+            let g = self.callbacks.lock();
+            Arc::clone(&g.on_buffered_amount_low)
+        };
+        (cb)(stream, amount);
     }
 
     /// Swap the callback set at runtime.
@@ -924,17 +1180,22 @@ impl SctpTransport {
             return Ok(());
         }
 
-        // Stop the worker: drop the sender so its `recv` returns Err and the
-        // loop exits, then join it. Joining before we touch the socket ensures
-        // no worker-driven usrsctp call races our close. The worker never calls
-        // close(), so this can't deadlock. If close() is somehow invoked from
-        // the worker thread itself we must not join ourselves.
+        // Stop queuing work: any item already in flight is a no-op, since the
+        // pool worker re-checks `closed` under `proc_lock` before touching the
+        // socket.
         *self.tx.lock().unwrap() = None;
-        let handle = self.worker.lock().unwrap().take();
-        if let Some(h) = handle {
-            if h.thread().id() != std::thread::current().id() {
-                let _ = h.join();
-            }
+
+        // Barrier (replaces the old "join the worker" step): wait until any
+        // pool worker currently mid-usrsctp-call on this transport finishes, so
+        // no worker-driven call races our socket close. If close() is re-entered
+        // from the worker thread itself (a user callback firing from inside
+        // conninput/the upcall), that worker already holds `proc_lock`; the
+        // PROCESSING thread-local lets us detect this and skip the barrier, as
+        // re-acquiring a non-reentrant mutex would self-deadlock.
+        let self_ptr = self as *const SctpTransport as usize;
+        let reentrant = PROCESSING.with(|p| p.get()) == self_ptr;
+        if !reentrant {
+            drop(self.proc_lock.lock());
         }
 
         // Take the socket out under the lock; close it after releasing so
@@ -947,23 +1208,18 @@ impl SctpTransport {
 
         // Remove from instances set first so any in-flight callback sees us
         // as stale, then close + deregister. The instances key is the
-        // Arc allocation address; we recover it from a field-free pointer.
-        let self_ptr = self as *const SctpTransport as usize;
+        // Arc allocation address (reused from the re-entrancy check above).
         instances_remove(self_ptr);
 
         if !sock.is_null() {
             unsafe {
                 sys::usrsctp_shutdown(sock, SHUT_RDWR);
                 sys::usrsctp_close(sock);
-                sys::usrsctp_deregister_address(
-                    self as *const SctpTransport as *mut c_void,
-                );
+                sys::usrsctp_deregister_address(self as *const SctpTransport as *mut c_void);
             }
         }
 
-        let prev = self
-            .state
-            .swap(SctpState::Closed.as_u8(), Ordering::SeqCst);
+        let prev = self.state.swap(SctpState::Closed.as_u8(), Ordering::SeqCst);
         if prev != SctpState::Closed.as_u8() {
             self.fire_state(SctpState::Closed);
         }
@@ -987,12 +1243,7 @@ impl SctpTransport {
         }
         trace!(len = data.len(), "SctpTransport::feed_inbound → conninput");
         unsafe {
-            sys::usrsctp_conninput(
-                self_ptr,
-                data.as_ptr() as *const c_void,
-                data.len(),
-                0,
-            );
+            sys::usrsctp_conninput(self_ptr, data.as_ptr() as *const c_void, data.len(), 0);
         }
     }
 
@@ -1022,8 +1273,7 @@ impl SctpTransport {
                 return;
             }
             let mut info: sys::sctp_rcvinfo = unsafe { std::mem::zeroed() };
-            let mut infolen =
-                std::mem::size_of::<sys::sctp_rcvinfo>() as sys::socklen_t;
+            let mut infolen = std::mem::size_of::<sys::sctp_rcvinfo>() as sys::socklen_t;
             let mut infotype: u32 = 0;
             let mut flags: i32 = 0;
             let mut fromlen: sys::socklen_t = 0;
@@ -1114,18 +1364,14 @@ impl SctpTransport {
             return;
         }
         // The notification union begins with the sn_header TLV.
-        let header = unsafe {
-            &*(notif.as_ptr() as *const sys::sctp_notification_sctp_tlv)
-        };
+        let header = unsafe { &*(notif.as_ptr() as *const sys::sctp_notification_sctp_tlv) };
         let sn_type = header.sn_type;
         match sn_type {
             SCTP_ASSOC_CHANGE => {
                 if notif.len() < std::mem::size_of::<sys::sctp_assoc_change>() {
                     return;
                 }
-                let sac = unsafe {
-                    &*(notif.as_ptr() as *const sys::sctp_assoc_change)
-                };
+                let sac = unsafe { &*(notif.as_ptr() as *const sys::sctp_assoc_change) };
                 match sac.sac_state {
                     SCTP_COMM_UP => {
                         // Connecting → Connected.
@@ -1154,8 +1400,9 @@ impl SctpTransport {
                 }
             }
             SCTP_SENDER_DRY_EVENT => {
-                // Backpressure relief signal; the data-channel layer hooks
-                // buffered-amount here later.
+                // usrsctp's send buffer has drained: retry anything parked on
+                // the userspace send queue (and decrement buffered amounts).
+                self.flush();
             }
             SCTP_STREAM_RESET_EVENT => {
                 // Stream reset surfaces here; DataChannel close handling
@@ -1185,8 +1432,7 @@ impl SctpTransport {
 
     fn fail(&self) {
         let prev = self.state.swap(SctpState::Failed.as_u8(), Ordering::SeqCst);
-        if prev != SctpState::Failed.as_u8() && prev != SctpState::Closed.as_u8()
-        {
+        if prev != SctpState::Failed.as_u8() && prev != SctpState::Closed.as_u8() {
             self.fire_state(SctpState::Failed);
         }
     }
@@ -1194,30 +1440,24 @@ impl SctpTransport {
 
 impl Drop for SctpTransport {
     fn drop(&mut self) {
-        // Stop and join the worker first. Its `recv` returns Err once the
-        // sender drops, so it won't block forever. The worker only holds a
-        // Weak<Self>, so it can't keep us alive — but it could still be
-        // mid-iteration, so we join to avoid a use-after-free on `self`.
-        *self.tx.lock().unwrap() = None;
-        if let Some(h) = self.worker.lock().unwrap().take() {
-            if h.thread().id() != std::thread::current().id() {
-                let _ = h.join();
-            }
-        }
+        // No worker join needed. Pool workers hold only a `Weak<Self>` and
+        // upgrade it just for the duration of processing one item, so the
+        // strong count is non-zero whenever a worker is touching this
+        // transport. Drop runs only when the strong count reaches zero, which
+        // therefore guarantees no worker is mid-call here and no later upgrade
+        // can succeed — `self` is exclusively owned. (The `tx` field, this
+        // transport's pool-worker sender clone, drops with the struct.)
 
         // Ensure the socket is closed and the instance deregistered even if
         // the caller never called close().
         if !self.closed.load(Ordering::SeqCst) {
-            let sock =
-                std::mem::replace(&mut self.inner.lock().sock, std::ptr::null_mut());
+            let sock = std::mem::replace(&mut self.inner.lock().sock, std::ptr::null_mut());
             let self_ptr = self as *const SctpTransport as usize;
             instances_remove(self_ptr);
             if !sock.is_null() {
                 unsafe {
                     sys::usrsctp_close(sock);
-                    sys::usrsctp_deregister_address(
-                        self as *const SctpTransport as *mut c_void,
-                    );
+                    sys::usrsctp_deregister_address(self as *const SctpTransport as *mut c_void);
                 }
             }
         }
@@ -1228,23 +1468,37 @@ impl Drop for SctpTransport {
 // worker thread
 // ---------------------------------------------------------------------------
 
-/// Per-transport worker loop. Drains the command channel, executing the
+/// Shared pool worker loop. Drains its slice of the work channel, executing the
 /// usrsctp calls that may synchronously emit outbound packets (and thus call
 /// back into `dtls.send()`), keeping them off the DTLS callback thread where
 /// the DTLS inner mutex is held.
-fn worker_loop(weak: std::sync::Weak<SctpTransport>, rx: Receiver<SctpCommand>) {
-    while let Ok(cmd) = rx.recv() {
-        let Some(this) = weak.upgrade() else {
-            break;
+///
+/// Each item is processed while holding the transport's `proc_lock` and with
+/// the `PROCESSING` thread-local set to its pointer, so a concurrent `close`
+/// blocks until the in-flight usrsctp call finishes (and a re-entrant `close`
+/// from a user callback can detect that it already holds the lock).
+fn pool_worker_loop(rx: WorkReceiver<WorkItem>) {
+    while let Ok(item) = rx.recv() {
+        let Some(this) = item.transport.upgrade() else {
+            continue;
         };
         if this.closed.load(Ordering::SeqCst) {
-            // Keep draining so the channel doesn't back up, but do no work.
+            // Transport torn down before we got to it: do no work.
             continue;
         }
-        match cmd {
-            SctpCommand::Connect => this.connect(),
-            SctpCommand::Inbound(data) => this.feed_inbound(&data),
+        let self_ptr = Arc::as_ptr(&this) as usize;
+        let guard = this.proc_lock.lock();
+        let prev = PROCESSING.with(|p| p.replace(self_ptr));
+        // Re-check under the lock: close() may have run between the early
+        // check and acquiring proc_lock.
+        if !this.closed.load(Ordering::SeqCst) {
+            match item.cmd {
+                SctpCommand::Connect => this.connect(),
+                SctpCommand::Inbound(data) => this.feed_inbound(&data),
+            }
         }
+        PROCESSING.with(|p| p.set(prev));
+        drop(guard);
     }
 }
 
@@ -1332,6 +1586,30 @@ unsafe fn setsockopt<T>(
     }
 }
 
+/// Read a single `int`-valued socket option.
+unsafe fn getsockopt_int(
+    sock: *mut sys::socket,
+    level: i32,
+    name: i32,
+) -> Result<i32, SctpTransportError> {
+    let mut value: i32 = 0;
+    let mut len = std::mem::size_of::<i32>() as sys::socklen_t;
+    let ret = unsafe {
+        sys::usrsctp_getsockopt(
+            sock,
+            level,
+            name,
+            &mut value as *mut i32 as *mut c_void,
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        Err(SctpTransportError::Usrsctp("usrsctp_getsockopt", errno()))
+    } else {
+        Ok(value)
+    }
+}
+
 /// Read the current C `errno`.
 fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
@@ -1380,12 +1658,10 @@ mod tests {
     fn make_dtls(role: Role) -> Arc<DtlsTransport> {
         let mut cfg = Configuration::new();
         cfg.bind_address = Some("127.0.0.1".to_string());
-        let ice = IceTransport::new(&cfg, role, IceTransportCallbacks::default())
-            .expect("ice");
+        let ice = IceTransport::new(&cfg, role, IceTransportCallbacks::default()).expect("ice");
         let cert = Certificate::generate_default().expect("cert");
         Arc::new(
-            DtlsTransport::new(ice, cert, DtlsTransportCallbacks::default())
-                .expect("dtls new"),
+            DtlsTransport::new(ice, cert, DtlsTransportCallbacks::default()).expect("dtls new"),
         )
     }
 
@@ -1428,7 +1704,10 @@ mod tests {
             sctp.connect();
             assert_eq!(sctp.state(), SctpState::Connecting);
             assert!(
-                states.lock().iter().any(|s| matches!(s, SctpState::Connecting)),
+                states
+                    .lock()
+                    .iter()
+                    .any(|s| matches!(s, SctpState::Connecting)),
                 "expected Connecting in {:?}",
                 states.lock().clone()
             );
@@ -1484,10 +1763,7 @@ mod tests {
                 .send(&sample_message(), &Reliability::reliable())
                 .expect_err("send while connecting must fail");
             assert!(
-                matches!(
-                    err,
-                    SctpTransportError::NotConnected(SctpState::Connecting)
-                ),
+                matches!(err, SctpTransportError::NotConnected(SctpState::Connecting)),
                 "got {err:?}"
             );
             sctp.close().expect("close");
@@ -1568,8 +1844,7 @@ mod tests {
 
     /// Spin until `pred` is true or `timeout_ms` elapses.
     async fn wait_for<F: FnMut() -> bool>(mut pred: F, timeout_ms: u64) -> bool {
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_millis(timeout_ms);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         while std::time::Instant::now() < deadline {
             if pred() {
                 return true;
@@ -1610,8 +1885,12 @@ mod tests {
 
             let cert_a = Certificate::generate_default().expect("cert a");
             let cert_b = Certificate::generate_default().expect("cert b");
-            let fp_a = cert_a.fingerprint(FingerprintAlgorithm::Sha256).expect("fp a");
-            let fp_b = cert_b.fingerprint(FingerprintAlgorithm::Sha256).expect("fp b");
+            let fp_a = cert_a
+                .fingerprint(FingerprintAlgorithm::Sha256)
+                .expect("fp a");
+            let fp_b = cert_b
+                .fingerprint(FingerprintAlgorithm::Sha256)
+                .expect("fp b");
 
             let dtls_a = Arc::new(
                 DtlsTransport::new(
@@ -1672,8 +1951,7 @@ mod tests {
             ice_a.gather().expect("a gather");
             assert!(
                 wait_for(
-                    || ice_a.gathering_state()
-                        == crate::ice_transport::GatheringState::Complete,
+                    || ice_a.gathering_state() == crate::ice_transport::GatheringState::Complete,
                     3000
                 )
                 .await
@@ -1683,13 +1961,14 @@ mod tests {
             ice_b.gather().expect("b gather");
             assert!(
                 wait_for(
-                    || ice_b.gathering_state()
-                        == crate::ice_transport::GatheringState::Complete,
+                    || ice_b.gathering_state() == crate::ice_transport::GatheringState::Complete,
                     3000
                 )
                 .await
             );
-            let desc_b = ice_b.get_local_description(DescriptionType::Answer).unwrap();
+            let desc_b = ice_b
+                .get_local_description(DescriptionType::Answer)
+                .unwrap();
             ice_a.set_remote_description(&desc_b).unwrap();
             for c in a_cands.lock().iter() {
                 ice_b.add_remote_candidate(c).unwrap();
@@ -1702,10 +1981,7 @@ mod tests {
 
             // Wait for the SCTP association to come up on both sides.
             let up = wait_for(
-                || {
-                    a_connected.load(Ordering::SeqCst)
-                        && b_connected.load(Ordering::SeqCst)
-                },
+                || a_connected.load(Ordering::SeqCst) && b_connected.load(Ordering::SeqCst),
                 12000,
             )
             .await;
