@@ -43,8 +43,8 @@ fn generate_capi_header() {
         manifest_dir.join("cbindgen.toml").display()
     );
 
-    let config = cbindgen::Config::from_file(manifest_dir.join("cbindgen.toml"))
-        .unwrap_or_default();
+    let config =
+        cbindgen::Config::from_file(manifest_dir.join("cbindgen.toml")).unwrap_or_default();
 
     // cbindgen 0.27 detects `#[no_mangle]` only as a bare word attribute; it
     // does not recognise edition-2024's `#[unsafe(no_mangle)]` (a list meta),
@@ -469,6 +469,5 @@ fn build_libsrtp2() {
     // Edition 2024 requires `unsafe extern` blocks (see usrsctp note above).
     let src = bindings.to_string();
     let src = src.replace("extern \"C\" {", "unsafe extern \"C\" {");
-    std::fs::write(out_dir.join("srtp_bindings.rs"), src)
-        .expect("failed to write srtp bindings");
+    std::fs::write(out_dir.join("srtp_bindings.rs"), src).expect("failed to write srtp bindings");
 }

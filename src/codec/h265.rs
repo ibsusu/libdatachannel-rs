@@ -6,10 +6,10 @@
 //! a 3-byte FU prefix (2-byte NAL header + 1-byte FU header).
 
 use crate::codec::nal::{
-    self, Separator, H265_NAL_TYPE_AP, H265_NAL_TYPE_FU, NALU_LONG_START_CODE,
-    NALU_SHORT_START_CODE,
+    self, H265_NAL_TYPE_AP, H265_NAL_TYPE_FU, NALU_LONG_START_CODE, NALU_SHORT_START_CODE,
+    Separator,
 };
-use crate::codec::{Fragmenter, ReassembledFrame, DEFAULT_MAX_FRAGMENT_SIZE};
+use crate::codec::{DEFAULT_MAX_FRAGMENT_SIZE, Fragmenter, ReassembledFrame};
 use crate::rtp::RtpHeader;
 use crate::rtp_packetizer::{RtpPacketizationConfig, RtpPacketizer};
 
@@ -25,7 +25,11 @@ impl H265RtpPacketizer {
     /// Construct with an explicit separator and max fragment size. Ports the
     /// primary `H265RtpPacketizer` constructor.
     #[must_use]
-    pub fn new(separator: Separator, config: RtpPacketizationConfig, max_fragment_size: usize) -> Self {
+    pub fn new(
+        separator: Separator,
+        config: RtpPacketizationConfig,
+        max_fragment_size: usize,
+    ) -> Self {
         H265RtpPacketizer {
             inner: RtpPacketizer::new(config),
             separator,
@@ -119,7 +123,10 @@ impl H265RtpDepacketizer {
     /// # Errors
     /// Returns `Err` for a truncated NAL unit (< 2 byte payload) or a malformed
     /// AP, matching the C++ `throw std::runtime_error`.
-    pub fn reassemble(&self, packets: &[Vec<u8>]) -> Result<Option<ReassembledFrame>, &'static str> {
+    pub fn reassemble(
+        &self,
+        packets: &[Vec<u8>],
+    ) -> Result<Option<ReassembledFrame>, &'static str> {
         if packets.is_empty() {
             return Ok(None);
         }
@@ -159,10 +166,8 @@ impl H265RtpDepacketizer {
                 return Err("Truncated H265 NAL unit");
             }
 
-            let nal = nal::H265NalHeaderBits::parse(
-                packet[rtp_header_size],
-                packet[rtp_header_size + 1],
-            );
+            let nal =
+                nal::H265NalHeaderBits::parse(packet[rtp_header_size], packet[rtp_header_size + 1]);
 
             if nal.unit_type == H265_NAL_TYPE_FU {
                 if payload_size <= 2 {

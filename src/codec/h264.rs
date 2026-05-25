@@ -15,10 +15,10 @@
 //! FU-A fragments and splitting STAP-A aggregation packets.
 
 use crate::codec::nal::{
-    self, Separator, H264_NAL_HEADER_SIZE, H264_NAL_TYPE_FU_A, H264_NAL_TYPE_STAP_A,
-    NALU_LONG_START_CODE, NALU_SHORT_START_CODE,
+    self, H264_NAL_HEADER_SIZE, H264_NAL_TYPE_FU_A, H264_NAL_TYPE_STAP_A, NALU_LONG_START_CODE,
+    NALU_SHORT_START_CODE, Separator,
 };
-use crate::codec::{Fragmenter, ReassembledFrame, DEFAULT_MAX_FRAGMENT_SIZE};
+use crate::codec::{DEFAULT_MAX_FRAGMENT_SIZE, Fragmenter, ReassembledFrame};
 use crate::rtp::RtpHeader;
 use crate::rtp_packetizer::{RtpPacketizationConfig, RtpPacketizer};
 
@@ -36,7 +36,11 @@ impl H264RtpPacketizer {
     /// frames) and max fragment size. Ports the primary `H264RtpPacketizer`
     /// constructor.
     #[must_use]
-    pub fn new(separator: Separator, config: RtpPacketizationConfig, max_fragment_size: usize) -> Self {
+    pub fn new(
+        separator: Separator,
+        config: RtpPacketizationConfig,
+        max_fragment_size: usize,
+    ) -> Self {
         H264RtpPacketizer {
             inner: RtpPacketizer::new(config),
             separator,
@@ -139,7 +143,10 @@ impl H264RtpDepacketizer {
     /// # Errors
     /// Returns `Err` for a malformed STAP-A (declared size exceeds payload) or
     /// an unknown NAL type, matching the C++ `throw std::runtime_error`.
-    pub fn reassemble(&self, packets: &[Vec<u8>]) -> Result<Option<ReassembledFrame>, &'static str> {
+    pub fn reassemble(
+        &self,
+        packets: &[Vec<u8>],
+    ) -> Result<Option<ReassembledFrame>, &'static str> {
         if packets.is_empty() {
             return Ok(None);
         }

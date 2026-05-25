@@ -84,7 +84,8 @@ const DEFAULT_MTU: usize = 1280;
 
 /// Cipher list inherited byte-for-byte from
 /// `native/libdatachannel/src/impl/dtlstransport.cpp:766`.
-const CIPHER_LIST: &str = "ALL:!SHA256:!SHA384:!aPSK:!ECDSA+SHA1:!ADH:!LOW:!EXP:!MD5:!3DES:!SSLv3:!TLSv1";
+const CIPHER_LIST: &str =
+    "ALL:!SHA256:!SHA384:!aPSK:!ECDSA+SHA1:!ADH:!LOW:!EXP:!MD5:!3DES:!SSLv3:!TLSv1";
 
 /// Tells `BIO_s_mem` to return -1 (retryable) on empty read instead of 0
 /// (eof). The C++ uses `BIO_set_mem_eof_return(mInBio, BIO_EOF)` where
@@ -414,8 +415,7 @@ impl DtlsTransport {
     /// SCTP/DataChannel path never calls it, so the default behaviour is
     /// unchanged.
     pub fn set_srtp_profiles(&self, profiles: &str) -> Result<(), DtlsTransportError> {
-        let c = std::ffi::CString::new(profiles)
-            .map_err(|_| DtlsTransportError::Handshake(-1))?;
+        let c = std::ffi::CString::new(profiles).map_err(|_| DtlsTransportError::Handshake(-1))?;
         let g = self.bridge.inner.lock();
         // SSL_set_tlsext_use_srtp returns 0 on success, non-zero on error
         // (the inverse of most OpenSSL calls).
@@ -441,7 +441,11 @@ impl DtlsTransport {
             if name.is_null() {
                 return None;
             }
-            Some(std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned())
+            Some(
+                std::ffi::CStr::from_ptr(name)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
         }
     }
 
@@ -807,7 +811,10 @@ fn pump_inbound(bridge: &Arc<Bridge>, data: &[u8]) {
             data.len() as std::ffi::c_int,
         );
         if written < 0 {
-            warn!("DtlsTransport: BIO_write returned {written}, dropping {} bytes", data.len());
+            warn!(
+                "DtlsTransport: BIO_write returned {written}, dropping {} bytes",
+                data.len()
+            );
             return;
         }
     }
@@ -1001,8 +1008,8 @@ mod tests {
         rt().block_on(async {
             let ice = make_ice(Role::Active);
             let cert = Certificate::generate_default().unwrap();
-            let dtls = DtlsTransport::new(ice, cert, DtlsTransportCallbacks::default())
-                .expect("dtls new");
+            let dtls =
+                DtlsTransport::new(ice, cert, DtlsTransportCallbacks::default()).expect("dtls new");
             assert!(dtls.is_client());
             assert_eq!(dtls.state(), DtlsState::New);
         });
@@ -1013,8 +1020,8 @@ mod tests {
         rt().block_on(async {
             let ice = make_ice(Role::Passive);
             let cert = Certificate::generate_default().unwrap();
-            let dtls = DtlsTransport::new(ice, cert, DtlsTransportCallbacks::default())
-                .expect("dtls new");
+            let dtls =
+                DtlsTransport::new(ice, cert, DtlsTransportCallbacks::default()).expect("dtls new");
             assert!(!dtls.is_client());
             assert_eq!(dtls.state(), DtlsState::New);
         });
@@ -1036,7 +1043,10 @@ mod tests {
             dtls.start().expect("start");
             assert_eq!(dtls.state(), DtlsState::Connecting);
             assert!(
-                states.lock().iter().any(|s| matches!(s, DtlsState::Connecting)),
+                states
+                    .lock()
+                    .iter()
+                    .any(|s| matches!(s, DtlsState::Connecting)),
                 "expected Connecting in {:?}",
                 states.lock().clone()
             );
@@ -1074,9 +1084,11 @@ mod tests {
         rt().block_on(async {
             let ice = make_ice(Role::Active);
             let cert = Certificate::generate_default().unwrap();
-            let dtls = DtlsTransport::new(ice, cert, DtlsTransportCallbacks::default())
-                .expect("dtls new");
-            let err = dtls.send(b"hello").expect_err("send before connect must fail");
+            let dtls =
+                DtlsTransport::new(ice, cert, DtlsTransportCallbacks::default()).expect("dtls new");
+            let err = dtls
+                .send(b"hello")
+                .expect_err("send before connect must fail");
             assert!(
                 matches!(err, DtlsTransportError::NotConnected),
                 "got {err:?}"
@@ -1193,8 +1205,8 @@ mod tests {
         rt().block_on(async {
             let ice = make_ice(Role::Active);
             let cert = Certificate::generate_default().unwrap();
-            let dtls = DtlsTransport::new(ice, cert, DtlsTransportCallbacks::default())
-                .expect("dtls new");
+            let dtls =
+                DtlsTransport::new(ice, cert, DtlsTransportCallbacks::default()).expect("dtls new");
             assert!(dtls.remote_fingerprint().is_none(), "starts unset");
 
             let other = Certificate::generate_default().unwrap();
@@ -1211,8 +1223,7 @@ mod tests {
 
     /// Spin until `pred` is true or `timeout_ms` elapses.
     async fn wait_for_dtls<F: FnMut() -> bool>(mut pred: F, timeout_ms: u64) -> bool {
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_millis(timeout_ms);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         while std::time::Instant::now() < deadline {
             if pred() {
                 return true;
@@ -1269,10 +1280,7 @@ mod tests {
         a.gather().expect("a gather");
         // Wait for A's gathering to finish.
         let _ = wait_for_dtls(
-            || {
-                a.gathering_state()
-                    == crate::ice_transport::GatheringState::Complete
-            },
+            || a.gathering_state() == crate::ice_transport::GatheringState::Complete,
             3000,
         )
         .await;
@@ -1283,10 +1291,7 @@ mod tests {
 
         b.gather().expect("b gather");
         let _ = wait_for_dtls(
-            || {
-                b.gathering_state()
-                    == crate::ice_transport::GatheringState::Complete
-            },
+            || b.gathering_state() == crate::ice_transport::GatheringState::Complete,
             3000,
         )
         .await;
@@ -1305,10 +1310,7 @@ mod tests {
         b.set_remote_end_of_candidates().expect("b eoc");
 
         let connected = wait_for_dtls(
-            || {
-                a_connected.load(Ordering::SeqCst)
-                    && b_connected.load(Ordering::SeqCst)
-            },
+            || a_connected.load(Ordering::SeqCst) && b_connected.load(Ordering::SeqCst),
             5000,
         )
         .await;
@@ -1412,10 +1414,10 @@ mod tests {
                 on_data: Arc::new(move |d| b_recv_cb.lock().extend_from_slice(d)),
             };
 
-            let dtls_a = DtlsTransport::new(Arc::clone(&ice_a), cert_a, a_dtls_cbs)
-                .expect("dtls a");
-            let dtls_b = DtlsTransport::new(Arc::clone(&ice_b), cert_b, b_dtls_cbs)
-                .expect("dtls b");
+            let dtls_a =
+                DtlsTransport::new(Arc::clone(&ice_a), cert_a, a_dtls_cbs).expect("dtls a");
+            let dtls_b =
+                DtlsTransport::new(Arc::clone(&ice_b), cert_b, b_dtls_cbs).expect("dtls b");
 
             // Cross-pin fingerprints BEFORE start() / auto-start fires.
             dtls_a.set_remote_fingerprint(fp_b);
@@ -1427,8 +1429,7 @@ mod tests {
             ice_a.gather().expect("a gather");
             assert!(
                 wait_for_dtls(
-                    || ice_a.gathering_state()
-                        == crate::ice_transport::GatheringState::Complete,
+                    || ice_a.gathering_state() == crate::ice_transport::GatheringState::Complete,
                     3000
                 )
                 .await,
@@ -1442,8 +1443,7 @@ mod tests {
             ice_b.gather().expect("b gather");
             assert!(
                 wait_for_dtls(
-                    || ice_b.gathering_state()
-                        == crate::ice_transport::GatheringState::Complete,
+                    || ice_b.gathering_state() == crate::ice_transport::GatheringState::Complete,
                     3000
                 )
                 .await,
@@ -1588,21 +1588,17 @@ mod tests {
             ice_a.gather().expect("a gather");
             assert!(
                 wait_for_dtls(
-                    || ice_a.gathering_state()
-                        == crate::ice_transport::GatheringState::Complete,
+                    || ice_a.gathering_state() == crate::ice_transport::GatheringState::Complete,
                     3000
                 )
                 .await
             );
-            let desc_a = ice_a
-                .get_local_description(DescriptionType::Offer)
-                .unwrap();
+            let desc_a = ice_a.get_local_description(DescriptionType::Offer).unwrap();
             ice_b.set_remote_description(&desc_a).unwrap();
             ice_b.gather().expect("b gather");
             assert!(
                 wait_for_dtls(
-                    || ice_b.gathering_state()
-                        == crate::ice_transport::GatheringState::Complete,
+                    || ice_b.gathering_state() == crate::ice_transport::GatheringState::Complete,
                     3000
                 )
                 .await
@@ -1624,11 +1620,7 @@ mod tests {
             // handshake window. The OTHER side may go Failed too once it
             // sees the fatal alert; we only assert on the side we know
             // must reject.
-            let failed = wait_for_dtls(
-                || a_failed.load(Ordering::SeqCst),
-                8000,
-            )
-            .await;
+            let failed = wait_for_dtls(|| a_failed.load(Ordering::SeqCst), 8000).await;
             assert!(
                 failed,
                 "mismatch side did not reach Failed: a={:?}, b={:?}",
@@ -1696,21 +1688,17 @@ mod tests {
             ice_a.gather().expect("a gather");
             assert!(
                 wait_for_dtls(
-                    || ice_a.gathering_state()
-                        == crate::ice_transport::GatheringState::Complete,
+                    || ice_a.gathering_state() == crate::ice_transport::GatheringState::Complete,
                     3000
                 )
                 .await
             );
-            let desc_a = ice_a
-                .get_local_description(DescriptionType::Offer)
-                .unwrap();
+            let desc_a = ice_a.get_local_description(DescriptionType::Offer).unwrap();
             ice_b.set_remote_description(&desc_a).unwrap();
             ice_b.gather().expect("b gather");
             assert!(
                 wait_for_dtls(
-                    || ice_b.gathering_state()
-                        == crate::ice_transport::GatheringState::Complete,
+                    || ice_b.gathering_state() == crate::ice_transport::GatheringState::Complete,
                     3000
                 )
                 .await
@@ -1728,11 +1716,7 @@ mod tests {
             ice_a.set_remote_end_of_candidates().unwrap();
             ice_b.set_remote_end_of_candidates().unwrap();
 
-            let failed = wait_for_dtls(
-                || a_failed.load(Ordering::SeqCst),
-                8000,
-            )
-            .await;
+            let failed = wait_for_dtls(|| a_failed.load(Ordering::SeqCst), 8000).await;
             assert!(
                 failed,
                 "expected A to Fail without remote fingerprint pinned (state={:?}, dtls_b={:?})",
@@ -1766,8 +1750,7 @@ mod tests {
             };
             let ice = make_ice(Role::Active);
             let cert = Certificate::generate_default().unwrap();
-            let dtls =
-                DtlsTransport::new(ice, cert, callbacks).expect("dtls new");
+            let dtls = DtlsTransport::new(ice, cert, callbacks).expect("dtls new");
 
             // Snapshot and invoke the returned closures directly.
             let snap = dtls.callbacks();

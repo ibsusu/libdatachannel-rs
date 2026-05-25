@@ -8,7 +8,7 @@
 //! reconstruction (RFC 7741 §4.5.2), parsing the full optional descriptor
 //! (X/I/L/T/K and the 15-bit PictureID `M` extension) to skip it.
 
-use crate::codec::{Fragmenter, DEFAULT_MAX_FRAGMENT_SIZE};
+use crate::codec::{DEFAULT_MAX_FRAGMENT_SIZE, Fragmenter};
 use crate::rtp::RtpHeader;
 use crate::rtp_packetizer::{RtpPacketizationConfig, RtpPacketizer};
 

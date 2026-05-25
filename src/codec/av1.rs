@@ -14,7 +14,7 @@
 //! prepended (with its LEB128 length) to the next packetized OBU and the `N`
 //! bit is set, mirroring `mSequenceHeader`.
 
-use crate::codec::{Fragmenter, DEFAULT_MAX_FRAGMENT_SIZE};
+use crate::codec::{DEFAULT_MAX_FRAGMENT_SIZE, Fragmenter};
 use crate::rtp_packetizer::{RtpPacketizationConfig, RtpPacketizer};
 
 // Aggregation header masks. (https://aomediacodec.github.io/av1-rtp-spec/#44)
@@ -130,8 +130,7 @@ impl Av1RtpPacketizer {
                     break;
                 }
                 let leb128_byte = data[leb128_index];
-                obu_length |=
-                    u32::from(leb128_byte & SEVEN_LSB_BITMASK) << (leb128_size * 7);
+                obu_length |= u32::from(leb128_byte & SEVEN_LSB_BITMASK) << (leb128_size * 7);
                 leb128_size += 1;
                 if leb128_byte & MSB_BITMASK == 0 {
                     break;
@@ -344,7 +343,11 @@ mod tests {
         assert_eq!(frags.len(), 1);
         let agg = frags[0][0];
         assert_eq!(agg >> W_BITSHIFT, 2, "W = 2 OBU elements");
-        assert_eq!(agg & N_MASK, N_MASK, "N set (first of coded video sequence)");
+        assert_eq!(
+            agg & N_MASK,
+            N_MASK,
+            "N set (first of coded video sequence)"
+        );
         // After the aggregation header: LEB128 size of seq header, then seq, then frame.
         let (sh_len, n) = read_leb128(&frags[0][1..]);
         assert_eq!(sh_len as usize, seq.len());

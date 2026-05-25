@@ -338,9 +338,8 @@ impl RtcpHeader {
     #[must_use]
     pub fn serialize(&self) -> [u8; 4] {
         let mut out = [0u8; 4];
-        out[0] = ((self.version & 0x03) << 6)
-            | ((self.padding as u8) << 5)
-            | (self.report_count & 0x1F);
+        out[0] =
+            ((self.version & 0x03) << 6) | ((self.padding as u8) << 5) | (self.report_count & 0x1F);
         out[1] = self.payload_type;
         out[2..4].copy_from_slice(&self.length.to_be_bytes());
         out
@@ -828,9 +827,7 @@ impl RtcpNack {
         let mut parts: Vec<RtcpNackPart> = Vec::new();
         let mut pid: u16 = 0;
         for &seq in missing {
-            let need_new = parts.is_empty()
-                || seq < pid
-                || seq > pid.wrapping_add(16);
+            let need_new = parts.is_empty() || seq < pid || seq > pid.wrapping_add(16);
             if need_new {
                 parts.push(RtcpNackPart { pid: seq, blp: 0 });
                 pid = seq;
@@ -993,10 +990,16 @@ mod tests {
         let base = RtpHeader::default();
         assert_eq!(base.serialize()[0], 0x80); // just V=2
 
-        let p = RtpHeader { padding: true, ..RtpHeader::default() };
+        let p = RtpHeader {
+            padding: true,
+            ..RtpHeader::default()
+        };
         assert_eq!(p.serialize()[0], 0xA0); // V=2 | P
 
-        let x = RtpHeader { extension: true, ..RtpHeader::default() };
+        let x = RtpHeader {
+            extension: true,
+            ..RtpHeader::default()
+        };
         assert_eq!(x.serialize()[0], 0x90); // V=2 | X
     }
 
@@ -1189,8 +1192,10 @@ mod tests {
         assert_eq!(parsed.sender_ssrc, remb.sender_ssrc);
         assert_eq!(parsed.ssrcs, remb.ssrcs);
         // bitrate round-trips up to the REMB quantization.
-        assert_eq!(parsed.bitrate, RtcpRemb::decode_bitrate(
-            RtcpRemb::encode_bitrate(2, remb.bitrate)));
+        assert_eq!(
+            parsed.bitrate,
+            RtcpRemb::decode_bitrate(RtcpRemb::encode_bitrate(2, remb.bitrate))
+        );
     }
 
     #[test]

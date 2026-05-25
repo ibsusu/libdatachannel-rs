@@ -36,7 +36,7 @@
 //! profiles this transport negotiates by default. `srtp_init()` runs once via a
 //! global [`Once`], mirroring usrsctp's init in [`crate::SctpTransport`].
 
-use std::ffi::{c_int, c_void, CStr};
+use std::ffi::{CStr, c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
 
@@ -44,9 +44,9 @@ use parking_lot::Mutex;
 use thiserror::Error;
 use tracing::{trace, warn};
 
+use crate::DtlsTransport;
 use crate::dtls_transport::{DtlsState, DtlsTransportCallbacks};
 use crate::srtp_sys as sys;
-use crate::DtlsTransport;
 
 // ---------------------------------------------------------------------------
 // Constants from libsrtp2 + RFC 5764 (most come straight from bindgen).
@@ -536,7 +536,11 @@ impl SrtpTransport {
         };
         drop(g);
         if st != SRTP_OK {
-            let op = if rtcp { "srtp_protect_rtcp" } else { "srtp_protect" };
+            let op = if rtcp {
+                "srtp_protect_rtcp"
+            } else {
+                "srtp_protect"
+            };
             return Err(SrtpTransportError::Srtp(op, st));
         }
         packet.truncate(size as usize);
@@ -577,7 +581,11 @@ impl SrtpTransport {
         };
         drop(g);
         if st != SRTP_OK {
-            let op = if rtcp { "srtp_unprotect_rtcp" } else { "srtp_unprotect" };
+            let op = if rtcp {
+                "srtp_unprotect_rtcp"
+            } else {
+                "srtp_unprotect"
+            };
             return Err(SrtpTransportError::Srtp(op, st));
         }
         packet.truncate(size as usize);
@@ -861,9 +869,7 @@ mod tests {
         let plain_len = buf.len() as c_int;
         buf.resize(buf.len() + sys::SRTP_MAX_TRAILER_LEN as usize, 0);
         let mut size = plain_len;
-        let st = unsafe {
-            sys::srtp_protect(send, buf.as_mut_ptr() as *mut c_void, &mut size)
-        };
+        let st = unsafe { sys::srtp_protect(send, buf.as_mut_ptr() as *mut c_void, &mut size) };
         assert_eq!(st, SRTP_OK, "srtp_protect failed");
         buf.truncate(size as usize);
         assert!(
@@ -874,12 +880,13 @@ mod tests {
 
         // Unprotect.
         let mut size2 = buf.len() as c_int;
-        let st = unsafe {
-            sys::srtp_unprotect(recv, buf.as_mut_ptr() as *mut c_void, &mut size2)
-        };
+        let st = unsafe { sys::srtp_unprotect(recv, buf.as_mut_ptr() as *mut c_void, &mut size2) };
         assert_eq!(st, SRTP_OK, "srtp_unprotect failed");
         buf.truncate(size2 as usize);
-        assert_eq!(buf, original, "round-tripped packet must equal the original");
+        assert_eq!(
+            buf, original,
+            "round-tripped packet must equal the original"
+        );
 
         unsafe {
             sys::srtp_dealloc(send);
@@ -905,14 +912,24 @@ mod tests {
         let send = unsafe {
             let mut s: sys::srtp_t = std::ptr::null_mut();
             assert_eq!(sys::srtp_create(&mut s, std::ptr::null()), SRTP_OK);
-            let pol = make_policy(profile, sys::srtp_ssrc_type_t_ssrc_any_outbound, send_key.as_mut_ptr()).unwrap();
+            let pol = make_policy(
+                profile,
+                sys::srtp_ssrc_type_t_ssrc_any_outbound,
+                send_key.as_mut_ptr(),
+            )
+            .unwrap();
             assert_eq!(sys::srtp_add_stream(s, &pol), SRTP_OK);
             s
         };
         let recv = unsafe {
             let mut s: sys::srtp_t = std::ptr::null_mut();
             assert_eq!(sys::srtp_create(&mut s, std::ptr::null()), SRTP_OK);
-            let pol = make_policy(profile, sys::srtp_ssrc_type_t_ssrc_any_inbound, recv_key.as_mut_ptr()).unwrap();
+            let pol = make_policy(
+                profile,
+                sys::srtp_ssrc_type_t_ssrc_any_inbound,
+                recv_key.as_mut_ptr(),
+            )
+            .unwrap();
             assert_eq!(sys::srtp_add_stream(s, &pol), SRTP_OK);
             s
         };
@@ -987,10 +1004,13 @@ mod tests {
     fn new_sets_profiles_and_is_not_ready() {
         rt().block_on(async {
             let dtls = make_dtls(Role::Active);
-            let srtp = SrtpTransport::new(dtls, SrtpTransportCallbacks::default())
-                .expect("srtp new");
+            let srtp =
+                SrtpTransport::new(dtls, SrtpTransportCallbacks::default()).expect("srtp new");
             assert!(!srtp.is_ready(), "no keys before handshake");
-            assert!(srtp.selected_profile().is_none(), "no profile before handshake");
+            assert!(
+                srtp.selected_profile().is_none(),
+                "no profile before handshake"
+            );
             // protect before ready must error NotReady.
             let err = srtp
                 .protect_rtp(rtp_packet(96, 1, 1, b"x"))
@@ -1012,8 +1032,8 @@ mod tests {
 
         rt().block_on(async {
             async fn wait_for<F: FnMut() -> bool>(mut pred: F, timeout_ms: u64) -> bool {
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_millis(timeout_ms);
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
                 while std::time::Instant::now() < deadline {
                     if pred() {
                         return true;
@@ -1045,8 +1065,12 @@ mod tests {
 
             let cert_a = Certificate::generate_default().expect("cert a");
             let cert_b = Certificate::generate_default().expect("cert b");
-            let fp_a = cert_a.fingerprint(FingerprintAlgorithm::Sha256).expect("fp a");
-            let fp_b = cert_b.fingerprint(FingerprintAlgorithm::Sha256).expect("fp b");
+            let fp_a = cert_a
+                .fingerprint(FingerprintAlgorithm::Sha256)
+                .expect("fp a");
+            let fp_b = cert_b
+                .fingerprint(FingerprintAlgorithm::Sha256)
+                .expect("fp b");
 
             let dtls_a = DtlsTransport::new(
                 Arc::clone(&ice_a),
@@ -1077,18 +1101,15 @@ mod tests {
                 },
             )
             .expect("srtp a");
-            let srtp_b = SrtpTransport::new(
-                Arc::new(dtls_b.clone()),
-                SrtpTransportCallbacks::default(),
-            )
-            .expect("srtp b");
+            let srtp_b =
+                SrtpTransport::new(Arc::new(dtls_b.clone()), SrtpTransportCallbacks::default())
+                    .expect("srtp b");
 
             // Drive ICE.
             ice_a.gather().expect("a gather");
             assert!(
                 wait_for(
-                    || ice_a.gathering_state()
-                        == crate::ice_transport::GatheringState::Complete,
+                    || ice_a.gathering_state() == crate::ice_transport::GatheringState::Complete,
                     3000
                 )
                 .await
@@ -1098,13 +1119,14 @@ mod tests {
             ice_b.gather().expect("b gather");
             assert!(
                 wait_for(
-                    || ice_b.gathering_state()
-                        == crate::ice_transport::GatheringState::Complete,
+                    || ice_b.gathering_state() == crate::ice_transport::GatheringState::Complete,
                     3000
                 )
                 .await
             );
-            let desc_b = ice_b.get_local_description(DescriptionType::Answer).unwrap();
+            let desc_b = ice_b
+                .get_local_description(DescriptionType::Answer)
+                .unwrap();
             ice_a.set_remote_description(&desc_b).unwrap();
             for c in a_cands.lock().iter() {
                 ice_b.add_remote_candidate(c).unwrap();
@@ -1116,11 +1138,7 @@ mod tests {
             ice_b.set_remote_end_of_candidates().unwrap();
 
             // Wait for both SRTP layers to derive keys (post DTLS handshake).
-            let ready = wait_for(
-                || srtp_a.is_ready() && srtp_b.is_ready(),
-                10000,
-            )
-            .await;
+            let ready = wait_for(|| srtp_a.is_ready() && srtp_b.is_ready(), 10000).await;
             assert!(
                 ready,
                 "srtp keys not derived: a_ready={}, b_ready={}, dtls_a={:?}, dtls_b={:?}",

@@ -41,8 +41,9 @@
 //! - DTLS handoff — the `on_data` callback is the seam for Task #14.
 
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::ops::Deref;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 use thiserror::Error;
@@ -185,6 +186,30 @@ fn map_state(s: libjuice::State) -> State {
     }
 }
 
+/// How the underlying libjuice agent is owned. Most PeerConnections own a
+/// standalone agent on its own UDP socket ([`AgentHandle::Plain`]). When
+/// `enable_ice_udp_mux` is set, the agent instead joins a process-wide
+/// `juice_mux_listen` socket ([`AgentHandle::Mux`]) — the same socket the C
+/// `IceUdpMuxListener` adapter registers — so many PeerConnections share one
+/// port. Both deref to the same [`libjuice::Agent`] surface; the [`Mux`]
+/// variant additionally deregisters from the shared demux table on drop.
+///
+/// [`Mux`]: AgentHandle::Mux
+enum AgentHandle {
+    Plain(libjuice::Agent),
+    Mux(libjuice::MuxAgent),
+}
+
+impl Deref for AgentHandle {
+    type Target = libjuice::Agent;
+    fn deref(&self) -> &libjuice::Agent {
+        match self {
+            AgentHandle::Plain(a) => a,
+            AgentHandle::Mux(m) => &**m, // MuxAgent: Deref<Target = Agent>
+        }
+    }
+}
+
 /// The ICE transport. Wraps a [`libjuice::Agent`] and applies the
 /// libdatachannel adapter layer on top.
 ///
@@ -192,8 +217,10 @@ fn map_state(s: libjuice::State) -> State {
 /// closures can hold a clone of the inner state without borrowing the
 /// outer handle.
 pub struct IceTransport {
-    /// libjuice's agent handle (which is itself `Clone + Send + Sync`).
-    agent: libjuice::Agent,
+    /// libjuice's agent handle (itself `Clone + Send + Sync`), either a
+    /// standalone agent or one joined to a shared UDP-mux socket. Derefs to
+    /// [`libjuice::Agent`] for all lifecycle calls.
+    agent: AgentHandle,
     /// Current dc-side role. Starts at [`Role::ActPass`] and switches
     /// to either Active or Passive in `set_remote_description`, matching
     /// the C++ behaviour at `icetransport.cpp:215`.
@@ -305,89 +332,103 @@ impl IceTransport {
         };
 
         // --- build the libjuice Agent from the dc Configuration. ---
-        let mut builder = libjuice::Agent::builder(handler);
-
-        // First STUN entry wins; rest are logged + dropped.
-        let mut stun_taken = false;
-        for srv in &config.ice_servers {
-            if !matches!(srv.typ, IceServerType::Stun) {
-                continue;
-            }
-            if srv.hostname.is_empty() {
-                continue;
-            }
-            if !stun_taken {
-                let port = if srv.port == 0 { 3478 } else { srv.port };
-                builder = builder.with_stun(srv.hostname.clone(), port);
-                stun_taken = true;
-            } else {
-                warn!(
-                    "IceTransport: dropping extra STUN server {}:{} \
-                     (libjuice only supports one STUN server in Config)",
-                    srv.hostname, srv.port
-                );
-            }
-        }
-
-        // Bind address.
-        if let Some(ip) = bind_addr {
-            builder = builder.with_bind_address(&ip);
-        }
-
-        // Port range — only override when narrower than the default
-        // (matches the C++ guard at icetransport.cpp:122).
-        let pr_begin = config.port_range_begin;
-        let pr_end = config.port_range_end;
-        if pr_begin > 1024 || (pr_end != 0 && pr_end != 65535) {
-            builder = builder.with_port_range(pr_begin, pr_end);
-        }
-
-        // TURN servers (cap at MAX_TURN_SERVERS_COUNT, matching the C++
-        // counter at icetransport.cpp:163).
-        let mut turn_added = 0usize;
-        for srv in &config.ice_servers {
-            if !matches!(srv.typ, IceServerType::Turn) {
-                continue;
-            }
-            if srv.hostname.is_empty() {
-                continue;
-            }
-            if turn_added >= MAX_TURN_SERVERS_COUNT {
-                warn!(
-                    "IceTransport: dropping additional TURN server {}:{} \
-                     (libjuice cap is {})",
-                    srv.hostname, srv.port, MAX_TURN_SERVERS_COUNT
-                );
-                continue;
-            }
-            // C++ icetransport.cpp:158 warns that only TurnUdp is
-            // supported with libjuice; we mirror that — non-UDP entries
-            // are dropped with a warning rather than silently passed.
-            if !matches!(
-                srv.relay_type,
-                crate::configuration::RelayType::TurnUdp
-            ) {
-                warn!(
-                    "IceTransport: skipping TURN server {}:{} — only \
-                     TurnUdp is supported with libjuice (got {:?})",
-                    srv.hostname, srv.port, srv.relay_type
-                );
-                continue;
-            }
-            let port = if srv.port == 0 { 3478 } else { srv.port };
-            builder = builder
-                .add_turn_server(
-                    srv.hostname.clone(),
-                    port,
-                    srv.username.clone(),
-                    srv.password.clone(),
-                )
+        //
+        // When ICE UDP mux is enabled, the agent must SHARE the process-wide
+        // socket registered by `juice_mux_listen` (the C `IceUdpMuxListener`
+        // adapter) rather than bind its own. We join that registry on
+        // `(bind_address, port_range_begin)`, mirroring upstream
+        // `icetransport.cpp`, which passes the same knobs to `juice_create`
+        // with `JUICE_CONCURRENCY_MODE_MUX`. A shared-socket agent ignores the
+        // per-agent bind/port-range/STUN/TURN builder knobs, so they're skipped
+        // on this path; `join_udp_mux` mints a random ufrag/pwd and registers
+        // the agent so a normally-exchanged offer/answer routes the offerer's
+        // checks to it by USERNAME.
+        let agent = if config.enable_ice_udp_mux {
+            let mux = libjuice::join_udp_mux(bind_addr, config.port_range_begin, handler)
                 .map_err(IceTransportError::Juice)?;
-            turn_added += 1;
-        }
+            AgentHandle::Mux(mux)
+        } else {
+            let mut builder = libjuice::Agent::builder(handler);
 
-        // Finally, construct the agent (which spawns the driver task).
-        let agent = builder.build().map_err(IceTransportError::Juice)?;
+            // First STUN entry wins; rest are logged + dropped.
+            let mut stun_taken = false;
+            for srv in &config.ice_servers {
+                if !matches!(srv.typ, IceServerType::Stun) {
+                    continue;
+                }
+                if srv.hostname.is_empty() {
+                    continue;
+                }
+                if !stun_taken {
+                    let port = if srv.port == 0 { 3478 } else { srv.port };
+                    builder = builder.with_stun(srv.hostname.clone(), port);
+                    stun_taken = true;
+                } else {
+                    warn!(
+                        "IceTransport: dropping extra STUN server {}:{} \
+                     (libjuice only supports one STUN server in Config)",
+                        srv.hostname, srv.port
+                    );
+                }
+            }
+
+            // Bind address.
+            if let Some(ip) = bind_addr {
+                builder = builder.with_bind_address(&ip);
+            }
+
+            // Port range — only override when narrower than the default
+            // (matches the C++ guard at icetransport.cpp:122).
+            let pr_begin = config.port_range_begin;
+            let pr_end = config.port_range_end;
+            if pr_begin > 1024 || (pr_end != 0 && pr_end != 65535) {
+                builder = builder.with_port_range(pr_begin, pr_end);
+            }
+
+            // TURN servers (cap at MAX_TURN_SERVERS_COUNT, matching the C++
+            // counter at icetransport.cpp:163).
+            let mut turn_added = 0usize;
+            for srv in &config.ice_servers {
+                if !matches!(srv.typ, IceServerType::Turn) {
+                    continue;
+                }
+                if srv.hostname.is_empty() {
+                    continue;
+                }
+                if turn_added >= MAX_TURN_SERVERS_COUNT {
+                    warn!(
+                        "IceTransport: dropping additional TURN server {}:{} \
+                     (libjuice cap is {})",
+                        srv.hostname, srv.port, MAX_TURN_SERVERS_COUNT
+                    );
+                    continue;
+                }
+                // C++ icetransport.cpp:158 warns that only TurnUdp is
+                // supported with libjuice; we mirror that — non-UDP entries
+                // are dropped with a warning rather than silently passed.
+                if !matches!(srv.relay_type, crate::configuration::RelayType::TurnUdp) {
+                    warn!(
+                        "IceTransport: skipping TURN server {}:{} — only \
+                     TurnUdp is supported with libjuice (got {:?})",
+                        srv.hostname, srv.port, srv.relay_type
+                    );
+                    continue;
+                }
+                let port = if srv.port == 0 { 3478 } else { srv.port };
+                builder = builder
+                    .add_turn_server(
+                        srv.hostname.clone(),
+                        port,
+                        srv.username.clone(),
+                        srv.password.clone(),
+                    )
+                    .map_err(IceTransportError::Juice)?;
+                turn_added += 1;
+            }
+
+            // Finally, construct the agent (which spawns the driver task).
+            AgentHandle::Plain(builder.build().map_err(IceTransportError::Juice)?)
+        };
 
         Ok(Arc::new(IceTransport {
             agent,
@@ -509,10 +550,7 @@ impl IceTransport {
     /// of the remote. An `Answer` with `ActPass` is rejected by libjuice
     /// itself; here we accept the description and let libjuice surface
     /// any incompatibility.
-    pub fn set_remote_description(
-        &self,
-        desc: &Description,
-    ) -> Result<(), IceTransportError> {
+    pub fn set_remote_description(&self, desc: &Description) -> Result<(), IceTransportError> {
         if self.bridge.closed.load(Ordering::SeqCst) {
             return Err(IceTransportError::Closed);
         }
@@ -548,10 +586,7 @@ impl IceTransport {
     /// `icetransport.cpp:229` short-circuits on
     /// `!candidate.isResolved()`). Returns an error if libjuice's
     /// command channel is gone.
-    pub fn add_remote_candidate(
-        &self,
-        candidate: &Candidate,
-    ) -> Result<bool, IceTransportError> {
+    pub fn add_remote_candidate(&self, candidate: &Candidate) -> Result<bool, IceTransportError> {
         if self.bridge.closed.load(Ordering::SeqCst) {
             return Err(IceTransportError::Closed);
         }
@@ -586,9 +621,7 @@ impl IceTransport {
 
     /// Returns the selected `(local, remote)` candidate pair, parsing
     /// libjuice's SDP back into dc [`Candidate`]s.
-    pub fn get_selected_pair(
-        &self,
-    ) -> Result<(Candidate, Candidate), IceTransportError> {
+    pub fn get_selected_pair(&self) -> Result<(Candidate, Candidate), IceTransportError> {
         let (local_sdp, remote_sdp) = self
             .agent
             .get_selected_candidates()
@@ -602,9 +635,7 @@ impl IceTransport {
     /// Returns the selected `(local_addr, remote_addr)` socket addresses
     /// in libjuice's `"ip port"` form. Errors out if no pair has been
     /// nominated yet.
-    pub fn get_selected_addresses(
-        &self,
-    ) -> Result<(String, String), IceTransportError> {
+    pub fn get_selected_addresses(&self) -> Result<(String, String), IceTransportError> {
         self.agent
             .get_selected_addresses()
             .map_err(|_| IceTransportError::NoSelectedPair)
@@ -1137,8 +1168,7 @@ mod tests {
             a.gather().expect("a gather");
             assert!(
                 wait_for(
-                    || a
-                        .agent
+                    || a.agent
                         .get_local_description()
                         .map(|s| s.contains("end-of-candidates"))
                         .unwrap_or(false),
@@ -1159,8 +1189,7 @@ mod tests {
             b.gather().expect("b gather");
             assert!(
                 wait_for(
-                    || b
-                        .agent
+                    || b.agent
                         .get_local_description()
                         .map(|s| s.contains("end-of-candidates"))
                         .unwrap_or(false),
@@ -1189,10 +1218,7 @@ mod tests {
 
             // --- 6. Wait for both sides to reach Connected ---
             let connected = wait_for(
-                || {
-                    a_connected.load(Ordering::SeqCst)
-                        && b_connected.load(Ordering::SeqCst)
-                },
+                || a_connected.load(Ordering::SeqCst) && b_connected.load(Ordering::SeqCst),
                 5000,
             )
             .await;
@@ -1252,7 +1278,10 @@ mod tests {
             // The synchronous part of gather() must have pushed
             // InProgress already.
             assert!(
-                gstates.lock().iter().any(|g| *g == GatheringState::InProgress),
+                gstates
+                    .lock()
+                    .iter()
+                    .any(|g| *g == GatheringState::InProgress),
                 "expected InProgress in {:?}",
                 gstates.lock().clone()
             );
@@ -1347,11 +1376,9 @@ mod tests {
             // Construct a syntactically-valid host candidate so the
             // pre-flight `is_resolved` check doesn't short-circuit
             // before the closed check.
-            let cand = Candidate::parse(
-                "candidate:1 1 UDP 2122252543 127.0.0.1 54321 typ host",
-                "0",
-            )
-            .expect("parse cand");
+            let cand =
+                Candidate::parse("candidate:1 1 UDP 2122252543 127.0.0.1 54321 typ host", "0")
+                    .expect("parse cand");
             let err = t
                 .add_remote_candidate(&cand)
                 .expect_err("add_remote_candidate after close must fail");

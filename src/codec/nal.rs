@@ -157,7 +157,11 @@ pub fn split_frame(frame: &[u8], separator: Separator) -> Vec<Vec<u8>> {
         while index < frame.len() {
             state = start_sequence_match_succ(state, frame[index], separator);
             if state == StartSeqMatch::LongMatch || state == StartSeqMatch::ShortMatch {
-                let seq_len = if state == StartSeqMatch::LongMatch { 4 } else { 3 };
+                let seq_len = if state == StartSeqMatch::LongMatch {
+                    4
+                } else {
+                    3
+                };
                 let nalu_end = index - seq_len;
                 state = StartSeqMatch::NoMatch;
                 // end index inclusive in C++: begin..(naluEndIndex + 1)

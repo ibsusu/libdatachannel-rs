@@ -37,7 +37,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 
 use crate::rtp::{
-    is_rtcp, RtcpNack, RtcpPli, RtcpRemb, RtcpRr, RtcpSr, RtpHeader, Ssrc, RTCP_PT_RR, RTCP_PT_SR,
+    RTCP_PT_RR, RTCP_PT_SR, RtcpNack, RtcpPli, RtcpRemb, RtcpRr, RtcpSr, RtpHeader, Ssrc, is_rtcp,
 };
 
 /// Whether a [`Message`] carries RTP media or RTCP control. Mirrors the
@@ -646,7 +646,9 @@ impl MediaHandler for PliHandler {
             // PSFB/PLI (PT=206, FMT=1).
             if scan_compound_rtcp(&message.data, |header| {
                 let pt = header.payload_type;
-                (pt == 196) || (pt == crate::rtp::RTCP_PT_PSFB && header.report_count == crate::rtp::RTCP_FMT_PLI)
+                (pt == 196)
+                    || (pt == crate::rtp::RTCP_PT_PSFB
+                        && header.report_count == crate::rtp::RTCP_FMT_PLI)
             }) {
                 (self.on_pli)();
             }
@@ -702,7 +704,10 @@ impl MediaHandler for RembHandler {
 /// Walk a compound RTCP packet, invoking `predicate` on each sub-packet header.
 /// Returns `true` as soon as the predicate matches. Mirrors the
 /// `offset += lengthInBytes()` loop the C++ PLI/REMB handlers use.
-fn scan_compound_rtcp(data: &[u8], mut predicate: impl FnMut(&crate::rtp::RtcpHeader) -> bool) -> bool {
+fn scan_compound_rtcp(
+    data: &[u8],
+    mut predicate: impl FnMut(&crate::rtp::RtcpHeader) -> bool,
+) -> bool {
     let mut offset = 0usize;
     while offset + crate::rtp::RTCP_HEADER_SIZE <= data.len() {
         let Some(header) = crate::rtp::RtcpHeader::parse(&data[offset..]) else {
@@ -964,7 +969,11 @@ mod tests {
         assert!(emitted);
         assert_eq!(reporter.packet_count(), 2, "only our SSRC counts");
         assert_eq!(reporter.payload_octets(), 20, "2 x 10-byte payloads");
-        assert_eq!(reporter.last_reported_timestamp(), 9900, "latest TS for our SSRC");
+        assert_eq!(
+            reporter.last_reported_timestamp(),
+            9900,
+            "latest TS for our SSRC"
+        );
 
         let sent = sender.take();
         assert_eq!(sent.len(), 1);
@@ -1056,8 +1065,8 @@ mod tests {
 
     #[test]
     fn pli_handler_fires_on_pli() {
-        use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
         // Handlers must be `Send` (they live behind a Track's `Arc<Mutex<_>>`),
         // so the test callback uses an `Arc<Atomic*>` rather than `Rc<Cell<_>>`.
         let count = Arc::new(AtomicU32::new(0));
@@ -1072,7 +1081,11 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 1);
 
         // A REMB must NOT trigger the PLI callback.
-        let remb = RtcpRemb { sender_ssrc: 1, bitrate: 1000, ssrcs: vec![1] };
+        let remb = RtcpRemb {
+            sender_ssrc: 1,
+            bitrate: 1000,
+            ssrcs: vec![1],
+        };
         let mut msgs2 = vec![Message::control(remb.serialize())];
         handler.incoming(&mut msgs2, &mut Sender::new());
         assert_eq!(count.load(Ordering::SeqCst), 1);
@@ -1080,15 +1093,19 @@ mod tests {
 
     #[test]
     fn remb_handler_reports_bitrate() {
-        use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
         let got = Arc::new(AtomicU64::new(0));
         let g = got.clone();
         let mut handler = RembHandler::new(move |br| {
             g.store(br, Ordering::SeqCst);
         });
 
-        let remb = RtcpRemb { sender_ssrc: 9, bitrate: 1_200_000, ssrcs: vec![9] };
+        let remb = RtcpRemb {
+            sender_ssrc: 9,
+            bitrate: 1_200_000,
+            ssrcs: vec![9],
+        };
         let expected = RtcpRemb::decode_bitrate(RtcpRemb::encode_bitrate(1, 1_200_000));
         let mut msgs = vec![Message::control(remb.serialize())];
         handler.incoming(&mut msgs, &mut Sender::new());
@@ -1148,9 +1165,7 @@ mod tests {
         // 8000 bits/s = 1000 bytes/s. Interval 100 ms => max budget 100 bytes.
         let mut pacer = PacingHandler::new(8000.0, 100);
         // Queue five 50-byte packets (header 12 + 38 payload = 50).
-        let mut msgs: Vec<Message> = (0..5)
-            .map(|i| rtp_packet(1, i, 0, &[0u8; 38]))
-            .collect();
+        let mut msgs: Vec<Message> = (0..5).map(|i| rtp_packet(1, i, 0, &[0u8; 38])).collect();
         assert_eq!(msgs[0].len(), 50);
         pacer.outgoing(&mut msgs, &mut Sender::new());
         assert!(msgs.is_empty(), "outgoing clears the vector (buffered)");
@@ -1171,9 +1186,7 @@ mod tests {
     #[test]
     fn pacing_budget_is_capped_at_one_interval() {
         let mut pacer = PacingHandler::new(8000.0, 100); // 1000 B/s, cap 100 B
-        let mut msgs: Vec<Message> = (0..10)
-            .map(|i| rtp_packet(1, i, 0, &[0u8; 38]))
-            .collect();
+        let mut msgs: Vec<Message> = (0..10).map(|i| rtp_packet(1, i, 0, &[0u8; 38])).collect();
         pacer.outgoing(&mut msgs, &mut Sender::new());
         // A huge elapsed time must NOT release everything: budget caps at 100 B.
         let released = pacer.tick(100_000);

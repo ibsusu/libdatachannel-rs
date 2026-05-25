@@ -18,8 +18,8 @@
 //! Audio/Video media modelling inside `description.rs`'s parser is a separate
 //! follow-up; the `Media` here is sufficient for a Track's `description()`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 use thiserror::Error;
@@ -71,11 +71,7 @@ impl Codec {
     /// The SDP media kind string (`"video"` or `"audio"`).
     #[must_use]
     pub fn media_kind(self) -> &'static str {
-        if self.is_video() {
-            "video"
-        } else {
-            "audio"
-        }
+        if self.is_video() { "video" } else { "audio" }
     }
 
     /// Default RTP clock rate for this codec (Hz). Video is 90 kHz; Opus 48 kHz.
@@ -575,12 +571,7 @@ impl Track {
     /// packets a [`PacingHandler`](crate::media_handler::PacingHandler) is
     /// holding could be released via its `tick`; SR reports from a reporter).
     fn send_outgoing_rtp(&self, packets: Vec<Vec<u8>>) -> Result<(), TrackError> {
-        let srtp = self
-            .inner
-            .lock()
-            .srtp
-            .clone()
-            .ok_or(TrackError::NotOpen)?;
+        let srtp = self.inner.lock().srtp.clone().ok_or(TrackError::NotOpen)?;
 
         // Fast path: no chain installed -> send directly (preserves #27).
         if self.inner.lock().chain.is_empty() {
@@ -626,9 +617,7 @@ impl Track {
             return;
         }
         let control = is_rtcp(packet);
-        if !control
-            && matches!(self.direction, Direction::SendOnly | Direction::Inactive)
-        {
+        if !control && matches!(self.direction, Direction::SendOnly | Direction::Inactive) {
             return; // bad direction for media
         }
 
@@ -857,10 +846,8 @@ mod tests {
         use crate::configuration::Configuration;
         use crate::description::{FingerprintAlgorithm, Role, Type as DescriptionType};
         use crate::dtls_transport::{DtlsTransport, DtlsTransportCallbacks};
-        use crate::ice_transport::{
-            GatheringState, IceTransport, IceTransportCallbacks,
-        };
-        use crate::srtp_transport::{SrtpTransportCallbacks};
+        use crate::ice_transport::{GatheringState, IceTransport, IceTransportCallbacks};
+        use crate::srtp_transport::SrtpTransportCallbacks;
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -869,8 +856,8 @@ mod tests {
 
         rt.block_on(async {
             async fn wait_for<F: FnMut() -> bool>(mut pred: F, timeout_ms: u64) -> bool {
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_millis(timeout_ms);
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
                 while std::time::Instant::now() < deadline {
                     if pred() {
                         return true;
@@ -909,8 +896,12 @@ mod tests {
 
             let cert_a = Certificate::generate_default().expect("cert a");
             let cert_b = Certificate::generate_default().expect("cert b");
-            let fp_a = cert_a.fingerprint(FingerprintAlgorithm::Sha256).expect("fp a");
-            let fp_b = cert_b.fingerprint(FingerprintAlgorithm::Sha256).expect("fp b");
+            let fp_a = cert_a
+                .fingerprint(FingerprintAlgorithm::Sha256)
+                .expect("fp a");
+            let fp_b = cert_b
+                .fingerprint(FingerprintAlgorithm::Sha256)
+                .expect("fp b");
 
             let dtls_a = DtlsTransport::new(
                 Arc::clone(&ice_a),
@@ -933,8 +924,7 @@ mod tests {
                 TrackInit::new(Direction::RecvOnly, Codec::H264, 96, 0x0BAD_F00D, "video0"),
                 TrackCallbacks::default(),
             );
-            let recovered: Arc<Mutex<Vec<(Vec<u8>, u32, u8)>>> =
-                Arc::new(Mutex::new(Vec::new()));
+            let recovered: Arc<Mutex<Vec<(Vec<u8>, u32, u8)>>> = Arc::new(Mutex::new(Vec::new()));
             let recovered_cb = recovered.clone();
             track_b.set_callbacks(TrackCallbacks {
                 on_frame: Arc::new(move |p, ts, pt| {
@@ -944,11 +934,9 @@ mod tests {
             });
 
             let track_b_for_srtp = track_b.clone();
-            let srtp_a = SrtpTransport::new(
-                Arc::new(dtls_a.clone()),
-                SrtpTransportCallbacks::default(),
-            )
-            .expect("srtp a");
+            let srtp_a =
+                SrtpTransport::new(Arc::new(dtls_a.clone()), SrtpTransportCallbacks::default())
+                    .expect("srtp a");
             let srtp_b = SrtpTransport::new(
                 Arc::new(dtls_b.clone()),
                 SrtpTransportCallbacks {
@@ -966,24 +954,14 @@ mod tests {
 
             // Drive ICE.
             ice_a.gather().expect("a gather");
-            assert!(
-                wait_for(
-                    || ice_a.gathering_state() == GatheringState::Complete,
-                    3000
-                )
-                .await
-            );
+            assert!(wait_for(|| ice_a.gathering_state() == GatheringState::Complete, 3000).await);
             let desc_a = ice_a.get_local_description(DescriptionType::Offer).unwrap();
             ice_b.set_remote_description(&desc_a).unwrap();
             ice_b.gather().expect("b gather");
-            assert!(
-                wait_for(
-                    || ice_b.gathering_state() == GatheringState::Complete,
-                    3000
-                )
-                .await
-            );
-            let desc_b = ice_b.get_local_description(DescriptionType::Answer).unwrap();
+            assert!(wait_for(|| ice_b.gathering_state() == GatheringState::Complete, 3000).await);
+            let desc_b = ice_b
+                .get_local_description(DescriptionType::Answer)
+                .unwrap();
             ice_a.set_remote_description(&desc_b).unwrap();
             for c in a_cands.lock().iter() {
                 ice_b.add_remote_candidate(c).unwrap();
@@ -1009,8 +987,7 @@ mod tests {
             let n = track_a.send(&payload).expect("track a send");
             assert_eq!(n, 1, "generic packetizer emits one RTP packet");
 
-            let arrived =
-                wait_for(|| !recovered.lock().is_empty(), 5000).await;
+            let arrived = wait_for(|| !recovered.lock().is_empty(), 5000).await;
             assert!(arrived, "frame did not arrive at peer track");
             let got = recovered.lock();
             assert_eq!(got.len(), 1);
@@ -1194,8 +1171,8 @@ mod tests {
         let (replies, handled) = track.inner.lock().chain.request_bitrate(250_000);
         assert!(handled, "RtcpReceivingSession honours the bitrate request");
         assert_eq!(replies.len(), 1, "exactly one REMB packet queued");
-        let remb = crate::rtp::RtcpRemb::parse(&replies[0].data)
-            .expect("queued reply parses as a REMB");
+        let remb =
+            crate::rtp::RtcpRemb::parse(&replies[0].data).expect("queued reply parses as a REMB");
         assert_eq!(remb.bitrate, 250_000, "REMB carries the requested bitrate");
 
         // The public method succeeds (no SRTP bound -> flush is a no-op).
