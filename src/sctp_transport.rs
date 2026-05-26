@@ -41,8 +41,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::{
     Arc, Mutex as StdMutex, Once, Weak,
-    atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
 };
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver as WorkReceiver, Sender as WorkSender};
 use once_cell::sync::Lazy;
@@ -578,6 +579,155 @@ thread_local! {
     static PROCESSING: Cell<usize> = const { Cell::new(0) };
 }
 
+// ---------------------------------------------------------------------------
+// SCTP instrumentation (env-gated: WB_SCTP_TRACE=1)
+//
+// Lock-free per-transport counters + a background printer thread. Built to
+// settle one question under concurrent WAN load: when a file echo stalls, is a
+// pool worker *stuck inside the user `on_message` callback* (so `drain_recv`
+// never returns and the worker can never process its own SENDER_DRY → flush),
+// or has inbound simply stopped arriving? `on_msg_busy_since` is the smoking
+// gun: a frozen non-zero value means the callback is blocking the worker.
+// ---------------------------------------------------------------------------
+
+/// Monotonic epoch for all trace timestamps.
+static TRACE_EPOCH: Lazy<Instant> = Lazy::new(Instant::now);
+/// Live per-transport traces; the printer thread snapshots these.
+static TRACE_REGISTRY: Lazy<StdMutex<Vec<Weak<SctpTrace>>>> =
+    Lazy::new(|| StdMutex::new(Vec::new()));
+/// One-shot guard so the printer thread spawns at most once.
+static TRACE_PRINTER: Once = Once::new();
+/// Per-process trace id allocator (0, 1, 2, …).
+static TRACE_NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+
+/// Nanoseconds since [`TRACE_EPOCH`]. `0` is reserved to mean "idle".
+fn now_ns() -> u64 {
+    TRACE_EPOCH.elapsed().as_nanos() as u64
+}
+
+/// `true` when `WB_SCTP_TRACE` is set to a non-empty, non-`0` value.
+fn trace_enabled() -> bool {
+    std::env::var_os("WB_SCTP_TRACE").is_some_and(|v| {
+        let s = v.to_string_lossy();
+        !s.is_empty() && s != "0"
+    })
+}
+
+/// Per-transport instrumentation. All fields are lock-free atomics so the hot
+/// paths (send / drain / dispatch) pay only a relaxed add or store.
+#[derive(Default)]
+struct SctpTrace {
+    id: usize,
+    // monotonic counters
+    feed_calls: AtomicU64,
+    drain_calls: AtomicU64,
+    recv_loops: AtomicU64,
+    drain_msgs: AtomicU64,
+    send_calls: AtomicU64,
+    send_now_ok: AtomicU64,
+    send_wouldblock: AtomicU64,
+    flush_calls: AtomicU64,
+    // gauges
+    queued_msgs: AtomicUsize,
+    buffered_total: AtomicUsize,
+    // "busy since" timestamps (ns from epoch); 0 = idle. A value that stops
+    // advancing while the wall clock moves on is a wedged section.
+    on_msg_busy_since: AtomicU64,
+    worker_busy_since: AtomicU64,
+    /// 0 idle, 1 Connect, 2 Inbound.
+    worker_cmd: AtomicU8,
+}
+
+impl SctpTrace {
+    fn new() -> Arc<Self> {
+        let t = Arc::new(SctpTrace {
+            id: TRACE_NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            ..Default::default()
+        });
+        TRACE_REGISTRY.lock().unwrap().push(Arc::downgrade(&t));
+        start_trace_printer();
+        t
+    }
+
+    fn mark_onmsg_start(&self) {
+        self.on_msg_busy_since.store(now_ns(), Ordering::Relaxed);
+    }
+    fn mark_onmsg_end(&self) {
+        self.on_msg_busy_since.store(0, Ordering::Relaxed);
+    }
+    fn mark_worker_start(&self, cmd: u8) {
+        self.worker_cmd.store(cmd, Ordering::Relaxed);
+        self.worker_busy_since.store(now_ns(), Ordering::Relaxed);
+    }
+    fn mark_worker_end(&self) {
+        self.worker_busy_since.store(0, Ordering::Relaxed);
+        self.worker_cmd.store(0, Ordering::Relaxed);
+    }
+
+    fn print(&self, now: u64) {
+        let busy = |since: u64| -> f64 {
+            if since == 0 {
+                0.0
+            } else {
+                now.saturating_sub(since) as f64 / 1e9
+            }
+        };
+        let cmd = match self.worker_cmd.load(Ordering::Relaxed) {
+            1 => "Connect",
+            2 => "Inbound",
+            _ => "idle",
+        };
+        let g = Ordering::Relaxed;
+        eprintln!(
+            "[sctp-trace t={:.1}s id={} feed={} drain={} recvloops={} msgs={} \
+             send={} ok={} wb={} flush={} q={} buf={} \
+             onmsg_busy={:.3}s worker_busy={:.3}s/{}]",
+            now as f64 / 1e9,
+            self.id,
+            self.feed_calls.load(g),
+            self.drain_calls.load(g),
+            self.recv_loops.load(g),
+            self.drain_msgs.load(g),
+            self.send_calls.load(g),
+            self.send_now_ok.load(g),
+            self.send_wouldblock.load(g),
+            self.flush_calls.load(g),
+            self.queued_msgs.load(g),
+            self.buffered_total.load(g),
+            busy(self.on_msg_busy_since.load(g)),
+            busy(self.worker_busy_since.load(g)),
+            cmd,
+        );
+    }
+}
+
+/// Spawn the trace printer thread (once per process). It snapshots every live
+/// trace every `WB_SCTP_TRACE_MS` ms (default 500) and prunes dead entries.
+fn start_trace_printer() {
+    TRACE_PRINTER.call_once(|| {
+        let interval_ms: u64 = std::env::var("WB_SCTP_TRACE_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(500);
+        std::thread::Builder::new()
+            .name("sctp-trace".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_millis(interval_ms));
+                    let now = now_ns();
+                    let mut reg = TRACE_REGISTRY.lock().unwrap();
+                    reg.retain(|w| w.strong_count() > 0);
+                    for w in reg.iter() {
+                        if let Some(t) = w.upgrade() {
+                            t.print(now);
+                        }
+                    }
+                }
+            })
+            .expect("spawn sctp-trace printer thread");
+    });
+}
+
 /// The SCTP transport. Cheap to clone via the surrounding `Arc<Self>`,
 /// matching the [`DtlsTransport`] / [`crate::IceTransport`] pattern.
 pub struct SctpTransport {
@@ -614,6 +764,8 @@ pub struct SctpTransport {
     /// after any in-flight worker call completes (replaces the old
     /// join-the-worker step). See [`PROCESSING`] for the re-entrancy escape.
     proc_lock: Mutex<()>,
+    /// Env-gated instrumentation (`WB_SCTP_TRACE=1`); `None` in normal runs.
+    trace: Option<Arc<SctpTrace>>,
 }
 
 impl std::fmt::Debug for SctpTransport {
@@ -664,6 +816,7 @@ impl SctpTransport {
             max_message_size: DEFAULT_LOCAL_MAX_MESSAGE_SIZE,
             tx: StdMutex::new(Some(tx)),
             proc_lock: Mutex::new(()),
+            trace: trace_enabled().then(SctpTrace::new),
         });
 
         // Install our recv shim + auto-connect hook on the DTLS transport.
@@ -997,6 +1150,9 @@ impl SctpTransport {
             return Err(SctpTransportError::MessageTooLarge(msg.data.len()));
         }
 
+        if let Some(t) = &self.trace {
+            t.send_calls.fetch_add(1, Ordering::Relaxed);
+        }
         let mut st = self.send_state.lock();
         // Flush the queue, and if nothing is pending, try to send directly.
         if self.try_send_queue(&mut st)? && self.try_send_message(msg, reliability)? {
@@ -1087,9 +1243,15 @@ impl SctpTransport {
         if ret < 0 {
             let e = errno();
             if is_wouldblock(e) {
+                if let Some(t) = &self.trace {
+                    t.send_wouldblock.fetch_add(1, Ordering::Relaxed);
+                }
                 return Ok(false);
             }
             return Err(SctpTransportError::Usrsctp("usrsctp_sendv", e));
+        }
+        if let Some(t) = &self.trace {
+            t.send_now_ok.fetch_add(1, Ordering::Relaxed);
         }
         Ok(true)
     }
@@ -1124,6 +1286,9 @@ impl SctpTransport {
         if self.closed.load(Ordering::SeqCst) || !matches!(self.state(), SctpState::Connected) {
             return;
         }
+        if let Some(t) = &self.trace {
+            t.flush_calls.fetch_add(1, Ordering::Relaxed);
+        }
         let mut st = self.send_state.lock();
         if let Err(e) = self.try_send_queue(&mut st) {
             warn!("SctpTransport: flush failed: {e}");
@@ -1148,6 +1313,11 @@ impl SctpTransport {
             st.buffered_amount.remove(&stream);
         } else {
             st.buffered_amount.insert(stream, amount);
+        }
+        if let Some(t) = &self.trace {
+            t.queued_msgs.store(st.queue.len(), Ordering::Relaxed);
+            t.buffered_total
+                .store(st.buffered_amount.values().sum(), Ordering::Relaxed);
         }
         let cb = {
             let g = self.callbacks.lock();
@@ -1241,6 +1411,9 @@ impl SctpTransport {
         if !instance_is_live(self_ptr as usize) {
             return;
         }
+        if let Some(t) = &self.trace {
+            t.feed_calls.fetch_add(1, Ordering::Relaxed);
+        }
         trace!(len = data.len(), "SctpTransport::feed_inbound → conninput");
         unsafe {
             sys::usrsctp_conninput(self_ptr, data.as_ptr() as *const c_void, data.len(), 0);
@@ -1268,9 +1441,15 @@ impl SctpTransport {
     fn drain_recv(&self, sock: *mut sys::socket) {
         const BUF: usize = 65536;
         let mut buffer = vec![0u8; BUF];
+        if let Some(t) = &self.trace {
+            t.drain_calls.fetch_add(1, Ordering::Relaxed);
+        }
         loop {
             if self.closed.load(Ordering::SeqCst) {
                 return;
+            }
+            if let Some(t) = &self.trace {
+                t.recv_loops.fetch_add(1, Ordering::Relaxed);
             }
             let mut info: sys::sctp_rcvinfo = unsafe { std::mem::zeroed() };
             let mut infolen = std::mem::size_of::<sys::sctp_rcvinfo>() as sys::socklen_t;
@@ -1356,7 +1535,14 @@ impl SctpTransport {
             let g = self.callbacks.lock();
             Arc::clone(&g.on_message)
         };
-        (cb)(msg);
+        if let Some(t) = &self.trace {
+            t.drain_msgs.fetch_add(1, Ordering::Relaxed);
+            t.mark_onmsg_start();
+            (cb)(msg);
+            t.mark_onmsg_end();
+        } else {
+            (cb)(msg);
+        }
     }
 
     fn process_notification(&self, notif: &[u8]) {
@@ -1492,9 +1678,18 @@ fn pool_worker_loop(rx: WorkReceiver<WorkItem>) {
         // Re-check under the lock: close() may have run between the early
         // check and acquiring proc_lock.
         if !this.closed.load(Ordering::SeqCst) {
+            if let Some(t) = &this.trace {
+                t.mark_worker_start(match item.cmd {
+                    SctpCommand::Connect => 1,
+                    SctpCommand::Inbound(_) => 2,
+                });
+            }
             match item.cmd {
                 SctpCommand::Connect => this.connect(),
                 SctpCommand::Inbound(data) => this.feed_inbound(&data),
+            }
+            if let Some(t) = &this.trace {
+                t.mark_worker_end();
             }
         }
         PROCESSING.with(|p| p.set(prev));

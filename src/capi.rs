@@ -52,11 +52,12 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 
 use crate::{
-    Certificate, CertificateType, Configuration, DataChannel, DataChannelCallbacks,
-    DataChannelInit, Description, IceServer, IceTransportPolicy, PeerConnection,
-    PeerConnectionCallbacks, PeerConnectionState, Reliability, ReliabilityType, Track,
-    Type as DescriptionType, WebSocket, WebSocketConfig, WebSocketServer, WebSocketServerConfig,
-    WsMessage,
+    Av1Packetization, Av1RtpPacketizer, Certificate, CertificateType, CodecPacketizer,
+    Configuration, DEFAULT_MAX_FRAGMENT_SIZE, DataChannel, DataChannelCallbacks, DataChannelInit,
+    Description, H264RtpPacketizer, H265RtpPacketizer, IceServer, IceTransportPolicy, NalSeparator,
+    PeerConnection, PeerConnectionCallbacks, PeerConnectionState, Reliability, ReliabilityType,
+    RtpPacketizationConfig, SsrcEntry, Track, Type as DescriptionType, Vp8RtpPacketizer, WebSocket,
+    WebSocketConfig, WebSocketServer, WebSocketServerConfig, WsMessage,
 };
 
 // ===========================================================================
@@ -297,6 +298,68 @@ pub struct RtcTrackInit {
     pub profile: *const c_char,
 }
 
+/// Mirrors `rtcPacketizerInit` (`rtc.h`). Field order/types match exactly so
+/// the struct is byte-compatible with a C caller. The `nalSeparator` /
+/// `obuPacketization` fields are `int`-sized C enums (see the `RTC_NAL_*` /
+/// `RTC_OBU_*` constants). The trailing playout-delay and color-space fields are
+/// accepted for ABI compatibility but have no backing in the Rust packetizers
+/// (the upstream header-extension writers are unported), so they are ignored.
+#[repr(C)]
+pub struct RtcPacketizerInit {
+    /// `uint32_t ssrc`
+    pub ssrc: u32,
+    /// `const char *cname`
+    pub cname: *const c_char,
+    /// `uint8_t payloadType`
+    pub payloadType: u8,
+    /// `uint32_t clockRate`
+    pub clockRate: u32,
+    /// `uint16_t sequenceNumber`
+    pub sequenceNumber: u16,
+    /// `uint32_t timestamp`
+    pub timestamp: u32,
+    /// `uint16_t maxFragmentSize` — 0 selects the default (H264/H265/AV1).
+    pub maxFragmentSize: u16,
+    /// `rtcNalUnitSeparator nalSeparator` (H264/H265 only).
+    pub nalSeparator: c_int,
+    /// `rtcObuPacketization obuPacketization` (AV1 only).
+    pub obuPacketization: c_int,
+    /// `uint8_t playoutDelayId` (unported — ignored).
+    pub playoutDelayId: u8,
+    /// `uint16_t playoutDelayMin` (unported — ignored).
+    pub playoutDelayMin: u16,
+    /// `uint16_t playoutDelayMax` (unported — ignored).
+    pub playoutDelayMax: u16,
+    /// `uint8_t colorSpaceId` (unported — ignored).
+    pub colorSpaceId: u8,
+    /// `uint8_t colorChromaSitingHorz` (unported — ignored).
+    pub colorChromaSitingHorz: u8,
+    /// `uint8_t colorChromaSitingVert` (unported — ignored).
+    pub colorChromaSitingVert: u8,
+    /// `uint8_t colorRange` (unported — ignored).
+    pub colorRange: u8,
+    /// `uint8_t colorPrimaries` (unported — ignored).
+    pub colorPrimaries: u8,
+    /// `uint8_t colorTransfer` (unported — ignored).
+    pub colorTransfer: u8,
+    /// `uint8_t colorMatrix` (unported — ignored).
+    pub colorMatrix: u8,
+}
+
+/// `rtcNalUnitSeparator` values (`rtc.h`).
+pub const RTC_NAL_SEPARATOR_LENGTH: c_int = 0;
+/// `0x00 0x00 0x00 0x01`
+pub const RTC_NAL_SEPARATOR_LONG_START_SEQUENCE: c_int = 1;
+/// `0x00 0x00 0x01`
+pub const RTC_NAL_SEPARATOR_SHORT_START_SEQUENCE: c_int = 2;
+/// long or short start sequence
+pub const RTC_NAL_SEPARATOR_START_SEQUENCE: c_int = 3;
+
+/// `rtcObuPacketization` values (`rtc.h`).
+pub const RTC_OBU_PACKETIZED_OBU: c_int = 0;
+/// one temporal unit per packet
+pub const RTC_OBU_PACKETIZED_TEMPORAL_UNIT: c_int = 1;
+
 /// Mirrors `rtcWsConfiguration` (WebSocket client). Field order/types match
 /// `rtc.h` exactly.
 #[repr(C)]
@@ -508,6 +571,27 @@ fn copy_string(s: &str, buffer: *mut c_char, size: c_int) -> c_int {
         *buffer.add(s.len()) = 0;
     }
     needed as c_int
+}
+
+/// libdatachannel's `copyAndReturn(vector<T>, T *buffer, int size)` for the
+/// array-returning getters:
+/// - `buffer == NULL` → return the element count (a sizing query).
+/// - `size < count` → `RTC_ERR_TOO_SMALL`.
+/// - otherwise copy `items` into `buffer` and return the count.
+///
+/// # Safety
+/// `buffer`, if non-null, must point to at least `size` elements of `T`.
+unsafe fn copy_and_return<T: Copy>(items: &[T], buffer: *mut T, size: c_int) -> c_int {
+    let count = items.len() as c_int;
+    if buffer.is_null() {
+        return count;
+    }
+    if size < count {
+        return RTC_ERR_TOO_SMALL;
+    }
+    // SAFETY: caller guarantees `buffer` holds at least `size >= count` elements.
+    unsafe { std::ptr::copy_nonoverlapping(items.as_ptr(), buffer, items.len()) };
+    count
 }
 
 /// Borrow a `*const c_char` as `&str`. Returns `None` for a null pointer or
@@ -1333,6 +1417,7 @@ pub extern "C" fn rtcDeleteDataChannel(dc: c_int) -> c_int {
                 DC_SLOTS.lock().remove(&dc);
                 DC_RECV.lock().remove(&dc);
                 DC_OPEN_FIRED.lock().remove(&dc);
+                DC_AVAIL_PENDING.lock().remove(&dc);
                 DC_OWNERS.lock().remove(&dc);
                 RTC_ERR_SUCCESS
             }
@@ -1423,6 +1508,7 @@ struct DcCallbackSlots {
     error: Option<RtcErrorCallbackFunc>,
     message: Option<RtcMessageCallbackFunc>,
     buffered_low: Option<RtcBufferedAmountLowCallbackFunc>,
+    available: Option<RtcAvailableCallbackFunc>,
 }
 
 // SAFETY: bare `extern "C" fn` pointers are Send/Sync (code addresses).
@@ -1450,6 +1536,15 @@ static DC_RECV: Lazy<Mutex<HashMap<c_int, VecDeque<(Vec<u8>, bool)>>>> =
 /// already-open channel. Membership is gated by `HashSet::insert` returning
 /// `true` only on first insert.
 static DC_OPEN_FIRED: Lazy<Mutex<HashSet<c_int>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+
+/// DataChannel ids whose pull-API receive queue transitioned empty→non-empty
+/// while no `rtcAvailableCallback` was installed, so the "available" edge has
+/// not yet reached the app. A subsequent `rtcSetAvailableCallback` replays it
+/// once and clears the flag — porting the replay half of upstream's
+/// `synchronized_stored_callback` for `availableCallback`. Unlike a level
+/// signal, it is *not* re-set while the queue stays non-empty: only the next
+/// empty→non-empty edge re-arms it (mirroring `triggerAvailable(count == 1)`).
+static DC_AVAIL_PENDING: Lazy<Mutex<HashSet<c_int>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 
 /// Marshal one inbound DataChannel message to a C `rtcMessageCallback`, applying
 /// rtc.h's size convention: binary → non-negative byte count; text → a
@@ -1514,18 +1609,39 @@ fn install_dc_callbacks(id: c_int) -> c_int {
             for (data, binary) in backlog {
                 deliver_c_message(id, cb, &data, binary);
             }
+            // The queue is now drained to the live handler, so any unmarked
+            // "available" edge no longer applies.
+            DC_AVAIL_PENDING.lock().remove(&id);
             cbs.on_message = Arc::new(move |data, binary| {
                 deliver_c_message(id, cb, data, binary);
             });
         } else {
             // No handler: buffer inbound messages for the pull API
-            // (`rtcReceiveMessage`), as upstream's unset onMessage does.
+            // (`rtcReceiveMessage`), as upstream's unset onMessage does. On the
+            // empty→non-empty transition fire the available callback once
+            // (edge-triggered, mirroring upstream's `triggerAvailable(count ==
+            // 1)`); if none is installed yet, mark the edge pending so a later
+            // `rtcSetAvailableCallback` replays it.
+            let avail = slots.available;
             cbs.on_message = Arc::new(move |data: &[u8], binary: bool| {
-                DC_RECV
-                    .lock()
-                    .entry(id)
-                    .or_default()
-                    .push_back((data.to_vec(), binary));
+                let became_nonempty = {
+                    let mut recv = DC_RECV.lock();
+                    let queue = recv.entry(id).or_default();
+                    let was_empty = queue.is_empty();
+                    queue.push_back((data.to_vec(), binary));
+                    was_empty
+                };
+                if became_nonempty {
+                    match avail {
+                        Some(cb) => {
+                            let ptr = user_pointer(id);
+                            dispatch(move || cb(id, ptr));
+                        }
+                        None => {
+                            DC_AVAIL_PENDING.lock().insert(id);
+                        }
+                    }
+                }
             });
         }
         if let Some(cb) = slots.buffered_low {
@@ -1547,6 +1663,21 @@ fn install_dc_callbacks(id: c_int) -> c_int {
         if dc.is_open() {
             if let Some(d) = open_dispatcher {
                 d();
+            }
+        }
+
+        // Replay a pending "available" edge: the receive queue went non-empty
+        // before an available callback existed. Deliver it once now. Gated on
+        // pull mode — when a message handler is set the backlog was just
+        // flushed to it (and the pending flag cleared above), so there is
+        // nothing to announce. Mirrors `synchronized_stored_callback`'s replay.
+        if slots.message.is_none() {
+            if let Some(cb) = slots.available {
+                let pending = DC_AVAIL_PENDING.lock().remove(&id);
+                if pending {
+                    let ptr = user_pointer(id);
+                    dispatch(move || cb(id, ptr));
+                }
             }
         }
         RTC_ERR_SUCCESS
@@ -1662,7 +1793,11 @@ fn install_ws_callbacks(id: c_int) -> c_int {
             // No handler yet: buffer inbound messages for the backlog / pull API.
             ws.set_on_message(move |msg: WsMessage| {
                 let (data, binary) = ws_message_parts(msg);
-                WS_RECV.lock().entry(id).or_default().push_back((data, binary));
+                WS_RECV
+                    .lock()
+                    .entry(id)
+                    .or_default()
+                    .push_back((data, binary));
             });
         }
 
@@ -1982,20 +2117,25 @@ pub extern "C" fn rtcGetAvailableAmount(id: c_int) -> c_int {
     })
 }
 
-/// `rtcSetAvailableCallback`. No poll-based receive queue exists in the
-/// runtime; accept and ignore.
-//
-// TODO(#22): wire when a poll-based receive queue lands.
+/// `rtcSetAvailableCallback`. Fires when the pull-API receive queue (the buffer
+/// used while no `rtcMessageCallback` is set) transitions empty→non-empty,
+/// porting upstream's `triggerAvailable(count == 1)`. Edge-triggered: it
+/// re-arms after the queue is drained via `rtcReceiveMessage` and the next
+/// message arrives. If the edge already happened before this callback was
+/// registered, it is replayed once on installation (the replay half of
+/// upstream's `synchronized_stored_callback`). Pass `NULL` to clear. No-op for
+/// channels with a live message handler, where inbound data is dispatched
+/// immediately rather than queued.
 #[unsafe(no_mangle)]
 pub extern "C" fn rtcSetAvailableCallback(
     id: c_int,
-    _cb: Option<RtcAvailableCallbackFunc>,
+    cb: Option<RtcAvailableCallbackFunc>,
 ) -> c_int {
     if get_dc(id).is_none() {
-        RTC_ERR_INVALID
-    } else {
-        RTC_ERR_SUCCESS
+        return RTC_ERR_INVALID;
     }
+    DC_SLOTS.lock().entry(id).or_default().available = cb;
+    install_dc_callbacks(id)
 }
 
 /// `rtcReceiveMessage` — dequeue the next inbound message from the pull-API
@@ -2469,6 +2609,184 @@ pub extern "C" fn rtcRequestBitrate(tr: c_int, bitrate: c_uint) -> c_int {
     })
 }
 
+// ===========================================================================
+// Codec RTP packetizers (rtcSet{H264,H265,AV1,VP8}Packetizer)
+// ===========================================================================
+
+/// Build an [`RtpPacketizationConfig`] from a borrowed [`RtcPacketizerInit`].
+/// Mirrors upstream `createRtpPacketizationConfig`: a NULL or non-UTF-8 `cname`
+/// is rejected (`None` → `RTC_ERR_INVALID`). A zero `clockRate` is also rejected
+/// (the Rust config requires a positive clock rate; upstream would later divide
+/// by it). The playout-delay/color fields are intentionally ignored — those
+/// RTP header-extension writers are unported.
+fn rtp_config_from_init(init: &RtcPacketizerInit) -> Option<RtpPacketizationConfig> {
+    // SAFETY: per the C-API contract `cname`, if non-null, is a valid C string.
+    let cname = match unsafe { cstr_opt(init.cname) } {
+        Some(Some(s)) => s,
+        _ => return None, // NULL or invalid-UTF-8 cname
+    };
+    if init.clockRate == 0 {
+        return None;
+    }
+    Some(RtpPacketizationConfig::new(
+        init.ssrc,
+        cname,
+        init.payloadType,
+        init.clockRate,
+        init.sequenceNumber,
+        init.timestamp,
+    ))
+}
+
+/// Map a C `rtcNalUnitSeparator` value to the Rust [`NalSeparator`]. Unknown
+/// values fall back to `Length` (the `0`/default upstream separator).
+fn nal_separator_from_c(v: c_int) -> NalSeparator {
+    match v {
+        RTC_NAL_SEPARATOR_LONG_START_SEQUENCE => NalSeparator::LongStartSequence,
+        RTC_NAL_SEPARATOR_SHORT_START_SEQUENCE => NalSeparator::ShortStartSequence,
+        RTC_NAL_SEPARATOR_START_SEQUENCE => NalSeparator::StartSequence,
+        _ => NalSeparator::Length,
+    }
+}
+
+/// A `maxFragmentSize` of `0` selects the libdatachannel default (1220).
+fn max_fragment_size(v: u16) -> usize {
+    if v == 0 {
+        DEFAULT_MAX_FRAGMENT_SIZE
+    } else {
+        v as usize
+    }
+}
+
+/// `rtcSetH264Packetizer` — install an H.264 (RFC 6184) RTP packetizer on the
+/// track. Mirrors upstream: `createRtpPacketizationConfig(init)` →
+/// `H264RtpPacketizer(nalSeparator, config, maxFragmentSize)` → installed as the
+/// outbound packetizer (the upstream chain head). NULL `init`/`cname`, a zero
+/// `clockRate`, or an unknown track is `RTC_ERR_INVALID`.
+///
+/// # Safety
+/// `init`, if non-null, must point to a valid [`RtcPacketizerInit`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtcSetH264Packetizer(tr: c_int, init: *const RtcPacketizerInit) -> c_int {
+    guard(|| {
+        let t = match get_tr(tr) {
+            Some(t) => t,
+            None => return RTC_ERR_INVALID,
+        };
+        if init.is_null() {
+            return RTC_ERR_INVALID;
+        }
+        // SAFETY: checked non-null; caller guarantees a valid RtcPacketizerInit.
+        let init = unsafe { &*init };
+        let config = match rtp_config_from_init(init) {
+            Some(c) => c,
+            None => return RTC_ERR_INVALID,
+        };
+        let packetizer = H264RtpPacketizer::new(
+            nal_separator_from_c(init.nalSeparator),
+            config,
+            max_fragment_size(init.maxFragmentSize),
+        );
+        t.set_codec_packetizer(CodecPacketizer::H264(packetizer));
+        RTC_ERR_SUCCESS
+    })
+}
+
+/// `rtcSetH265Packetizer` — install an H.265 (RFC 7798) RTP packetizer. Same
+/// shape as [`rtcSetH264Packetizer`].
+///
+/// # Safety
+/// `init`, if non-null, must point to a valid [`RtcPacketizerInit`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtcSetH265Packetizer(tr: c_int, init: *const RtcPacketizerInit) -> c_int {
+    guard(|| {
+        let t = match get_tr(tr) {
+            Some(t) => t,
+            None => return RTC_ERR_INVALID,
+        };
+        if init.is_null() {
+            return RTC_ERR_INVALID;
+        }
+        // SAFETY: checked non-null; caller guarantees a valid RtcPacketizerInit.
+        let init = unsafe { &*init };
+        let config = match rtp_config_from_init(init) {
+            Some(c) => c,
+            None => return RTC_ERR_INVALID,
+        };
+        let packetizer = H265RtpPacketizer::new(
+            nal_separator_from_c(init.nalSeparator),
+            config,
+            max_fragment_size(init.maxFragmentSize),
+        );
+        t.set_codec_packetizer(CodecPacketizer::H265(packetizer));
+        RTC_ERR_SUCCESS
+    })
+}
+
+/// `rtcSetAV1Packetizer` — install an AV1 RTP packetizer. `obuPacketization`
+/// selects OBU vs temporal-unit packetization (default OBU, mirroring upstream's
+/// `== RTC_OBU_PACKETIZED_TEMPORAL_UNIT ? TemporalUnit : Obu`).
+///
+/// # Safety
+/// `init`, if non-null, must point to a valid [`RtcPacketizerInit`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtcSetAV1Packetizer(tr: c_int, init: *const RtcPacketizerInit) -> c_int {
+    guard(|| {
+        let t = match get_tr(tr) {
+            Some(t) => t,
+            None => return RTC_ERR_INVALID,
+        };
+        if init.is_null() {
+            return RTC_ERR_INVALID;
+        }
+        // SAFETY: checked non-null; caller guarantees a valid RtcPacketizerInit.
+        let init = unsafe { &*init };
+        let config = match rtp_config_from_init(init) {
+            Some(c) => c,
+            None => return RTC_ERR_INVALID,
+        };
+        let packetization = if init.obuPacketization == RTC_OBU_PACKETIZED_TEMPORAL_UNIT {
+            Av1Packetization::TemporalUnit
+        } else {
+            Av1Packetization::Obu
+        };
+        let packetizer = Av1RtpPacketizer::new(
+            packetization,
+            config,
+            max_fragment_size(init.maxFragmentSize),
+        );
+        t.set_codec_packetizer(CodecPacketizer::Av1(packetizer));
+        RTC_ERR_SUCCESS
+    })
+}
+
+/// `rtcSetVP8Packetizer` — install a VP8 (RFC 7741) RTP packetizer. VP8 takes
+/// only the config and `maxFragmentSize`.
+///
+/// # Safety
+/// `init`, if non-null, must point to a valid [`RtcPacketizerInit`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtcSetVP8Packetizer(tr: c_int, init: *const RtcPacketizerInit) -> c_int {
+    guard(|| {
+        let t = match get_tr(tr) {
+            Some(t) => t,
+            None => return RTC_ERR_INVALID,
+        };
+        if init.is_null() {
+            return RTC_ERR_INVALID;
+        }
+        // SAFETY: checked non-null; caller guarantees a valid RtcPacketizerInit.
+        let init = unsafe { &*init };
+        let config = match rtp_config_from_init(init) {
+            Some(c) => c,
+            None => return RTC_ERR_INVALID,
+        };
+        let packetizer = Vp8RtpPacketizer::new(config, max_fragment_size(init.maxFragmentSize));
+        t.set_codec_packetizer(CodecPacketizer::Vp8(packetizer));
+        RTC_ERR_SUCCESS
+    })
+}
+
 /// `rtcChainRtcpReceivingSession` — append an [`crate::RtcpReceivingSession`] to
 /// the track's runtime media-handler chain. The session learns the inbound SSRC
 /// and replies to SR with RR (and REMB once a bitrate is requested), and emits
@@ -2646,6 +2964,330 @@ pub extern "C" fn rtcTransformTimestampToSeconds(
     })
 }
 
+/// `rtcGetCurrentTrackTimestamp` — read the active packetizer's current RTP
+/// timestamp. Mirrors upstream `config->timestamp`; a null `timestamp` pointer
+/// is tolerated (returns success without writing), matching the upstream guard.
+///
+/// # Safety
+/// `timestamp`, if non-null, must point to a valid `uint32_t`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtcGetCurrentTrackTimestamp(id: c_int, timestamp: *mut u32) -> c_int {
+    guard(|| {
+        let t = match get_tr(id) {
+            Some(t) => t,
+            None => return RTC_ERR_INVALID,
+        };
+        if !timestamp.is_null() {
+            // SAFETY: checked non-null.
+            unsafe { *timestamp = t.current_timestamp() };
+        }
+        RTC_ERR_SUCCESS
+    })
+}
+
+/// `rtcSetTrackRtpTimestamp` — set the active packetizer's RTP timestamp used by
+/// subsequent sends. Mirrors upstream `config->timestamp = timestamp`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtcSetTrackRtpTimestamp(id: c_int, timestamp: u32) -> c_int {
+    guard(|| {
+        let t = match get_tr(id) {
+            Some(t) => t,
+            None => return RTC_ERR_INVALID,
+        };
+        t.set_rtp_timestamp(timestamp);
+        RTC_ERR_SUCCESS
+    })
+}
+
+/// `rtcGetLastTrackSenderReportTimestamp` — the RTP timestamp of the last RTCP
+/// Sender Report emitted by a chained [`crate::RtcpSrReporter`]. Returns
+/// `RTC_ERR_INVALID` when no SR reporter is in the track's media-handler chain
+/// (upstream throws when the track has no registered reporter).
+///
+/// # Safety
+/// `timestamp`, if non-null, must point to a valid `uint32_t`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtcGetLastTrackSenderReportTimestamp(id: c_int, timestamp: *mut u32) -> c_int {
+    guard(|| {
+        let t = match get_tr(id) {
+            Some(t) => t,
+            None => return RTC_ERR_INVALID,
+        };
+        let ts = match t.last_sr_timestamp() {
+            Some(ts) => ts,
+            None => return RTC_ERR_INVALID,
+        };
+        if !timestamp.is_null() {
+            // SAFETY: checked non-null.
+            unsafe { *timestamp = ts };
+        }
+        RTC_ERR_SUCCESS
+    })
+}
+
+/// `rtcGetTrackPayloadTypesForCodec` — fill `buffer` with the payload types in
+/// the track's media description whose rtpmap encoding name matches `ccodec`
+/// (case-insensitive). Follows the [`copy_and_return`] sizing convention: a null
+/// `buffer` returns the count, a too-small `size` returns `RTC_ERR_TOO_SMALL`.
+///
+/// # Safety
+/// `ccodec` must be a valid NUL-terminated C string; `buffer`, if non-null, must
+/// point to at least `size` `int`s.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtcGetTrackPayloadTypesForCodec(
+    tr: c_int,
+    ccodec: *const c_char,
+    buffer: *mut c_int,
+    size: c_int,
+) -> c_int {
+    guard(|| {
+        let t = match get_tr(tr) {
+            Some(t) => t,
+            None => return RTC_ERR_INVALID,
+        };
+        let codec = match unsafe { cstr_opt(ccodec) } {
+            Some(Some(s)) => s.to_ascii_lowercase(),
+            _ => return RTC_ERR_INVALID,
+        };
+        let media = t.description();
+        let pts: Vec<c_int> = media
+            .rtp_maps()
+            .iter()
+            .filter(|m| m.format.eq_ignore_ascii_case(&codec))
+            .map(|m| c_int::from(m.payload_type))
+            .collect();
+        // SAFETY: caller upholds the buffer/size contract.
+        unsafe { copy_and_return(&pts, buffer, size) }
+    })
+}
+
+/// `rtcGetSsrcsForTrack` — fill `buffer` with the SSRCs bound to the track's
+/// media description, following the [`copy_and_return`] sizing convention.
+///
+/// # Safety
+/// `buffer`, if non-null, must point to at least `count` `uint32_t`s.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtcGetSsrcsForTrack(tr: c_int, buffer: *mut u32, count: c_int) -> c_int {
+    guard(|| {
+        let t = match get_tr(tr) {
+            Some(t) => t,
+            None => return RTC_ERR_INVALID,
+        };
+        let media = t.description();
+        let ssrcs: Vec<u32> = media.ssrcs().iter().map(|s| s.ssrc).collect();
+        // SAFETY: caller upholds the buffer/count contract.
+        unsafe { copy_and_return(&ssrcs, buffer, count) }
+    })
+}
+
+/// `rtcGetCNameForSsrc` — write the CNAME bound to `ssrc` in the track's media
+/// description into `cname` (the [`copy_string`] convention). Returns `0` when
+/// the SSRC has no CNAME, matching upstream.
+///
+/// # Safety
+/// `cname`, if non-null, must point to at least `cname_size` bytes.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtcGetCNameForSsrc(
+    tr: c_int,
+    ssrc: u32,
+    cname: *mut c_char,
+    cname_size: c_int,
+) -> c_int {
+    guard(|| {
+        let t = match get_tr(tr) {
+            Some(t) => t,
+            None => return RTC_ERR_INVALID,
+        };
+        let media = t.description();
+        match media
+            .ssrcs()
+            .iter()
+            .find(|s| s.ssrc == ssrc)
+            .and_then(|s| s.name.as_deref())
+        {
+            Some(name) => copy_string(name, cname, cname_size),
+            None => 0,
+        }
+    })
+}
+
+/// `rtcSetNeedsToSendRtcpSr` — deprecated upstream no-op kept for ABI
+/// compatibility; always returns success.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtcSetNeedsToSendRtcpSr(_id: c_int) -> c_int {
+    guard(|| RTC_ERR_SUCCESS)
+}
+
+// ===========================================================================
+// SDP-string SSRC utilities (free functions — operate on an SDP string, not a
+// live PeerConnection/Track handle). Mirror capi.cpp's rtcGetSsrcsForType /
+// rtcSetSsrcForType, which build a throwaway `Description(sdp, "unspec")`,
+// inspect/mutate the media section matching a media type, and (for the setter)
+// re-serialize the SDP.
+// ===========================================================================
+
+/// Mirrors `rtcSsrcForTypeInit` (`rtc.h`): the SSRC plus optional cname / msid /
+/// track-id to stamp onto a media section. Field order/types match exactly so a
+/// C caller's struct is byte-compatible. The three string fields are optional
+/// (`NULL` → unset).
+#[repr(C)]
+pub struct rtcSsrcForTypeInit {
+    /// `uint32_t ssrc`
+    pub ssrc: u32,
+    /// `const char *name` — optional cname.
+    pub name: *const c_char,
+    /// `const char *msid` — optional.
+    pub msid: *const c_char,
+    /// `const char *trackId` — optional, track id used within the msid.
+    pub trackId: *const c_char,
+}
+
+/// `rtcGetSsrcsForType` — parse `sdp`, find the first media section whose type
+/// matches `mediaType` (case-insensitive), and write its SSRCs into `buffer`
+/// following the [`copy_and_return`] sizing convention. Returns `0` when no
+/// media of that type is present (matching upstream).
+///
+/// # Safety
+/// `mediaType` / `sdp` must be valid NUL-terminated C strings; `buffer`, if
+/// non-null, must point to at least `bufferSize` `uint32_t`s.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtcGetSsrcsForType(
+    mediaType: *const c_char,
+    sdp: *const c_char,
+    buffer: *mut u32,
+    bufferSize: c_int,
+) -> c_int {
+    guard(|| {
+        let mtype = match unsafe { cstr_opt(mediaType) } {
+            Some(Some(s)) => s.to_ascii_lowercase(),
+            _ => return RTC_ERR_INVALID,
+        };
+        let sdp = match unsafe { cstr_opt(sdp) } {
+            Some(Some(s)) => s,
+            _ => return RTC_ERR_INVALID,
+        };
+        let desc = match Description::parse(sdp) {
+            Ok(d) => d,
+            Err(_) => return RTC_ERR_FAILURE,
+        };
+        let ssrcs: Vec<u32> = match desc
+            .media_sections()
+            .iter()
+            .find(|m| m.kind().eq_ignore_ascii_case(&mtype))
+        {
+            Some(m) => m.ssrcs().iter().map(|s| s.ssrc).collect(),
+            None => return 0,
+        };
+        // SAFETY: caller upholds the buffer/size contract.
+        unsafe { copy_and_return(&ssrcs, buffer, bufferSize) }
+    })
+}
+
+/// `rtcSetSsrcForType` — parse `sdp`, append the SSRC binding described by
+/// `init` to the first media section whose type matches `mediaType`
+/// (case-insensitive, additive like `Description::Media::addSSRC`), re-serialize
+/// the SDP, and write it into `buffer` (the [`copy_string`] convention). If no
+/// media of that type is present the SDP is returned unchanged, matching
+/// upstream.
+///
+/// # Safety
+/// `mediaType` / `sdp` must be valid NUL-terminated C strings; `init` must be a
+/// valid `rtcSsrcForTypeInit` (its string fields NUL-terminated or null);
+/// `buffer`, if non-null, must point to at least `bufferSize` bytes.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtcSetSsrcForType(
+    mediaType: *const c_char,
+    sdp: *const c_char,
+    buffer: *mut c_char,
+    bufferSize: c_int,
+    init: *const rtcSsrcForTypeInit,
+) -> c_int {
+    guard(|| {
+        let mtype = match unsafe { cstr_opt(mediaType) } {
+            Some(Some(s)) => s.to_ascii_lowercase(),
+            _ => return RTC_ERR_INVALID,
+        };
+        let sdp = match unsafe { cstr_opt(sdp) } {
+            Some(Some(s)) => s,
+            _ => return RTC_ERR_INVALID,
+        };
+        if init.is_null() {
+            return RTC_ERR_INVALID;
+        }
+        // SAFETY: checked non-null; caller guarantees a valid struct.
+        let init = unsafe { &*init };
+        let name = match unsafe { cstr_opt(init.name) } {
+            Some(v) => v.map(str::to_owned),
+            None => return RTC_ERR_INVALID,
+        };
+        let msid = match unsafe { cstr_opt(init.msid) } {
+            Some(v) => v.map(str::to_owned),
+            None => return RTC_ERR_INVALID,
+        };
+        let track_id = match unsafe { cstr_opt(init.trackId) } {
+            Some(v) => v.map(str::to_owned),
+            None => return RTC_ERR_INVALID,
+        };
+        let mut desc = match Description::parse(sdp) {
+            Ok(d) => d,
+            Err(_) => return RTC_ERR_FAILURE,
+        };
+        if let Some(m) = desc
+            .media_sections_mut()
+            .iter_mut()
+            .find(|m| m.kind().eq_ignore_ascii_case(&mtype))
+        {
+            m.add_ssrc(SsrcEntry {
+                ssrc: init.ssrc,
+                name,
+                msid,
+                track_id,
+            });
+        }
+        copy_string(&desc.to_sdp(), buffer, bufferSize)
+    })
+}
+
+// ===========================================================================
+// Opaque message (rtcMessage* = void*). Mirrors capi.cpp's
+// rtcCreateOpaqueMessage / rtcDeleteOpaqueMessage: a heap copy of caller bytes
+// wrapped behind an opaque pointer. (The media-interceptor callback that would
+// consume one is not wired in this port — see notes on rtcSetMediaInterceptor —
+// so the only supported lifecycle is create → delete, which this pair owns
+// leak-free.)
+// ===========================================================================
+
+/// `rtcCreateOpaqueMessage` — heap-copy `size` bytes from `data` and return an
+/// opaque handle (`rtcMessage *`). Returns null on a null `data` or negative
+/// `size`. Free it with [`rtcDeleteOpaqueMessage`].
+///
+/// # Safety
+/// `data`, if non-null, must point to at least `size` readable bytes.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtcCreateOpaqueMessage(data: *mut c_void, size: c_int) -> *mut c_void {
+    if data.is_null() || size < 0 {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `data` has at least `size` readable bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, size as usize) }.to_vec();
+    Box::into_raw(Box::new(bytes)) as *mut c_void
+}
+
+/// `rtcDeleteOpaqueMessage` — free a handle returned by
+/// [`rtcCreateOpaqueMessage`]. A null pointer is a no-op.
+///
+/// # Safety
+/// `msg` must be a pointer returned by [`rtcCreateOpaqueMessage`] and not freed
+/// already.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtcDeleteOpaqueMessage(msg: *mut c_void) {
+    if msg.is_null() {
+        return;
+    }
+    // SAFETY: `msg` was produced by rtcCreateOpaqueMessage as a Box<Vec<u8>>.
+    drop(unsafe { Box::from_raw(msg as *mut Vec<u8>) });
+}
+
 // ===========================================================================
 // WebSocket (client + server) — shares the generic-channel id space
 // ===========================================================================
@@ -2819,7 +3461,11 @@ pub extern "C" fn rtcCreateWebSocketServer(
                         Ok(c) => c,
                         Err(_) => return RTC_ERR_FAILURE,
                     };
-                    let cert_pem = match cert.x509().to_pem().ok().and_then(|b| String::from_utf8(b).ok())
+                    let cert_pem = match cert
+                        .x509()
+                        .to_pem()
+                        .ok()
+                        .and_then(|b| String::from_utf8(b).ok())
                     {
                         Some(s) => s,
                         None => return RTC_ERR_FAILURE,
@@ -2931,6 +3577,7 @@ pub extern "C" fn rtcCleanup() {
     DC_SLOTS.lock().clear();
     DC_RECV.lock().clear();
     DC_OPEN_FIRED.lock().clear();
+    DC_AVAIL_PENDING.lock().clear();
     DC_OWNERS.lock().clear();
     TRACK_SLOTS.lock().clear();
     TRACK_OWNERS.lock().clear();
@@ -3226,6 +3873,407 @@ mod tests {
         rtcDeletePeerConnection(pc);
     }
 
+    /// `rtcSet{H264,H265,AV1,VP8}Packetizer` install a codec packetizer on a real
+    /// track handle and validate their argument edges (unknown track, NULL init,
+    /// NULL cname, zero clockRate all report `RTC_ERR_INVALID`).
+    #[test]
+    fn set_codec_packetizers_install_and_validate() {
+        let bind = CString::new("127.0.0.1").unwrap();
+        let cfg = loopback_config(&bind);
+        let pc = rtcCreatePeerConnection(&cfg);
+
+        let mid = CString::new("video0").unwrap();
+        let tinit = RtcTrackInit {
+            direction: 1, // SENDONLY
+            codec: 0,     // H264
+            payloadType: 96,
+            ssrc: 0x1234_5678,
+            mid: mid.as_ptr(),
+            name: std::ptr::null(),
+            msid: std::ptr::null(),
+            trackId: std::ptr::null(),
+            profile: std::ptr::null(),
+        };
+        let tr = rtcAddTrackEx(pc, &tinit);
+        assert!(tr > 0, "rtcAddTrackEx should return a track handle");
+
+        let cname = CString::new("video-cname").unwrap();
+        let mk = |nal: c_int, obu: c_int| RtcPacketizerInit {
+            ssrc: 0x1234_5678,
+            cname: cname.as_ptr(),
+            payloadType: 96,
+            clockRate: 90_000,
+            sequenceNumber: 0,
+            timestamp: 0,
+            maxFragmentSize: 0, // default
+            nalSeparator: nal,
+            obuPacketization: obu,
+            playoutDelayId: 0,
+            playoutDelayMin: 0,
+            playoutDelayMax: 0,
+            colorSpaceId: 0,
+            colorChromaSitingHorz: 0,
+            colorChromaSitingVert: 0,
+            colorRange: 0,
+            colorPrimaries: 0,
+            colorTransfer: 0,
+            colorMatrix: 0,
+        };
+
+        // All four install on a valid track (each replaces the previous packetizer).
+        let h264 = mk(RTC_NAL_SEPARATOR_START_SEQUENCE, 0);
+        assert_eq!(unsafe { rtcSetH264Packetizer(tr, &h264) }, RTC_ERR_SUCCESS);
+        let h265 = mk(RTC_NAL_SEPARATOR_LENGTH, 0);
+        assert_eq!(unsafe { rtcSetH265Packetizer(tr, &h265) }, RTC_ERR_SUCCESS);
+        let av1 = mk(0, RTC_OBU_PACKETIZED_TEMPORAL_UNIT);
+        assert_eq!(unsafe { rtcSetAV1Packetizer(tr, &av1) }, RTC_ERR_SUCCESS);
+        let vp8 = mk(0, 0);
+        assert_eq!(unsafe { rtcSetVP8Packetizer(tr, &vp8) }, RTC_ERR_SUCCESS);
+
+        // Unknown track -> INVALID.
+        assert_eq!(
+            unsafe { rtcSetH264Packetizer(999_999, &h264) },
+            RTC_ERR_INVALID
+        );
+        // NULL init -> INVALID.
+        assert_eq!(
+            unsafe { rtcSetVP8Packetizer(tr, std::ptr::null()) },
+            RTC_ERR_INVALID
+        );
+        // NULL cname -> INVALID.
+        let mut bad_cname = mk(0, 0);
+        bad_cname.cname = std::ptr::null();
+        assert_eq!(
+            unsafe { rtcSetH264Packetizer(tr, &bad_cname) },
+            RTC_ERR_INVALID
+        );
+        // Zero clockRate -> INVALID.
+        let mut zero_clock = mk(0, 0);
+        zero_clock.clockRate = 0;
+        assert_eq!(
+            unsafe { rtcSetAV1Packetizer(tr, &zero_clock) },
+            RTC_ERR_INVALID
+        );
+
+        assert_eq!(rtcDeleteTrack(tr), RTC_ERR_SUCCESS);
+        rtcDeletePeerConnection(pc);
+    }
+
+    /// Exercises the Track timestamp / SSRC / CNAME C-ABI utilities against a
+    /// real track: timestamp get/set (generic packetizer and, once installed,
+    /// the codec packetizer's config), payload-types-for-codec filtering with
+    /// the `copyAndReturn` sizing convention, SSRC enumeration, CNAME lookup,
+    /// the last-SR-timestamp (INVALID until an SR reporter is chained), and the
+    /// deprecated `rtcSetNeedsToSendRtcpSr` no-op.
+    #[test]
+    fn track_timestamp_ssrc_cname_c_api() {
+        use std::os::raw::c_char;
+
+        let bind = CString::new("127.0.0.1").unwrap();
+        let cfg = loopback_config(&bind);
+        let pc = rtcCreatePeerConnection(&cfg);
+
+        let mid = CString::new("video0").unwrap();
+        let name = CString::new("video-cname").unwrap();
+        let tinit = RtcTrackInit {
+            direction: 1, // SENDONLY
+            codec: 0,     // H264
+            payloadType: 96,
+            ssrc: 0x1234_5678,
+            mid: mid.as_ptr(),
+            name: name.as_ptr(),
+            msid: std::ptr::null(),
+            trackId: std::ptr::null(),
+            profile: std::ptr::null(),
+        };
+        let tr = rtcAddTrackEx(pc, &tinit);
+        assert!(tr > 0, "rtcAddTrackEx should return a track handle");
+
+        // --- timestamp get/set on the generic packetizer (round-trips) ---
+        let mut ts: u32 = 0;
+        assert_eq!(rtcGetCurrentTrackTimestamp(tr, &mut ts), RTC_ERR_SUCCESS);
+        assert_eq!(rtcSetTrackRtpTimestamp(tr, 0xDEAD_BEEF), RTC_ERR_SUCCESS);
+        let mut got: u32 = 0;
+        assert_eq!(rtcGetCurrentTrackTimestamp(tr, &mut got), RTC_ERR_SUCCESS);
+        assert_eq!(got, 0xDEAD_BEEF);
+        // Null out-pointer is tolerated (matches upstream guard).
+        assert_eq!(
+            rtcGetCurrentTrackTimestamp(tr, std::ptr::null_mut()),
+            RTC_ERR_SUCCESS
+        );
+
+        // Installing a codec packetizer redirects timestamp access to ITS config.
+        let cname = CString::new("video-cname").unwrap();
+        let pkt = RtcPacketizerInit {
+            ssrc: 0x1234_5678,
+            cname: cname.as_ptr(),
+            payloadType: 96,
+            clockRate: 90_000,
+            sequenceNumber: 0,
+            timestamp: 777,
+            maxFragmentSize: 0,
+            nalSeparator: RTC_NAL_SEPARATOR_LENGTH,
+            obuPacketization: 0,
+            playoutDelayId: 0,
+            playoutDelayMin: 0,
+            playoutDelayMax: 0,
+            colorSpaceId: 0,
+            colorChromaSitingHorz: 0,
+            colorChromaSitingVert: 0,
+            colorRange: 0,
+            colorPrimaries: 0,
+            colorTransfer: 0,
+            colorMatrix: 0,
+        };
+        assert_eq!(unsafe { rtcSetH264Packetizer(tr, &pkt) }, RTC_ERR_SUCCESS);
+        let mut got2: u32 = 0;
+        assert_eq!(rtcGetCurrentTrackTimestamp(tr, &mut got2), RTC_ERR_SUCCESS);
+        assert_eq!(got2, 777, "reads the installed codec packetizer's config");
+        assert_eq!(rtcSetTrackRtpTimestamp(tr, 999), RTC_ERR_SUCCESS);
+        let mut got3: u32 = 0;
+        assert_eq!(rtcGetCurrentTrackTimestamp(tr, &mut got3), RTC_ERR_SUCCESS);
+        assert_eq!(got3, 999);
+
+        // --- payload types for codec (copyAndReturn semantics) ---
+        let h264 = CString::new("H264").unwrap();
+        // Sizing query: null buffer returns the count.
+        assert_eq!(
+            rtcGetTrackPayloadTypesForCodec(tr, h264.as_ptr(), std::ptr::null_mut(), 0),
+            1
+        );
+        let mut buf = [0 as c_int; 4];
+        let n = rtcGetTrackPayloadTypesForCodec(
+            tr,
+            h264.as_ptr(),
+            buf.as_mut_ptr(),
+            buf.len() as c_int,
+        );
+        assert_eq!(n, 1);
+        assert_eq!(buf[0], 96);
+        // Case-insensitive match.
+        let lower = CString::new("h264").unwrap();
+        assert_eq!(
+            rtcGetTrackPayloadTypesForCodec(
+                tr,
+                lower.as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len() as c_int
+            ),
+            1
+        );
+        // Unknown codec -> 0.
+        let vp9 = CString::new("VP9").unwrap();
+        assert_eq!(
+            rtcGetTrackPayloadTypesForCodec(tr, vp9.as_ptr(), buf.as_mut_ptr(), buf.len() as c_int),
+            0
+        );
+        // Too-small buffer -> RTC_ERR_TOO_SMALL.
+        assert_eq!(
+            rtcGetTrackPayloadTypesForCodec(tr, h264.as_ptr(), buf.as_mut_ptr(), 0),
+            RTC_ERR_TOO_SMALL
+        );
+        // Null codec name -> INVALID.
+        assert_eq!(
+            rtcGetTrackPayloadTypesForCodec(tr, std::ptr::null(), buf.as_mut_ptr(), 4),
+            RTC_ERR_INVALID
+        );
+
+        // --- SSRCs for track ---
+        assert_eq!(rtcGetSsrcsForTrack(tr, std::ptr::null_mut(), 0), 1);
+        let mut sbuf = [0u32; 4];
+        assert_eq!(
+            rtcGetSsrcsForTrack(tr, sbuf.as_mut_ptr(), sbuf.len() as c_int),
+            1
+        );
+        assert_eq!(sbuf[0], 0x1234_5678);
+        assert_eq!(
+            rtcGetSsrcsForTrack(tr, sbuf.as_mut_ptr(), 0),
+            RTC_ERR_TOO_SMALL
+        );
+
+        // --- CNAME for SSRC ---
+        let mut cbuf = [0 as c_char; 32];
+        assert_eq!(
+            rtcGetCNameForSsrc(tr, 0x1234_5678, cbuf.as_mut_ptr(), cbuf.len() as c_int),
+            "video-cname".len() as c_int + 1
+        );
+        // Unknown SSRC -> 0.
+        assert_eq!(
+            rtcGetCNameForSsrc(tr, 0xFFFF_FFFF, cbuf.as_mut_ptr(), cbuf.len() as c_int),
+            0
+        );
+
+        // --- last SR timestamp: INVALID until a reporter is chained ---
+        let mut srt: u32 = 123;
+        assert_eq!(
+            rtcGetLastTrackSenderReportTimestamp(tr, &mut srt),
+            RTC_ERR_INVALID
+        );
+        assert_eq!(rtcChainRtcpSrReporter(tr), RTC_ERR_SUCCESS);
+        let mut srt2: u32 = 123;
+        assert_eq!(
+            rtcGetLastTrackSenderReportTimestamp(tr, &mut srt2),
+            RTC_ERR_SUCCESS
+        );
+        assert_eq!(srt2, 0, "no SR emitted yet -> last reported timestamp is 0");
+
+        // --- deprecated no-op ---
+        assert_eq!(rtcSetNeedsToSendRtcpSr(tr), RTC_ERR_SUCCESS);
+
+        // --- invalid track handle on each getter/setter ---
+        assert_eq!(
+            rtcGetCurrentTrackTimestamp(999_999, &mut got),
+            RTC_ERR_INVALID
+        );
+        assert_eq!(rtcSetTrackRtpTimestamp(999_999, 0), RTC_ERR_INVALID);
+        assert_eq!(
+            rtcGetSsrcsForTrack(999_999, sbuf.as_mut_ptr(), 4),
+            RTC_ERR_INVALID
+        );
+
+        assert_eq!(rtcDeleteTrack(tr), RTC_ERR_SUCCESS);
+        rtcDeletePeerConnection(pc);
+    }
+
+    /// Exercises the SDP-string SSRC utilities (`rtcGetSsrcsForType` /
+    /// `rtcSetSsrcForType`) and the opaque-message create/delete pair. Mints a
+    /// real offer SDP (one sendonly H264 video track carrying an SSRC) via the
+    /// C API, then reads / mutates its SSRCs purely through the string-based
+    /// functions (no live handle), mirroring how a caller post-processes SDP.
+    #[test]
+    fn ssrc_for_type_and_opaque_message_c_api() {
+        use std::os::raw::c_char;
+
+        let bind = CString::new("127.0.0.1").unwrap();
+        let cfg = loopback_config(&bind);
+        let pc = rtcCreatePeerConnection(&cfg);
+
+        let mid = CString::new("video0").unwrap();
+        let name = CString::new("vcname").unwrap();
+        let tinit = RtcTrackInit {
+            direction: 1, // SENDONLY
+            codec: 0,     // H264
+            payloadType: 96,
+            ssrc: 0x1111_2222,
+            mid: mid.as_ptr(),
+            name: name.as_ptr(),
+            msid: std::ptr::null(),
+            trackId: std::ptr::null(),
+            profile: std::ptr::null(),
+        };
+        assert!(rtcAddTrackEx(pc, &tinit) > 0);
+
+        // Mint an offer SDP. ufrag/pwd + the video m-line with a=ssrc are present
+        // immediately; gathered candidates aren't needed for SSRC inspection.
+        assert_eq!(rtcSetLocalDescription(pc, std::ptr::null()), RTC_ERR_SUCCESS);
+        let needed = rtcGetLocalDescription(pc, std::ptr::null_mut(), 0);
+        assert!(needed > 0, "no local description: {needed}");
+        let mut sdp_buf = vec![0 as c_char; needed as usize];
+        assert_eq!(
+            rtcGetLocalDescription(pc, sdp_buf.as_mut_ptr(), needed),
+            needed
+        );
+        let sdp = unsafe { CStr::from_ptr(sdp_buf.as_ptr()) }.to_owned();
+
+        let video = CString::new("video").unwrap();
+        let audio = CString::new("audio").unwrap();
+
+        // --- rtcGetSsrcsForType ---
+        // Sizing query (null buffer) returns the count: 1 SSRC on the video m-line.
+        assert_eq!(
+            rtcGetSsrcsForType(video.as_ptr(), sdp.as_ptr(), std::ptr::null_mut(), 0),
+            1
+        );
+        let mut ssrcs = [0u32; 4];
+        assert_eq!(
+            rtcGetSsrcsForType(video.as_ptr(), sdp.as_ptr(), ssrcs.as_mut_ptr(), 4),
+            1
+        );
+        assert_eq!(ssrcs[0], 0x1111_2222);
+        // Case-insensitive media type.
+        let video_upper = CString::new("VIDEO").unwrap();
+        assert_eq!(
+            rtcGetSsrcsForType(video_upper.as_ptr(), sdp.as_ptr(), ssrcs.as_mut_ptr(), 4),
+            1
+        );
+        // Too-small (non-null buffer, size < count) -> TOO_SMALL.
+        assert_eq!(
+            rtcGetSsrcsForType(video.as_ptr(), sdp.as_ptr(), ssrcs.as_mut_ptr(), 0),
+            RTC_ERR_TOO_SMALL
+        );
+        // No audio media section -> 0 (matches upstream).
+        assert_eq!(
+            rtcGetSsrcsForType(audio.as_ptr(), sdp.as_ptr(), ssrcs.as_mut_ptr(), 4),
+            0
+        );
+        // Invalid args.
+        assert_eq!(
+            rtcGetSsrcsForType(std::ptr::null(), sdp.as_ptr(), ssrcs.as_mut_ptr(), 4),
+            RTC_ERR_INVALID
+        );
+        assert_eq!(
+            rtcGetSsrcsForType(video.as_ptr(), std::ptr::null(), ssrcs.as_mut_ptr(), 4),
+            RTC_ERR_INVALID
+        );
+
+        // --- rtcSetSsrcForType: append a second SSRC to the video section ---
+        let extra_name = CString::new("extra-cname").unwrap();
+        let init = rtcSsrcForTypeInit {
+            ssrc: 0x9999_0000,
+            name: extra_name.as_ptr(),
+            msid: std::ptr::null(),
+            trackId: std::ptr::null(),
+        };
+        // Sizing query.
+        let needed2 =
+            rtcSetSsrcForType(video.as_ptr(), sdp.as_ptr(), std::ptr::null_mut(), 0, &init);
+        assert!(needed2 > 0, "set-ssrc sizing query: {needed2}");
+        let mut out_buf = vec![0 as c_char; needed2 as usize];
+        assert_eq!(
+            rtcSetSsrcForType(
+                video.as_ptr(),
+                sdp.as_ptr(),
+                out_buf.as_mut_ptr(),
+                needed2,
+                &init
+            ),
+            needed2
+        );
+        let new_sdp = unsafe { CStr::from_ptr(out_buf.as_ptr()) }.to_owned();
+
+        // The mutated SDP advertises BOTH SSRCs on the video section.
+        assert_eq!(
+            rtcGetSsrcsForType(video.as_ptr(), new_sdp.as_ptr(), ssrcs.as_mut_ptr(), 4),
+            2
+        );
+        assert!(ssrcs[..2].contains(&0x1111_2222));
+        assert!(ssrcs[..2].contains(&0x9999_0000));
+        // Null init -> INVALID.
+        assert_eq!(
+            rtcSetSsrcForType(
+                video.as_ptr(),
+                sdp.as_ptr(),
+                out_buf.as_mut_ptr(),
+                needed2,
+                std::ptr::null()
+            ),
+            RTC_ERR_INVALID
+        );
+
+        // --- opaque message create/delete ---
+        let mut payload = *b"opaque-bytes";
+        let msg =
+            rtcCreateOpaqueMessage(payload.as_mut_ptr() as *mut c_void, payload.len() as c_int);
+        assert!(!msg.is_null());
+        rtcDeleteOpaqueMessage(msg);
+        // Null data / negative size -> null; deleting null is a no-op.
+        assert!(rtcCreateOpaqueMessage(std::ptr::null_mut(), 4).is_null());
+        assert!(rtcCreateOpaqueMessage(payload.as_mut_ptr() as *mut c_void, -1).is_null());
+        rtcDeleteOpaqueMessage(std::ptr::null_mut());
+
+        rtcDeletePeerConnection(pc);
+    }
+
     /// End-to-end loopback through the C API: two PCs, a data channel, message
     /// round-trip — all driven via the `extern "C"` symbols. Proves the handle
     /// registry, the callback marshalling (state/candidate/data-channel/
@@ -3464,5 +4512,105 @@ mod tests {
         unsafe {
             drop(Box::from_raw(ctx_ptr));
         }
+    }
+
+    /// The available callback is edge-triggered on the pull-API receive queue:
+    /// it fires when the queue goes empty→non-empty, stays silent while the
+    /// queue remains non-empty, and re-arms once drained. Ports upstream's
+    /// `triggerAvailable(count == 1)`. Drives `deliver_message` directly to
+    /// simulate inbound data without a full handshake.
+    #[test]
+    fn available_callback_fires_on_empty_to_nonempty_edge() {
+        static FIRES: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn on_avail(_id: c_int, _ptr: *mut c_void) {
+            FIRES.fetch_add(1, Ordering::SeqCst);
+        }
+        FIRES.store(0, Ordering::SeqCst);
+
+        let bind = CString::new("127.0.0.1").unwrap();
+        let cfg = loopback_config(&bind);
+        let pc = rtcCreatePeerConnection(&cfg);
+        let dc = rtcCreateDataChannel(pc, CString::new("chat").unwrap().as_ptr());
+        assert!(dc > 0);
+
+        // No message handler → inbound data buffers in the pull queue.
+        assert_eq!(rtcSetAvailableCallback(dc, Some(on_avail)), RTC_ERR_SUCCESS);
+        let channel = get_dc(dc).expect("dc handle");
+
+        // First message: empty→non-empty edge fires exactly once.
+        channel.deliver_message(b"one", true);
+        assert_eq!(FIRES.load(Ordering::SeqCst), 1);
+        assert_eq!(rtcGetAvailableAmount(dc), 3);
+
+        // Second message while still non-empty: no new edge, no fire.
+        channel.deliver_message(b"two", true);
+        assert_eq!(FIRES.load(Ordering::SeqCst), 1);
+        assert_eq!(rtcGetAvailableAmount(dc), 6);
+
+        // Drain the queue via the pull API.
+        loop {
+            let mut size = 256i32;
+            let mut buf = vec![0i8; 256];
+            let rc = rtcReceiveMessage(dc, buf.as_mut_ptr(), &mut size);
+            if rc == RTC_ERR_NOT_AVAIL {
+                break;
+            }
+            assert_eq!(rc, RTC_ERR_SUCCESS);
+        }
+        assert_eq!(rtcGetAvailableAmount(dc), 0);
+
+        // After draining to empty, the next message re-arms the edge.
+        channel.deliver_message(b"three", true);
+        assert_eq!(FIRES.load(Ordering::SeqCst), 2);
+
+        // Clearing the callback stops further fires.
+        assert_eq!(rtcSetAvailableCallback(dc, None), RTC_ERR_SUCCESS);
+        loop {
+            let mut size = 256i32;
+            let mut buf = vec![0i8; 256];
+            if rtcReceiveMessage(dc, buf.as_mut_ptr(), &mut size) == RTC_ERR_NOT_AVAIL {
+                break;
+            }
+        }
+        channel.deliver_message(b"four", true);
+        assert_eq!(FIRES.load(Ordering::SeqCst), 2);
+
+        rtcDeleteDataChannel(dc);
+        rtcDeletePeerConnection(pc);
+    }
+
+    /// An available edge that happened *before* the callback was registered is
+    /// replayed once on registration — porting the replay half of upstream's
+    /// `synchronized_stored_callback` for `availableCallback`, and mirroring how
+    /// the open callback replays a missed transition.
+    #[test]
+    fn available_callback_replays_edge_registered_after_message() {
+        static FIRES: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn on_avail(_id: c_int, _ptr: *mut c_void) {
+            FIRES.fetch_add(1, Ordering::SeqCst);
+        }
+        FIRES.store(0, Ordering::SeqCst);
+
+        let bind = CString::new("127.0.0.1").unwrap();
+        let cfg = loopback_config(&bind);
+        let pc = rtcCreatePeerConnection(&cfg);
+        let dc = rtcCreateDataChannel(pc, CString::new("chat").unwrap().as_ptr());
+        assert!(dc > 0);
+
+        // Message arrives with no callback yet: queued, edge marked pending.
+        let channel = get_dc(dc).expect("dc handle");
+        channel.deliver_message(b"early", true);
+        assert_eq!(FIRES.load(Ordering::SeqCst), 0);
+
+        // Registering now replays the missed edge exactly once.
+        assert_eq!(rtcSetAvailableCallback(dc, Some(on_avail)), RTC_ERR_SUCCESS);
+        assert_eq!(FIRES.load(Ordering::SeqCst), 1);
+
+        // Re-registering must not re-fire (the pending flag was consumed).
+        assert_eq!(rtcSetAvailableCallback(dc, Some(on_avail)), RTC_ERR_SUCCESS);
+        assert_eq!(FIRES.load(Ordering::SeqCst), 1);
+
+        rtcDeleteDataChannel(dc);
+        rtcDeletePeerConnection(pc);
     }
 }

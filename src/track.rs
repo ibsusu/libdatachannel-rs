@@ -24,6 +24,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use parking_lot::Mutex;
 use thiserror::Error;
 
+use crate::codec::{
+    av1::Av1RtpPacketizer, h264::H264RtpPacketizer, h265::H265RtpPacketizer, vp8::Vp8RtpPacketizer,
+};
 use crate::description::Direction;
 use crate::media_handler::{MediaHandler, MediaHandlerChain, Message, MessageType};
 use crate::rtp::is_rtcp;
@@ -343,6 +346,48 @@ impl Default for TrackCallbacks {
     }
 }
 
+/// A codec-specific RTP packetizer installed on a [`Track`] via the
+/// `rtcSet{H264,H265,AV1,VP8}Packetizer` C-API. When present it takes over the
+/// outbound [`send`](Track::send) path from the generic [`RtpPacketizer`]: a
+/// coded frame is fragmented and wrapped into one-or-more RTP packets per the
+/// codec rules. Mirrors upstream `Track::setMediaHandler(packetizer)`, where the
+/// packetizer becomes the head of the media-handler chain.
+pub enum CodecPacketizer {
+    /// H.264 (RFC 6184) packetizer.
+    H264(H264RtpPacketizer),
+    /// H.265 (RFC 7798) packetizer.
+    H265(H265RtpPacketizer),
+    /// AV1 packetizer (OBU or temporal-unit packetization).
+    Av1(Av1RtpPacketizer),
+    /// VP8 (RFC 7741) packetizer.
+    Vp8(Vp8RtpPacketizer),
+}
+
+impl CodecPacketizer {
+    /// Run a coded frame through the codec packetizer, producing RTP packets
+    /// ready for SRTP protection. Takes `&mut self` because AV1 caches the
+    /// sequence header OBU across frames.
+    fn outgoing(&mut self, frame: Vec<u8>) -> Vec<Vec<u8>> {
+        match self {
+            CodecPacketizer::H264(p) => p.outgoing(frame),
+            CodecPacketizer::H265(p) => p.outgoing(frame),
+            CodecPacketizer::Av1(p) => p.outgoing(frame),
+            CodecPacketizer::Vp8(p) => p.outgoing(frame),
+        }
+    }
+
+    /// Borrow the underlying generic [`RtpPacketizer`] holding the config, so the
+    /// Track can read/write the RTP timestamp on whichever codec is installed.
+    fn inner(&self) -> &RtpPacketizer {
+        match self {
+            CodecPacketizer::H264(p) => p.inner(),
+            CodecPacketizer::H265(p) => p.inner(),
+            CodecPacketizer::Av1(p) => p.inner(),
+            CodecPacketizer::Vp8(p) => p.inner(),
+        }
+    }
+}
+
 struct Inner {
     media: Media,
     srtp: Option<Arc<SrtpTransport>>,
@@ -351,6 +396,9 @@ struct Inner {
     /// RTP path is used (preserving the #27 round-trip). Mirrors the
     /// `setMediaHandler`/`chainMediaHandler` chain on `rtc::Track`.
     chain: MediaHandlerChain,
+    /// Codec-specific packetizer installed via `rtcSet{H264,H265,AV1,VP8}Packetizer`.
+    /// `None` uses the generic [`RtpPacketizer`] (one packet per frame).
+    codec_packetizer: Option<CodecPacketizer>,
 }
 
 /// A media track bound to an SDP media section. Cheap to share via `Arc<Self>`.
@@ -395,6 +443,7 @@ impl Track {
                 media,
                 srtp: None,
                 chain: MediaHandlerChain::new(),
+                codec_packetizer: None,
             }),
             callbacks: Mutex::new(callbacks),
             packetizer: RtpPacketizer::new(config),
@@ -530,6 +579,48 @@ impl Track {
         self.inner.lock().chain.add(handler);
     }
 
+    /// Install a codec-specific RTP packetizer (see [`CodecPacketizer`]). It
+    /// takes over the outbound [`send`](Self::send) path from the generic
+    /// packetizer, fragmenting coded frames into codec-correct RTP packets.
+    /// Mirrors `rtc::Track::setMediaHandler` for the C-API
+    /// `rtcSet{H264,H265,AV1,VP8}Packetizer` entry points. Replaces any
+    /// previously installed codec packetizer.
+    pub fn set_codec_packetizer(&self, packetizer: CodecPacketizer) {
+        self.inner.lock().codec_packetizer = Some(packetizer);
+    }
+
+    /// The current outbound RTP timestamp of the active packetizer — the
+    /// installed [`CodecPacketizer`] if any, else the generic packetizer (the
+    /// same config [`send`](Self::send) advances). Backs
+    /// `rtcGetCurrentTrackTimestamp`.
+    #[must_use]
+    pub fn current_timestamp(&self) -> u32 {
+        match self.inner.lock().codec_packetizer.as_ref() {
+            Some(cp) => cp.inner().config().timestamp,
+            None => self.packetizer.config().timestamp,
+        }
+    }
+
+    /// Set the outbound RTP timestamp on the active packetizer — the installed
+    /// [`CodecPacketizer`] if any, else the generic packetizer. Backs
+    /// `rtcSetTrackRtpTimestamp`.
+    pub fn set_rtp_timestamp(&self, timestamp: u32) {
+        match self.inner.lock().codec_packetizer.as_ref() {
+            Some(cp) => cp.inner().set_timestamp(timestamp),
+            None => self.packetizer.set_timestamp(timestamp),
+        }
+    }
+
+    /// The RTP timestamp of the last Sender Report emitted by a chained
+    /// [`RtcpSrReporter`](crate::RtcpSrReporter), or `None` if no SR reporter is
+    /// in the media-handler chain. Backs `rtcGetLastTrackSenderReportTimestamp`
+    /// (which maps `None` to `RTC_ERR_INVALID`, matching upstream's throw when no
+    /// reporter is registered for the track).
+    #[must_use]
+    pub fn last_sr_timestamp(&self) -> Option<u32> {
+        self.inner.lock().chain.last_sr_timestamp()
+    }
+
     /// Number of handlers currently in the runtime chain.
     #[must_use]
     pub fn media_handler_count(&self) -> usize {
@@ -559,7 +650,17 @@ impl Track {
             return Err(TrackError::BadDirection);
         }
 
-        let packets = self.packetizer.outgoing(payload.to_vec());
+        // A codec packetizer (installed via `rtcSet{H264,H265,AV1,VP8}Packetizer`)
+        // takes over fragmentation; otherwise the generic packetizer emits one
+        // RTP packet. The inner lock is held only for packetization and dropped
+        // before `send_outgoing_rtp` (which re-locks `inner`).
+        let packets = {
+            let mut inner = self.inner.lock();
+            match inner.codec_packetizer.as_mut() {
+                Some(cp) => cp.outgoing(payload.to_vec()),
+                None => self.packetizer.outgoing(payload.to_vec()),
+            }
+        };
         let n = packets.len();
         self.send_outgoing_rtp(packets)?;
         Ok(n)
@@ -989,10 +1090,40 @@ mod tests {
 
             let arrived = wait_for(|| !recovered.lock().is_empty(), 5000).await;
             assert!(arrived, "frame did not arrive at peer track");
-            let got = recovered.lock();
-            assert_eq!(got.len(), 1);
-            assert_eq!(got[0].0, payload, "payload round-trips through SRTP");
-            assert_eq!(got[0].2, 96, "payload type preserved");
+            {
+                let got = recovered.lock();
+                assert_eq!(got.len(), 1);
+                assert_eq!(got[0].0, payload, "payload round-trips through SRTP");
+                assert_eq!(got[0].2, 96, "payload type preserved");
+            }
+
+            // Installing a codec packetizer (as `rtcSetH264Packetizer` does)
+            // takes over `send()`: a single length-prefixed NAL larger than the
+            // max fragment size FU-A-fragments into several RTP packets, where the
+            // generic packetizer emits exactly one. Proves the codec packetizer
+            // is wired into the outbound path.
+            //
+            // Use a distinct SSRC from the track's default packetizer: that
+            // packetizer randomizes its starting sequence number (RFC 3550), so
+            // reusing its SSRC with a fresh low seq would let SRTP's per-SSRC
+            // replay window reject the packet as `replay_old`. A separate SSRC is
+            // an independent SRTP stream with a fresh replay context.
+            let nal_len = 2500usize;
+            let mut h264_frame = (nal_len as u32).to_be_bytes().to_vec();
+            h264_frame.push(0x65); // NAL header: IDR slice (type 5)
+            h264_frame.extend(std::iter::repeat(0xAB).take(nal_len - 1));
+            let cfg =
+                RtpPacketizationConfig::new(0x0BAD_F00E, "video0", 96, VIDEO_CLOCK_RATE, 1, 0);
+            track_a.set_codec_packetizer(CodecPacketizer::H264(H264RtpPacketizer::new(
+                crate::codec::nal::Separator::Length,
+                cfg,
+                crate::codec::DEFAULT_MAX_FRAGMENT_SIZE,
+            )));
+            let frag_count = track_a.send(&h264_frame).expect("track a codec send");
+            assert!(
+                frag_count >= 2,
+                "codec packetizer should FU-A-fragment a {nal_len}-byte NAL (got {frag_count})"
+            );
 
             track_a.close();
             track_b.close();

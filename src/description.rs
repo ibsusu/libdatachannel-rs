@@ -396,6 +396,13 @@ impl MediaSection {
         &self.ssrcs
     }
 
+    /// Append an SSRC binding. Mirrors `Description::Media::addSSRC` (additive —
+    /// it does not clear existing bindings), which is what the C API's
+    /// `rtcSetSsrcForType` drives.
+    pub fn add_ssrc(&mut self, entry: SsrcEntry) {
+        self.ssrcs.push(entry);
+    }
+
     /// Whether this media section advertises the given payload type.
     #[must_use]
     pub fn has_payload_type(&self, pt: u8) -> bool {
@@ -669,6 +676,13 @@ impl Description {
     /// All modeled `m=audio` / `m=video` sections in declaration order.
     pub fn media_sections(&self) -> &[MediaSection] {
         &self.media_sections
+    }
+
+    /// Mutable view of the modeled media sections in declaration order, so a
+    /// caller can edit a section in place (e.g. the C API's `rtcSetSsrcForType`
+    /// appends an SSRC binding to the section matching a media type).
+    pub fn media_sections_mut(&mut self) -> &mut [MediaSection] {
+        &mut self.media_sections
     }
 
     /// True if at least one modeled media (audio/video) section exists.

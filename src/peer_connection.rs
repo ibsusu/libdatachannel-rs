@@ -1605,7 +1605,15 @@ impl PeerConnection {
             on_state_change: Arc::new(move |s| pc.on_sctp_state(s)),
             on_message: Arc::new(move |m| pc_msg.on_sctp_message(m)),
             on_buffered_amount_low: Arc::new(move |stream, amount| {
-                if let Some(dc) = pc_low.inner.data_channels.lock().get(&stream) {
+                // Clone the channel Arc out and DROP the `data_channels` guard
+                // before firing the user callback. `trigger_buffered_amount`
+                // invokes the application `on_buffered_amount_low`, which may
+                // call `send()` synchronously; the send path re-enters this
+                // same closure via `update_buffered_amount`. Holding the lock
+                // across the callback would self-deadlock (parking_lot mutex is
+                // non-reentrant).
+                let dc = pc_low.inner.data_channels.lock().get(&stream).cloned();
+                if let Some(dc) = dc {
                     dc.trigger_buffered_amount(amount);
                 }
             }),
@@ -1768,8 +1776,10 @@ impl PeerConnection {
             }
             DcepMessage::Ack => {
                 // Inbound ACK: the locally-created channel on this stream is
-                // now open.
-                if let Some(dc) = self.inner.data_channels.lock().get(&stream).cloned() {
+                // now open. Clone out + drop the guard before `mark_open`,
+                // which fires the user `on_open` (may send re-entrantly).
+                let dc = self.inner.data_channels.lock().get(&stream).cloned();
+                if let Some(dc) = dc {
                     dc.mark_open();
                 }
             }
@@ -1778,7 +1788,14 @@ impl PeerConnection {
 
     /// Deliver a user message to the channel bound to `stream`, if any.
     fn deliver_to_channel(&self, stream: u16, data: &[u8], binary: bool) {
-        if let Some(dc) = self.inner.data_channels.lock().get(&stream).cloned() {
+        // Clone the channel Arc out and DROP the `data_channels` guard before
+        // dispatching `deliver_message` → user `on_message`. A common, legal
+        // pattern (and what the inline echo does) is to `send()` straight from
+        // `on_message`; that send path can fire `on_buffered_amount_low`, which
+        // re-locks `data_channels`. Holding the guard across the callback would
+        // self-deadlock the SCTP worker. (Was the prod concurrent-load wedge.)
+        let dc = self.inner.data_channels.lock().get(&stream).cloned();
+        if let Some(dc) = dc {
             dc.deliver_message(data, binary);
         }
     }
@@ -2430,6 +2447,149 @@ a=max-message-size:262144\r\n";
                 "A never received B's message"
             );
             assert_eq!(a_recv.lock()[0], b"hello-from-b");
+
+            pc_a.close().expect("close a");
+            pc_b.close().expect("close b");
+        });
+    }
+
+    /// Regression for the concurrent-load self-deadlock (issue #57): echoing
+    /// straight from `on_message` must not wedge the SCTP worker. B installs an
+    /// inline echo — it calls `send_binary` synchronously from inside its
+    /// receive callback. The send path runs `update_buffered_amount`, which on
+    /// the high→low transition fires `on_buffered_amount_low`; that closure
+    /// re-locks the PeerConnection `data_channels` map. Before the fix,
+    /// `deliver_to_channel` still held that (non-reentrant) lock across the
+    /// callback, so the worker thread self-deadlocked on the first backpressure
+    /// edge and no echo ever returned. With the lock dropped before dispatch,
+    /// all echoes round-trip. If this regresses, the worker hangs and the
+    /// receive assertion below times out (the test's own runtime thread is
+    /// unaffected, so the suite fails cleanly rather than hanging forever).
+    #[test]
+    fn inline_echo_from_on_message_does_not_deadlock() {
+        rt().block_on(async {
+            let a_state: Arc<Mutex<PeerConnectionState>> =
+                Arc::new(Mutex::new(PeerConnectionState::New));
+            let b_state: Arc<Mutex<PeerConnectionState>> =
+                Arc::new(Mutex::new(PeerConnectionState::New));
+            let a_cands: Arc<Mutex<Vec<Candidate>>> = Arc::new(Mutex::new(Vec::new()));
+            let b_cands: Arc<Mutex<Vec<Candidate>>> = Arc::new(Mutex::new(Vec::new()));
+
+            // A counts the echoes it gets back; B holds its inbound channel.
+            let a_echoes: Arc<std::sync::atomic::AtomicUsize> =
+                Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let b_channel: Arc<Mutex<Option<DataChannel>>> = Arc::new(Mutex::new(None));
+
+            let a_state_cb = a_state.clone();
+            let a_cands_cb = a_cands.clone();
+            let a_echoes_cb = a_echoes.clone();
+            let a_cbs = PeerConnectionCallbacks {
+                on_state_change: Arc::new(move |s| *a_state_cb.lock() = s),
+                on_local_candidate: Arc::new(move |c| a_cands_cb.lock().push(c)),
+                ..PeerConnectionCallbacks::default()
+            };
+
+            let b_state_cb = b_state.clone();
+            let b_cands_cb = b_cands.clone();
+            let b_channel_cb = b_channel.clone();
+            let b_cbs = PeerConnectionCallbacks {
+                on_state_change: Arc::new(move |s| *b_state_cb.lock() = s),
+                on_local_candidate: Arc::new(move |c| b_cands_cb.lock().push(c)),
+                on_data_channel: Arc::new(move |dc| {
+                    // INLINE ECHO: send straight back from the receive
+                    // callback — the pattern that triggered the deadlock.
+                    let echo_dc = dc.clone();
+                    dc.set_callbacks(DataChannelCallbacks {
+                        on_message: Arc::new(move |data, _binary| {
+                            let _ = echo_dc.send_binary(data);
+                        }),
+                        ..DataChannelCallbacks::default()
+                    });
+                    *b_channel_cb.lock() = Some(dc);
+                }),
+                ..PeerConnectionCallbacks::default()
+            };
+
+            let pc_a = PeerConnection::new(loopback_config(), a_cbs).expect("pc a");
+            let pc_b = PeerConnection::new(loopback_config(), b_cbs).expect("pc b");
+
+            let dc_a = pc_a.create_data_channel("echo");
+            dc_a.set_callbacks(DataChannelCallbacks {
+                on_message: Arc::new(move |_data, _binary| {
+                    a_echoes_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }),
+                ..DataChannelCallbacks::default()
+            });
+
+            // Offer/answer + trickle.
+            pc_a.set_local_description(DescriptionType::Offer)
+                .expect("a set local offer");
+            assert!(
+                wait_for(|| pc_a.gathering_state() == GatheringState::Complete, 3000).await,
+                "A never finished gathering"
+            );
+            let offer = pc_a.local_description().expect("a local description");
+            pc_b.set_remote_description(offer).expect("b set remote offer");
+            pc_b.set_local_description(DescriptionType::Answer)
+                .expect("b set local answer");
+            assert!(
+                wait_for(|| pc_b.gathering_state() == GatheringState::Complete, 3000).await,
+                "B never finished gathering"
+            );
+            let answer = pc_b.local_description().expect("b local description");
+            pc_a.set_remote_description(answer).expect("a set remote answer");
+            for c in a_cands.lock().iter() {
+                let _ = pc_b.add_remote_candidate(c);
+            }
+            for c in b_cands.lock().iter() {
+                let _ = pc_a.add_remote_candidate(c);
+            }
+            pc_a.set_remote_end_of_candidates().expect("a eoc");
+            pc_b.set_remote_end_of_candidates().expect("b eoc");
+
+            assert!(
+                wait_for(
+                    || {
+                        *a_state.lock() == PeerConnectionState::Connected
+                            && *b_state.lock() == PeerConnectionState::Connected
+                    },
+                    12000,
+                )
+                .await,
+                "peers did not reach Connected: a={:?}, b={:?}",
+                *a_state.lock(),
+                *b_state.lock(),
+            );
+            assert!(
+                wait_for(|| b_channel.lock().is_some(), 5000).await,
+                "B never received the data channel"
+            );
+            assert!(
+                wait_for(|| dc_a.is_open(), 5000).await,
+                "A's channel never opened"
+            );
+
+            // Fire a burst of sizeable messages so buffered-amount rises above
+            // and falls back below the (default 0) low-water threshold, forcing
+            // `on_buffered_amount_low` to fire from inside the echo's send —
+            // the re-entrant path. Pre-fix, the first such edge wedges B's
+            // worker and `n` echoes never come back.
+            const N: usize = 200;
+            let payload = vec![0xABu8; 16 * 1024];
+            for _ in 0..N {
+                dc_a.send_binary(&payload).expect("a send");
+            }
+
+            assert!(
+                wait_for(
+                    || a_echoes.load(std::sync::atomic::Ordering::SeqCst) >= N,
+                    15000,
+                )
+                .await,
+                "inline echo deadlocked: only {} of {N} echoes returned \
+                 (B's SCTP worker wedged on a re-entrant data_channels lock)",
+                a_echoes.load(std::sync::atomic::Ordering::SeqCst),
+            );
 
             pc_a.close().expect("close a");
             pc_b.close().expect("close b");

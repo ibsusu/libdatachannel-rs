@@ -166,6 +166,15 @@ pub trait MediaHandler: Send {
     fn request_bitrate(&mut self, _bitrate: u64, _sender: &mut Sender) -> bool {
         false
     }
+
+    /// The RTP timestamp carried by the most recent Sender Report this handler
+    /// emitted, if it is a sender-report source. Defaults to `None` for handlers
+    /// that don't produce SRs. Used to back `rtcGetLastTrackSenderReportTimestamp`
+    /// without downcasting the chain's `Box<dyn MediaHandler>` nodes (upstream
+    /// reaches the reporter through a separate `rtcpSrReporterMap`).
+    fn last_sr_timestamp(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// An ordered chain of [`MediaHandler`]s. Ports the `addToChain` / `incomingChain`
@@ -254,6 +263,14 @@ impl MediaHandlerChain {
             }
         }
         (sender.take(), handled)
+    }
+
+    /// The last Sender-Report RTP timestamp reported by any handler in the chain
+    /// (the chained [`RtcpSrReporter`], if present). `None` when no handler is a
+    /// sender-report source. Backs `rtcGetLastTrackSenderReportTimestamp`.
+    #[must_use]
+    pub fn last_sr_timestamp(&self) -> Option<u32> {
+        self.handlers.iter().find_map(|h| h.last_sr_timestamp())
     }
 }
 
@@ -617,6 +634,10 @@ impl MediaHandler for RtcpSrReporter {
         // elapsed time, defaulting to the configured interval so chaining alone
         // still produces a report once per qualifying batch.
         self.outgoing_at(messages, sender, self.report_interval_ms, 0);
+    }
+
+    fn last_sr_timestamp(&self) -> Option<u32> {
+        Some(self.last_reported_timestamp)
     }
 }
 

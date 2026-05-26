@@ -86,7 +86,8 @@ pub use srtp_transport::{
     DEFAULT_SRTP_PROFILES, SrtpTransport, SrtpTransportCallbacks, SrtpTransportError, srtp_version,
 };
 pub use track::{
-    Codec, Media as TrackMedia, RtpMap, SsrcEntry, Track, TrackCallbacks, TrackError, TrackInit,
+    Codec, CodecPacketizer, Media as TrackMedia, RtpMap, SsrcEntry, Track, TrackCallbacks,
+    TrackError, TrackInit,
 };
 pub use websocket::{
     DEFAULT_WS_MAX_MESSAGE_SIZE, DecodeOutcome, Frame, Opcode, State as WebSocketState, WebSocket,
