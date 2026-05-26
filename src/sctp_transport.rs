@@ -154,6 +154,26 @@ const SCTP_STREAM_RESET_OUTGOING: u16 = 0x01;
 pub(crate) const MAX_SCTP_STREAMS_COUNT: u16 = 1024;
 const DEFAULT_LOCAL_MAX_MESSAGE_SIZE: usize = 256 * 1024;
 
+/// Number of streams to request per direction in `SCTP_INITMSG`. usrsctp
+/// preallocates *and initializes* a `sctp_stream_out`/`sctp_stream_in` control
+/// struct for every requested stream at association setup (`sctputil.c`
+/// `sctp_init_asoc`), so the count is a fixed per-association resident-memory
+/// tax (~110 KiB/assoc at 1024) regardless of how many channels are opened.
+/// Defaults to [`MAX_SCTP_STREAMS_COUNT`]; `JUICE_SCTP_STREAMS` overrides it
+/// (clamped to `1..=MAX_SCTP_STREAMS_COUNT`) — a measurement instrument and a
+/// knob for high-fan-out, few-channels-per-peer deployments. Read once, cached.
+fn requested_stream_count() -> u16 {
+    static N: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *N.get_or_init(|| match std::env::var("JUICE_SCTP_STREAMS") {
+        Ok(v) => v
+            .trim()
+            .parse::<u16>()
+            .map(|n| n.clamp(1, MAX_SCTP_STREAMS_COUNT))
+            .unwrap_or(MAX_SCTP_STREAMS_COUNT),
+        Err(_) => MAX_SCTP_STREAMS_COUNT,
+    })
+}
+
 // shutdown how.
 const SHUT_RDWR: i32 = 2;
 
@@ -1051,10 +1071,13 @@ impl SctpTransport {
             spp.spp_pathmtu = SAFE_SCTP_MTU;
             setsockopt(sock, IPPROTO_SCTP, SCTP_PEER_ADDR_PARAMS, &spp)?;
 
-            // SCTP_INITMSG: cap streams.
+            // SCTP_INITMSG: cap streams. The requested count drives usrsctp's
+            // per-association stream-array preallocation (see
+            // `requested_stream_count`), so it's the dominant per-conn memory knob.
+            let streams = requested_stream_count();
             let sinit = sys::sctp_initmsg {
-                sinit_num_ostreams: MAX_SCTP_STREAMS_COUNT,
-                sinit_max_instreams: MAX_SCTP_STREAMS_COUNT,
+                sinit_num_ostreams: streams,
+                sinit_max_instreams: streams,
                 sinit_max_attempts: 0,
                 sinit_max_init_timeo: 0,
             };
