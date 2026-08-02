@@ -1,0 +1,6 @@
+[submodule "vendor/usrsctp"]
+	path = vendor/usrsctp
+	url = https://github.com/paullouisageneau/usrsctp.git
+[submodule "vendor/libsrtp"]
+	path = vendor/libsrtp
+	url = https://github.com/cisco/libsrtp.git

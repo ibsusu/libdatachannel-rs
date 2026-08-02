@@ -2,11 +2,8 @@
 //!
 //! Compiles the vendored usrsctp C library (0.9.5.0) via the `cc` crate
 //! and generates Rust FFI bindings for `usrsctp.h` via `bindgen`. The
-//! C sources live under
-//! `native/libdatachannel/deps/usrsctp/usrsctplib/` and are NOT vendored
-//! into this crate's git repo — they're referenced in place by relative
-//! path. The generated bindings land in `OUT_DIR` (under `target/`, which
-//! is gitignored), so nothing C enters version control.
+//! C sources live in the pinned `vendor/usrsctp` Git submodule. The generated
+//! bindings land in `OUT_DIR` (under `target/`, which is gitignored).
 //!
 //! The compile defines and the per-OS flag selection mirror
 //! `usrsctplib/CMakeLists.txt` exactly so the later x86_64-Linux
@@ -113,12 +110,10 @@ fn generate_capi_header() {
 }
 
 fn build_usrsctp() {
-    // Path to the vendored usrsctp sources, relative to this crate's
-    // manifest dir (rust/libdatachannel-rust/). Three levels up reaches
-    // the `native/` root.
+    // Path to the pinned usrsctp submodule inside this crate repository.
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let usrsctplib = manifest_dir
-        .join("../../libdatachannel/deps/usrsctp/usrsctplib")
+        .join("vendor/usrsctp/usrsctplib")
         .canonicalize()
         .expect("usrsctp usrsctplib dir not found");
 
@@ -316,7 +311,7 @@ fn build_usrsctp() {
 fn build_libsrtp2() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let libsrtp = manifest_dir
-        .join("../../libdatachannel/deps/libsrtp")
+        .join("vendor/libsrtp")
         .canonicalize()
         .expect("libsrtp deps dir not found");
 
