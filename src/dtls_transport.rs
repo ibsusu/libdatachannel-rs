@@ -39,7 +39,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use openssl::hash::MessageDigest;
-use openssl::ssl::{Ssl, SslContext, SslContextBuilder, SslMethod, SslOptions, SslVerifyMode};
+use openssl::ssl::{
+    Ssl, SslContext, SslContextBuilder, SslMethod, SslOptions, SslVerifyMode, SslVersion,
+};
 use openssl_sys as ossl_sys;
 use parking_lot::Mutex;
 use thiserror::Error;
@@ -63,6 +65,52 @@ fn ssl_ptr(ssl: &Ssl) -> *mut ossl_sys::SSL {
     // SAFETY: `Ssl` is `#[repr(transparent)]` over `*mut ffi::SSL` per
     // the `foreign_type_and_impl_send_sync!` macro contract.
     unsafe { std::mem::transmute_copy::<Ssl, *mut ossl_sys::SSL>(ssl) }
+}
+
+// `DTLSv1_get_timeout` / `DTLSv1_handle_timeout` are macros in OpenSSL
+// (thin wrappers over `SSL_ctrl`), so `openssl-sys` does not expose them as
+// functions. We invoke `SSL_ctrl` directly with the documented command
+// numbers from `<openssl/dtls1.h>`.
+const DTLS_CTRL_GET_TIMEOUT: std::ffi::c_int = 73;
+const DTLS_CTRL_HANDLE_TIMEOUT: std::ffi::c_int = 74;
+
+/// `DTLSv1_get_timeout(ssl, &mut tv)` — the time remaining until OpenSSL's
+/// next handshake retransmit is due. Returns `Some(duration)` when a timer
+/// is pending, `None` when nothing is scheduled (no unacked flight).
+///
+/// Safety: `ssl` must be a live `*mut SSL` and the caller must hold the
+/// `Inner` mutex (OpenSSL calls are not reentrant).
+unsafe fn dtls_get_timeout(ssl: *mut ossl_sys::SSL) -> Option<std::time::Duration> {
+    let mut tv = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let r = unsafe {
+        ossl_sys::SSL_ctrl(
+            ssl,
+            DTLS_CTRL_GET_TIMEOUT,
+            0,
+            &mut tv as *mut libc::timeval as *mut std::ffi::c_void,
+        )
+    };
+    if r == 1 {
+        Some(std::time::Duration::new(
+            tv.tv_sec.max(0) as u64,
+            (tv.tv_usec.max(0) as u32).saturating_mul(1000),
+        ))
+    } else {
+        None
+    }
+}
+
+/// `DTLSv1_handle_timeout(ssl)` — retransmit the last handshake flight *iff*
+/// the retransmit timer has actually expired. OpenSSL checks expiry
+/// internally, so polling this is safe: returns `0` when nothing is due,
+/// `>0` when a flight was re-queued into the outbound BIO, `<0` on error.
+///
+/// Safety: same contract as [`dtls_get_timeout`].
+unsafe fn dtls_handle_timeout(ssl: *mut ossl_sys::SSL) -> std::ffi::c_long {
+    unsafe { ossl_sys::SSL_ctrl(ssl, DTLS_CTRL_HANDLE_TIMEOUT, 0, std::ptr::null_mut()) }
 }
 
 use crate::certificate::{Certificate, CertificateError, format_fingerprint};
@@ -353,26 +401,37 @@ impl DtlsTransport {
         // — see `started` AtomicBool — so racing the auto-start with a
         // manual `start()` call is harmless.
         let prev = ice.callbacks();
-        let dtls_for_cb = DtlsTransport {
-            bridge: Arc::clone(&bridge),
-        };
+        // Capture only a *weak* ref to the bridge. A strong `Arc<Bridge>`
+        // here (via a `DtlsTransport`) would form a reference cycle —
+        // `Bridge → ice → ICE callbacks → this closure → Bridge` — that
+        // leaks the whole transport (and its ICE agent) forever and keeps
+        // the DTLS retransmit timer alive past the transport's real
+        // lifetime. With a `Weak`, dropping the last `DtlsTransport` handle
+        // frees the cycle and the timer's own `Weak::upgrade` then fails so
+        // it exits promptly.
+        let weak_bridge = Arc::downgrade(&bridge);
         let new_on_state_change = {
             let prev_state = Arc::clone(&prev.on_state_change);
             Arc::new(move |s: IceState| {
                 if matches!(s, IceState::Connected | IceState::Completed) {
-                    // start() is idempotent: no-op if we've already
-                    // started, otherwise drives the ClientHello.
-                    if let Err(e) = dtls_for_cb.start() {
-                        // Only Closed should bubble out here; everything
-                        // else (Ice / SSL handshake error) is logged.
-                        warn!("DtlsTransport: auto-start on ICE-Connected failed: {e}");
+                    if let Some(bridge) = weak_bridge.upgrade() {
+                        let dtls_for_cb = DtlsTransport {
+                            bridge: Arc::clone(&bridge),
+                        };
+                        // start() is idempotent: no-op if we've already
+                        // started, otherwise drives the ClientHello.
+                        if let Err(e) = dtls_for_cb.start() {
+                            // Only Closed should bubble out here; everything
+                            // else (Ice / SSL handshake error) is logged.
+                            warn!("DtlsTransport: auto-start on ICE-Connected failed: {e}");
+                        }
+                        // Drain the outbound BIO: ClientHello bytes pushed
+                        // during a prior `start()` may have been stranded
+                        // because ICE didn't have a selected pair at the
+                        // time. Now that we're Connected, push them.
+                        let mut g = bridge.inner.lock();
+                        let _ = drain_outbound_locked(&mut g, &bridge);
                     }
-                    // Drain the outbound BIO: ClientHello bytes pushed
-                    // during a prior `start()` may have been stranded
-                    // because ICE didn't have a selected pair at the
-                    // time. Now that we're Connected, push them.
-                    let mut g = dtls_for_cb.bridge.inner.lock();
-                    let _ = drain_outbound_locked(&mut g, &dtls_for_cb.bridge);
                 }
                 (prev_state)(s);
             })
@@ -560,25 +619,34 @@ impl DtlsTransport {
         // ICE state transitions can still surface to the upper layer
         // (we lift the existing on_state_change unchanged).
         let prev = self.bridge.ice.callbacks();
-        let bridge = Arc::clone(&self.bridge);
+        // Weak, not strong — see the cycle note in `new()`. These shims live
+        // inside the ICE transport, which the Bridge owns; a strong capture
+        // would leak the transport and keep the DTLS timer alive forever.
         let new_callbacks = IceTransportCallbacks {
             on_state_change: {
                 // Chain to the previous on_state_change and additionally
                 // mark the transport failed if ICE falls over.
                 let prev_state = Arc::clone(&prev.on_state_change);
-                let bridge = Arc::clone(&self.bridge);
+                let weak = Arc::downgrade(&self.bridge);
                 Arc::new(move |s: IceState| {
                     (prev_state)(s);
                     if matches!(s, IceState::Failed | IceState::Closed) {
-                        fail_transport(&bridge);
+                        if let Some(bridge) = weak.upgrade() {
+                            fail_transport(&bridge);
+                        }
                     }
                 })
             },
             on_gathering_state_change: prev.on_gathering_state_change,
             on_candidate: prev.on_candidate,
-            on_data: Arc::new(move |data: &[u8]| {
-                pump_inbound(&bridge, data);
-            }),
+            on_data: {
+                let weak = Arc::downgrade(&self.bridge);
+                Arc::new(move |data: &[u8]| {
+                    if let Some(bridge) = weak.upgrade() {
+                        pump_inbound(&bridge, data);
+                    }
+                })
+            },
         };
         self.bridge.ice.set_callbacks(new_callbacks);
 
@@ -612,6 +680,33 @@ impl DtlsTransport {
                         other => return Err(other),
                     }
                 }
+            }
+        }
+
+        // Spawn the DTLS retransmit timer. OpenSSL does NOT self-retransmit
+        // lost handshake flights — the application must call
+        // `DTLSv1_handle_timeout()` once OpenSSL's timer expires. C++
+        // libdatachannel runs a dedicated timer thread for exactly this
+        // (`dtlstransport.cpp`). Without it, a handshake flight dropped on
+        // the wire — common over the real internet, ~never over loopback or
+        // veth — is never resent and the handshake stalls forever. This is
+        // why Rust↔Rust handshakes over clean local links always succeeded
+        // while Chrome↔Rust over a lossy path hung at "ctrl open timeout".
+        // Runs for both roles (client and server both emit flights) until
+        // the handshake leaves `Connecting`.
+        //
+        // The timer holds only a `Weak<Bridge>` and upgrades per tick: the
+        // instant the application drops the transport (PeerConnection close
+        // / Drop), the upgrade fails and the timer exits — it must never keep
+        // a dead transport (and its ICE agent) alive, nor touch ICE after the
+        // owner has torn down.
+        {
+            let weak = Arc::downgrade(&self.bridge);
+            if let Err(e) = std::thread::Builder::new()
+                .name("dtls-timer".into())
+                .spawn(move || dtls_timer_loop(weak))
+            {
+                warn!("DtlsTransport: failed to spawn DTLS retransmit timer: {e}");
             }
         }
         Ok(())
@@ -709,6 +804,16 @@ fn build_ssl_context(
             | SslOptions::NO_RENEGOTIATION,
     );
     builder.set_cipher_list(CIPHER_LIST)?;
+
+    // Pin DTLS to 1.2. OpenSSL 3.5+ can negotiate DTLS 1.3, and Chrome (with
+    // WebRTC-ForceDtls13) presents a DTLS 1.3 endpoint — but DTLS 1.3 is a
+    // different record/ACK state machine than the 1.2 path libdatachannel
+    // (and this port) was written against. Empirically the OpenSSL↔OpenSSL
+    // path negotiates 1.2 and completes, while the OpenSSL↔Chrome path stalls
+    // mid-handshake. libdatachannel C++ itself uses DTLS 1.2; matching that
+    // keeps browser interop on the well-trodden path. (No min cap — 1.0/1.2
+    // range is fine; we just refuse to climb to 1.3.)
+    builder.set_max_proto_version(Some(SslVersion::DTLS1_2))?;
 
     // Verify mode matches dtlstransport.cpp:762 — REQUIRE the peer
     // certificate. The callback ports the C++
@@ -881,6 +986,23 @@ fn drive_handshake_locked(
             // Handshake done.
             if !inner.handshake_done {
                 inner.handshake_done = true;
+                // Diagnostic (gated): which DTLS version actually got
+                // negotiated. Chrome forces a DTLS 1.3 ClientHello; an
+                // OpenSSL 3.5+ server will happily complete 1.3, which is a
+                // different record/ACK machine than the 1.2 path this port
+                // was written against.
+                if std::env::var_os("DTLS_LOG_VERSION").is_some() {
+                    let ver = unsafe {
+                        let p = ossl_sys::SSL_get_version(ssl_ptr(&inner.ssl));
+                        if p.is_null() {
+                            "?".to_string()
+                        } else {
+                            std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+                        }
+                    };
+                    let role = if bridge.is_client { "client" } else { "server" };
+                    eprintln!("[dtls] handshake complete role={role} version={ver}");
+                }
                 // Set MTU to a sane post-handshake value matching C++
                 // at dtlstransport.cpp:962.
                 unsafe { ossl_sys::SSL_set_mtu(ssl_ptr(&inner.ssl), 4097) };
@@ -900,7 +1022,18 @@ fn drive_handshake_locked(
             // Normal: handshake needs more datagrams.
             Ok(())
         }
-        other => Err(DtlsTransportError::Handshake(other)),
+        other => {
+            // Surface the concrete OpenSSL error (gated) — the SSL_get_error
+            // code alone (e.g. SSL_ERROR_SSL=1) doesn't say *why*. Drain the
+            // error queue into a readable string for diagnosis.
+            if std::env::var_os("DTLS_LOG_VERSION").is_some() {
+                // Drains the thread's OpenSSL error queue into a Display.
+                let detail = openssl::error::ErrorStack::get();
+                let role = if bridge.is_client { "client" } else { "server" };
+                eprintln!("[dtls] handshake ERROR role={role} ssl_err={other} detail=[{detail}]");
+            }
+            Err(DtlsTransportError::Handshake(other))
+        }
     }
 }
 
@@ -932,6 +1065,69 @@ fn drain_outbound_locked(
             }
             Err(e) => return Err(DtlsTransportError::Ice(e)),
         }
+    }
+}
+
+/// Background retransmit driver for the DTLS handshake. Spawned by
+/// [`DtlsTransport::start`]; runs until the handshake leaves `Connecting`
+/// (→ Connected / Failed / Closed) or a hard cap elapses.
+///
+/// Each tick, while still handshaking, it asks OpenSSL to retransmit the
+/// last flight if its timer has expired (`DTLSv1_handle_timeout`) and, when
+/// a flight was re-queued, drains the outbound BIO back onto ICE. The poll
+/// cadence follows OpenSSL's own next-timeout (clamped) so we fire close to
+/// when each flight is actually due without busy-spinning. A 30 s overall
+/// cap mirrors libdatachannel's transport timeout: past it the peer is gone
+/// and we fail rather than spin forever.
+fn dtls_timer_loop(weak: std::sync::Weak<Bridge>) {
+    const MAX_HANDSHAKE: std::time::Duration = std::time::Duration::from_secs(30);
+    const MIN_TICK: std::time::Duration = std::time::Duration::from_millis(10);
+    const MAX_TICK: std::time::Duration = std::time::Duration::from_millis(250);
+
+    let deadline = std::time::Instant::now() + MAX_HANDSHAKE;
+    loop {
+        // Each tick computes a sleep while holding a *strong* ref, then drops
+        // it before sleeping — so during the sleep only the Weak remains and
+        // the real owner can free the Bridge (and its ICE agent) at will.
+        let sleep = {
+            let Some(bridge) = weak.upgrade() else {
+                // Transport dropped by its owner — nothing left to drive.
+                return;
+            };
+            if bridge.closed.load(Ordering::SeqCst) {
+                return;
+            }
+            if !matches!(*bridge.state.lock(), DtlsState::Connecting) {
+                // Handshake completed or failed — nothing left to retransmit.
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                warn!("DtlsTransport: DTLS handshake timed out after 30s; failing transport");
+                fail_transport(&bridge);
+                return;
+            }
+
+            let mut g = bridge.inner.lock();
+            let ssl = ssl_ptr(&g.ssl);
+            // 0 = nothing due yet, >0 = a flight was re-queued, <0 = error.
+            let r = unsafe { dtls_handle_timeout(ssl) };
+            if r > 0 {
+                if let Err(e) = drain_outbound_locked(&mut g, &bridge) {
+                    // ICE may not have a selected pair yet (e.g. start()
+                    // raced ahead of ICE-Connected); log and keep ticking —
+                    // the next tick retries once the pair is up.
+                    warn!("DtlsTransport: handshake retransmit drain failed: {e}");
+                }
+            }
+            // Sleep until OpenSSL's next scheduled retransmit, clamped so we
+            // stay responsive to state changes and the overall deadline.
+            match unsafe { dtls_get_timeout(ssl) } {
+                Some(d) => d.clamp(MIN_TICK, MAX_TICK),
+                None => MAX_TICK,
+            }
+            // `bridge` (strong ref) and `g` (lock guard) drop here.
+        };
+        std::thread::sleep(sleep);
     }
 }
 

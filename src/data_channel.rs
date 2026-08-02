@@ -643,7 +643,10 @@ impl DataChannel {
     /// and the new amount is *at or below* it (edge-triggered, not level).
     pub(crate) fn trigger_buffered_amount(&self, amount: usize) {
         let previous = self.inner.buffered_amount.swap(amount, Ordering::SeqCst);
-        let threshold = self.inner.buffered_amount_low_threshold.load(Ordering::SeqCst);
+        let threshold = self
+            .inner
+            .buffered_amount_low_threshold
+            .load(Ordering::SeqCst);
         if previous > threshold && amount <= threshold {
             let cb = Arc::clone(&self.inner.callbacks.lock().on_buffered_amount_low);
             (cb)();

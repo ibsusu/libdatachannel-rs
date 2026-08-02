@@ -4165,7 +4165,10 @@ mod tests {
 
         // Mint an offer SDP. ufrag/pwd + the video m-line with a=ssrc are present
         // immediately; gathered candidates aren't needed for SSRC inspection.
-        assert_eq!(rtcSetLocalDescription(pc, std::ptr::null()), RTC_ERR_SUCCESS);
+        assert_eq!(
+            rtcSetLocalDescription(pc, std::ptr::null()),
+            RTC_ERR_SUCCESS
+        );
         let needed = rtcGetLocalDescription(pc, std::ptr::null_mut(), 0);
         assert!(needed > 0, "no local description: {needed}");
         let mut sdp_buf = vec![0 as c_char; needed as usize];

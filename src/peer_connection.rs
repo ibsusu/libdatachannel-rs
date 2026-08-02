@@ -2529,7 +2529,8 @@ a=max-message-size:262144\r\n";
                 "A never finished gathering"
             );
             let offer = pc_a.local_description().expect("a local description");
-            pc_b.set_remote_description(offer).expect("b set remote offer");
+            pc_b.set_remote_description(offer)
+                .expect("b set remote offer");
             pc_b.set_local_description(DescriptionType::Answer)
                 .expect("b set local answer");
             assert!(
@@ -2537,7 +2538,8 @@ a=max-message-size:262144\r\n";
                 "B never finished gathering"
             );
             let answer = pc_b.local_description().expect("b local description");
-            pc_a.set_remote_description(answer).expect("a set remote answer");
+            pc_a.set_remote_description(answer)
+                .expect("a set remote answer");
             for c in a_cands.lock().iter() {
                 let _ = pc_b.add_remote_candidate(c);
             }

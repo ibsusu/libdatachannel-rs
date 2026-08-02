@@ -1056,6 +1056,58 @@ fn run_ws_client(
     }
 }
 
+/// Point an `SslConnectorBuilder` at the host's real CA trust store.
+///
+/// Needed because we statically link a `vendored` OpenSSL whose compiled-in
+/// `OPENSSLDIR` refers to the build host, not the runtime host — so the default
+/// verify paths are empty and chain validation always fails. We honour
+/// `SSL_CERT_FILE` / `SSL_CERT_DIR` first (operator override / curl convention),
+/// then probe the well-known bundle locations across common distros + macOS.
+/// If nothing is found we fall back to the (empty) default paths so behaviour is
+/// no worse than before.
+fn load_system_ca(builder: &mut openssl::ssl::SslConnectorBuilder) {
+    // 1. Explicit single-file override (operator intent / curl convention).
+    if let Some(f) = std::env::var_os("SSL_CERT_FILE") {
+        if std::path::Path::new(&f).exists() && builder.set_ca_file(&f).is_ok() {
+            return;
+        }
+    }
+    // 2. Well-known CA *bundle files*, in rough order of prevalence. Bundle
+    //    files are tried before any directory: a single PEM either parses with
+    //    roots or fails loudly, whereas load_verify_locations on an *empty*
+    //    hashed dir returns Ok while loading nothing (the macOS trap, where
+    //    SSL_CERT_DIR=/etc/ssl/certs exists but is empty) — a silent miss that
+    //    then fails every real chain with "unable to get local issuer".
+    const CA_FILES: &[&str] = &[
+        "/etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu/Alpine/Arch
+        "/etc/pki/tls/certs/ca-bundle.crt",   // RHEL/Fedora/CentOS
+        "/etc/ssl/ca-bundle.pem",             // openSUSE
+        "/etc/ssl/cert.pem",                  // macOS (LibreSSL/MacPorts), OpenBSD, Alpine
+        "/usr/local/etc/openssl/cert.pem",    // Homebrew OpenSSL
+    ];
+    for f in CA_FILES {
+        if std::path::Path::new(f).exists() && builder.set_ca_file(f).is_ok() {
+            return;
+        }
+    }
+    // 3. Explicit hashed-dir override, then well-known hashed dirs.
+    if let Some(d) = std::env::var_os("SSL_CERT_DIR") {
+        let p = std::path::PathBuf::from(&d);
+        if p.exists() && builder.load_verify_locations(None, Some(&p)).is_ok() {
+            return;
+        }
+    }
+    const CA_DIRS: &[&str] = &["/etc/ssl/certs", "/etc/pki/tls/certs"];
+    for d in CA_DIRS {
+        let p = std::path::Path::new(d);
+        if p.exists() && builder.load_verify_locations(None, Some(p)).is_ok() {
+            return;
+        }
+    }
+    // 4. Last resort: whatever the vendored build baked in (likely empty).
+    let _ = builder.set_default_verify_paths();
+}
+
 /// TCP connect (+ optional TLS), then drive the client HTTP Upgrade handshake.
 /// Returns the live stream plus any bytes already read past the response
 /// headers (the leading bytes of the first frame, which arrived in the same
@@ -1078,6 +1130,14 @@ fn connect_and_handshake(
             .map_err(|e| WebSocketError::Transport(format!("TLS init: {e}")))?;
         if config.disable_tls_verification {
             builder.set_verify(SslVerifyMode::NONE);
+        } else {
+            // We link OpenSSL with the `vendored` feature, which bakes an
+            // OPENSSLDIR pointing at the *build host's* layout (e.g. the Docker
+            // cross-build image). That directory does not exist at runtime, so
+            // the default verify paths are empty and every real wss:// cert
+            // fails with "unable to get local issuer certificate". Point the
+            // verify store at the actual system CA bundle on the running host.
+            load_system_ca(&mut builder);
         }
         let connector = builder.build();
         let mut cfg = connector
