@@ -302,12 +302,6 @@ fn usrsctp_global_init() {
             sys::usrsctp_sysctl_set_sctp_max_chunks_on_queue(10 * 1024); // 10K chunks
             sys::usrsctp_sysctl_set_sctp_initial_cwnd(10); // 10 MTUs (RFC 6928)
             sys::usrsctp_sysctl_set_sctp_max_burst_default(10); // 10 MTUs
-            // Interactive DataChannel transfers are sparse bursts. The usrsctp
-            // defaults (SACK every 2 packets, 200 ms delayed fallback) make a
-            // 256 KiB piece pay timer-scale latency repeatedly. ACK each packet;
-            // retain a short 20 ms fallback for implementations that coalesce.
-            sys::usrsctp_sysctl_set_sctp_sack_freq_default(1);
-            sys::usrsctp_sysctl_set_sctp_delayed_sack_time_default(20);
         }
         *INSTANCES.lock().unwrap() = Some(HashSet::new());
     });
