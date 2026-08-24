@@ -978,15 +978,19 @@ impl PeerConnection {
         // Tear down from the top down (SCTP / SRTP → DTLS → ICE), mirroring
         // the C++ `PeerConnection::close()`.
         if let Some(sctp) = self.inner.sctp.lock().take() {
+            sctp.set_callbacks(SctpTransportCallbacks::default());
             let _ = sctp.close();
         }
         if let Some(srtp) = self.inner.srtp.lock().take() {
+            srtp.set_callbacks(SrtpTransportCallbacks::default());
             let _ = srtp.close();
         }
         if let Some(dtls) = self.inner.dtls.lock().take() {
+            dtls.set_callbacks(DtlsTransportCallbacks::default());
             let _ = dtls.close();
         }
         if let Some(ice) = self.inner.ice.lock().take() {
+            ice.set_callbacks(IceTransportCallbacks::default());
             let _ = ice.close();
         }
         self.force_state(PeerConnectionState::Closed);
@@ -2125,6 +2129,23 @@ a=max-message-size:262144\r\n";
             desc.set_application(Application::new("0"));
             let err = pc.set_remote_description(desc).expect_err("must reject");
             assert!(matches!(err, PeerConnectionError::MissingRemoteFingerprint));
+        });
+    }
+
+    #[test]
+    fn close_breaks_transport_callback_cycles() {
+        rt().block_on(async {
+            let pc = PeerConnection::new(loopback_config(), PeerConnectionCallbacks::default())
+                .expect("construct");
+            pc.set_local_description(DescriptionType::Offer)
+                .expect("initialize transports");
+            let weak = Arc::downgrade(&pc.inner);
+            pc.close().expect("close");
+            drop(pc);
+            assert!(
+                weak.upgrade().is_none(),
+                "transport callbacks retained the PC"
+            );
         });
     }
 
