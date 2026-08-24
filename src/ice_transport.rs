@@ -754,6 +754,7 @@ impl IceTransport {
             };
             (cb)(State::Closed);
         }
+        self.agent.shutdown();
 
         Ok(())
     }
