@@ -47,7 +47,8 @@ pub use codec::{
 };
 pub use configuration::{
     CertificateType, Configuration, CongestionControl, IceServer, IceServerParseError,
-    IceServerType, IceTransportPolicy, ProxyServer, ProxyType, RelayType, TransportPolicy,
+    IceServerType, IceTcpMode, IceTransportPolicy, ProxyServer, ProxyType, RelayType,
+    TransportPolicy,
 };
 pub use data_channel::{DataChannel, DataChannelCallbacks, DataChannelError, DataChannelInit};
 pub use description::{

@@ -44,6 +44,16 @@ pub enum IceTransportPolicy {
 /// (`Configuration::iceTransportPolicy` is typed `TransportPolicy`).
 pub type TransportPolicy = IceTransportPolicy;
 
+/// Explicit RFC 6544 role. `None` in [`Configuration`] preserves the legacy
+/// `enable_ice_tcp` boolean (`true` means active/client mode).
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum IceTcpMode {
+    /// Initiate a framed TCP connection to a remote passive candidate.
+    Active,
+    /// Listen for a framed TCP connection from a remote active candidate.
+    Passive,
+}
+
 /// Relay flavour for a TURN server. Mirrors `rtc::IceServer::RelayType`.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum RelayType {
@@ -379,8 +389,11 @@ pub struct Configuration {
     pub certificate_type: CertificateType,
     /// ICE transport policy.
     pub ice_transport_policy: TransportPolicy,
-    /// Enable ICE-TCP candidates.
+    /// Legacy ICE-TCP switch. `true` means active mode unless
+    /// [`Configuration::ice_tcp_mode`] overrides it.
     pub enable_ice_tcp: bool,
+    /// Explicit active/passive role for native peer-to-peer fallback.
+    pub ice_tcp_mode: Option<IceTcpMode>,
     /// Enable ICE UDP multiplexing (libjuice backend only).
     pub enable_ice_udp_mux: bool,
     /// If true, the runtime does not auto-create offers / process renegotiation.
@@ -417,6 +430,7 @@ impl Configuration {
             certificate_type: CertificateType::Default,
             ice_transport_policy: IceTransportPolicy::All,
             enable_ice_tcp: false,
+            ice_tcp_mode: None,
             enable_ice_udp_mux: false,
             disable_auto_negotiation: false,
             disable_auto_gathering: false,
@@ -870,6 +884,7 @@ mod tests {
         assert!(c.max_message_size.is_none());
         assert!(c.ice_servers.is_empty());
         assert!(!c.enable_ice_tcp);
+        assert!(c.ice_tcp_mode.is_none());
         assert!(!c.enable_ice_udp_mux);
         assert!(!c.disable_auto_negotiation);
         assert!(!c.disable_auto_gathering);

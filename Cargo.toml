@@ -11,7 +11,7 @@ description = "Native Rust port of libdatachannel. Replaces the C++ library; not
 crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]
-libjuice = { git = "ssh://git@github.com/ibsusu/libjuice-rs.git", rev = "4483fe91f84da96e586a2041c0d8c66ba98d3125" }
+libjuice = { git = "ssh://git@github.com/ibsusu/libjuice-rs.git", rev = "b9b9caec72a1091463aac2df5a14c15949bf1a68" }
 tracing = "0.1"
 log = "0.4"
 tokio = { version = "1", features = ["full"] }

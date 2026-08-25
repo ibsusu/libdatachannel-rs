@@ -57,7 +57,7 @@ use tracing::warn;
 use juice as libjuice;
 
 use crate::candidate::{Candidate, ParseError as CandidateParseError};
-use crate::configuration::{Configuration, IceServerType, IceTransportPolicy};
+use crate::configuration::{Configuration, IceServerType, IceTcpMode, IceTransportPolicy};
 use crate::description::{
     Application, Description, DescriptionParseError, Role, Type as DescriptionType,
 };
@@ -162,6 +162,10 @@ pub enum IceTransportError {
     /// `get_selected_pair` was called before a pair was nominated.
     #[error("no selected candidate pair yet")]
     NoSelectedPair,
+
+    /// Configuration combines transport modes the native backend cannot honor.
+    #[error("unsupported ICE configuration: {0}")]
+    UnsupportedConfiguration(&'static str),
 
     /// The transport has been closed (the agent's command channel is gone).
     #[error("transport closed")]
@@ -343,12 +347,26 @@ impl IceTransport {
         // on this path; `join_udp_mux` mints a random ufrag/pwd and registers
         // the agent so a normally-exchanged offer/answer routes the offerer's
         // checks to it by USERNAME.
+        let ice_tcp_mode = config
+            .ice_tcp_mode
+            .or_else(|| config.enable_ice_tcp.then_some(IceTcpMode::Active));
+        if config.enable_ice_udp_mux && ice_tcp_mode.is_some() {
+            return Err(IceTransportError::UnsupportedConfiguration(
+                "ICE-TCP cannot be combined with ICE UDP mux",
+            ));
+        }
         let agent = if config.enable_ice_udp_mux {
             let mux = libjuice::join_udp_mux(bind_addr, config.port_range_begin, handler)
                 .map_err(IceTransportError::Juice)?;
             AgentHandle::Mux(mux)
         } else {
             let mut builder = libjuice::Agent::builder(handler);
+            if let Some(mode) = ice_tcp_mode {
+                builder = builder.with_ice_tcp_mode(match mode {
+                    IceTcpMode::Active => libjuice::IceTcpMode::Active,
+                    IceTcpMode::Passive => libjuice::IceTcpMode::Passive,
+                });
+            }
 
             // First STUN entry wins; rest are logged + dropped.
             let mut stun_taken = false;
@@ -1252,8 +1270,167 @@ mod tests {
         });
     }
 
+    #[test]
+    fn two_transports_exchange_data_over_explicit_ice_tcp_roles() {
+        fn tcp_only(description: Description) -> Description {
+            let sdp = description.to_sdp();
+            let filtered = sdp
+                .lines()
+                .filter(|line| {
+                    !line.starts_with("a=candidate:")
+                        || line.split_whitespace().nth(2) == Some("TCP")
+                })
+                .collect::<Vec<_>>()
+                .join("\r\n")
+                + "\r\n";
+            Description::parse(&filtered).expect("parse TCP-only SDP")
+        }
+
+        rt().block_on(async {
+            let a_connected = Arc::new(AtomicBool::new(false));
+            let b_connected = Arc::new(AtomicBool::new(false));
+            let received = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let active_candidates = Arc::new(Mutex::new(Vec::<Candidate>::new()));
+            let passive_candidates = Arc::new(Mutex::new(Vec::<Candidate>::new()));
+
+            let ac = a_connected.clone();
+            let bc = b_connected.clone();
+            let received_cb = received.clone();
+            let active_candidates_cb = active_candidates.clone();
+            let passive_candidates_cb = passive_candidates.clone();
+
+            let a_callbacks = IceTransportCallbacks {
+                on_state_change: Arc::new(move |state| {
+                    if matches!(state, State::Connected | State::Completed) {
+                        ac.store(true, Ordering::SeqCst);
+                    }
+                }),
+                on_candidate: Arc::new(move |candidate| {
+                    active_candidates_cb.lock().push(candidate);
+                }),
+                ..IceTransportCallbacks::default()
+            };
+            let b_callbacks = IceTransportCallbacks {
+                on_state_change: Arc::new(move |state| {
+                    if matches!(state, State::Connected | State::Completed) {
+                        bc.store(true, Ordering::SeqCst);
+                    }
+                }),
+                on_candidate: Arc::new(move |candidate| {
+                    passive_candidates_cb.lock().push(candidate);
+                }),
+                on_data: Arc::new(move |data| {
+                    *received_cb.lock() = data.to_vec();
+                }),
+                ..IceTransportCallbacks::default()
+            };
+
+            let mut active_cfg = Configuration::new();
+            active_cfg.bind_address = Some("127.0.0.1".to_string());
+            active_cfg.ice_tcp_mode = Some(IceTcpMode::Active);
+            let mut passive_cfg = active_cfg.clone();
+            passive_cfg.ice_tcp_mode = Some(IceTcpMode::Passive);
+
+            let active = IceTransport::new(&active_cfg, Role::ActPass, a_callbacks)
+                .expect("active transport");
+            let passive = IceTransport::new(&passive_cfg, Role::Active, b_callbacks)
+                .expect("passive transport");
+
+            active.gather().expect("active gather");
+            assert!(
+                wait_for(
+                    || active
+                        .agent
+                        .get_local_description()
+                        .is_ok_and(|sdp| sdp.contains("end-of-candidates")),
+                    3000,
+                )
+                .await
+            );
+            let active_description = tcp_only(
+                active
+                    .get_local_description(DescriptionType::Offer)
+                    .expect("active description"),
+            );
+            passive
+                .set_remote_description(&active_description)
+                .expect("passive remote description");
+            for candidate in active_candidates.lock().iter().filter(|candidate| {
+                candidate.transport_type() != crate::candidate::TransportType::Udp
+            }) {
+                passive
+                    .add_remote_candidate(candidate)
+                    .expect("trickle active TCP candidate");
+            }
+
+            passive.gather().expect("passive gather");
+            assert!(
+                wait_for(
+                    || passive
+                        .agent
+                        .get_local_description()
+                        .is_ok_and(|sdp| sdp.contains("end-of-candidates")),
+                    3000,
+                )
+                .await
+            );
+            let passive_description = tcp_only(
+                passive
+                    .get_local_description(DescriptionType::Answer)
+                    .expect("passive description"),
+            );
+            active
+                .set_remote_description(&passive_description)
+                .expect("active remote description");
+            for candidate in passive_candidates.lock().iter().filter(|candidate| {
+                candidate.transport_type() != crate::candidate::TransportType::Udp
+            }) {
+                active
+                    .add_remote_candidate(candidate)
+                    .expect("trickle passive TCP candidate");
+            }
+            active
+                .set_remote_end_of_candidates()
+                .expect("active end of candidates");
+            passive
+                .set_remote_end_of_candidates()
+                .expect("passive end of candidates");
+
+            assert!(
+                wait_for(
+                    || {
+                        matches!(active.state(), State::Connected | State::Completed)
+                            && matches!(passive.state(), State::Connected | State::Completed)
+                    },
+                    5000,
+                )
+                .await,
+                "ICE-TCP adapter handshake failed: active={:?} passive={:?}",
+                active.state(),
+                passive.state(),
+            );
+            assert!(a_connected.load(Ordering::SeqCst));
+            assert!(b_connected.load(Ordering::SeqCst));
+
+            let (active_local, active_remote) = active.get_selected_pair().expect("selected");
+            assert_ne!(
+                active_local.transport_type(),
+                crate::candidate::TransportType::Udp
+            );
+            assert_ne!(
+                active_remote.transport_type(),
+                crate::candidate::TransportType::Udp
+            );
+
+            active.send(b"adapter-ice-tcp").expect("send");
+            assert!(
+                wait_for(|| received.lock().as_slice() == b"adapter-ice-tcp", 2000).await,
+                "application bytes did not traverse ICE-TCP"
+            );
+        });
+    }
+
     // ---------------------------------------------------------------
-    // Phase G-4b: ICE restart, eager close, runtime callback swap.
     // ---------------------------------------------------------------
 
     #[test]

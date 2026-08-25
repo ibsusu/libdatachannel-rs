@@ -2474,6 +2474,116 @@ a=max-message-size:262144\r\n";
         });
     }
 
+    #[test]
+    fn data_channel_message_round_trips_over_ice_tcp() {
+        rt().block_on(async {
+            let a_state = Arc::new(Mutex::new(PeerConnectionState::New));
+            let b_state = Arc::new(Mutex::new(PeerConnectionState::New));
+            let a_candidates = Arc::new(Mutex::new(Vec::<Candidate>::new()));
+            let b_candidates = Arc::new(Mutex::new(Vec::<Candidate>::new()));
+            let b_channel = Arc::new(Mutex::new(None::<DataChannel>));
+            let received = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+
+            let a_state_cb = a_state.clone();
+            let a_candidates_cb = a_candidates.clone();
+            let a_callbacks = PeerConnectionCallbacks {
+                on_state_change: Arc::new(move |state| *a_state_cb.lock() = state),
+                on_local_candidate: Arc::new(move |candidate| {
+                    a_candidates_cb.lock().push(candidate)
+                }),
+                ..PeerConnectionCallbacks::default()
+            };
+            let b_state_cb = b_state.clone();
+            let b_candidates_cb = b_candidates.clone();
+            let b_channel_cb = b_channel.clone();
+            let received_cb = received.clone();
+            let b_callbacks = PeerConnectionCallbacks {
+                on_state_change: Arc::new(move |state| *b_state_cb.lock() = state),
+                on_local_candidate: Arc::new(move |candidate| {
+                    b_candidates_cb.lock().push(candidate)
+                }),
+                on_data_channel: Arc::new(move |channel| {
+                    let received = received_cb.clone();
+                    channel.set_callbacks(DataChannelCallbacks {
+                        on_message: Arc::new(move |data, _| received.lock().push(data.to_vec())),
+                        ..DataChannelCallbacks::default()
+                    });
+                    *b_channel_cb.lock() = Some(channel);
+                }),
+                ..PeerConnectionCallbacks::default()
+            };
+
+            let mut a_config = loopback_config();
+            a_config.ice_tcp_mode = Some(crate::configuration::IceTcpMode::Active);
+            a_config.port_range_begin = 40_000;
+            a_config.port_range_end = 40_127;
+            let mut b_config = loopback_config();
+            b_config.ice_tcp_mode = Some(crate::configuration::IceTcpMode::Passive);
+            b_config.port_range_begin = 40_000;
+            b_config.port_range_end = 40_127;
+            let pc_a = PeerConnection::new(a_config, a_callbacks).expect("pc a");
+            let pc_b = PeerConnection::new(b_config, b_callbacks).expect("pc b");
+            let dc_a = pc_a.create_data_channel("ice-tcp");
+
+            pc_a.set_local_description(DescriptionType::Offer)
+                .expect("offer");
+            assert!(wait_for(|| pc_a.gathering_state() == GatheringState::Complete, 3000).await);
+            pc_b.set_remote_description(pc_a.local_description().expect("offer sdp"))
+                .expect("remote offer");
+            pc_b.set_local_description(DescriptionType::Answer)
+                .expect("answer");
+            assert!(wait_for(|| pc_b.gathering_state() == GatheringState::Complete, 3000).await);
+            pc_a.set_remote_description(pc_b.local_description().expect("answer sdp"))
+                .expect("remote answer");
+
+            for candidate in a_candidates.lock().iter().filter(|candidate| {
+                candidate.transport_type() != crate::candidate::TransportType::Udp
+            }) {
+                pc_b.add_remote_candidate(candidate)
+                    .expect("active candidate");
+            }
+            for candidate in b_candidates.lock().iter().filter(|candidate| {
+                candidate.transport_type() != crate::candidate::TransportType::Udp
+            }) {
+                pc_a.add_remote_candidate(candidate)
+                    .expect("passive candidate");
+            }
+            pc_a.set_remote_end_of_candidates().expect("a eoc");
+            pc_b.set_remote_end_of_candidates().expect("b eoc");
+
+            assert!(
+                wait_for(
+                    || {
+                        *a_state.lock() == PeerConnectionState::Connected
+                            && *b_state.lock() == PeerConnectionState::Connected
+                    },
+                    12000,
+                )
+                .await,
+                "peer connections did not connect over ICE-TCP: a={:?} b={:?}",
+                *a_state.lock(),
+                *b_state.lock(),
+            );
+            assert!(
+                wait_for(|| b_channel.lock().is_some(), 5000).await,
+                "DCEP channel did not arrive over ICE-TCP"
+            );
+            assert!(
+                wait_for(|| dc_a.is_open(), 5000).await,
+                "DCEP ACK did not return over ICE-TCP"
+            );
+            dc_a.send_binary(b"peer-connection-over-ice-tcp")
+                .expect("send");
+            assert!(
+                wait_for(|| !received.lock().is_empty(), 5000).await,
+                "DataChannel payload did not cross ICE-TCP"
+            );
+            assert_eq!(received.lock()[0], b"peer-connection-over-ice-tcp");
+            pc_a.close().expect("close a");
+            pc_b.close().expect("close b");
+        });
+    }
+
     /// Regression for the concurrent-load self-deadlock (issue #57): echoing
     /// straight from `on_message` must not wedge the SCTP worker. B installs an
     /// inline echo — it calls `send_binary` synchronously from inside its
